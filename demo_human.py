@@ -220,7 +220,7 @@ def main(args):
     timing_stats.add("  [model_loading] setup_sam_3d_body", time.time() - t0)
 
     t0 = time.time()
-    visualizer = setup_visualizer()
+    visualizer = setup_visualizer() if args.visualize else None
     print(f"  [model_loading] setup_visualizer: {time.time() - t0:.4f}s")
     timing_stats.add("  [model_loading] setup_visualizer", time.time() - t0)
 
@@ -306,23 +306,24 @@ def main(args):
     print(f"  Saved Hand Box visualization: {hand_box_path}")
 
     # Generate concat image: [original, skeleton, mesh, side view]
-    print("  Generating concat visualization...")
-    concat_img = visualize_sample_together(img_cv2, outputs, estimator.faces)
+    if args.visualize:
+        print("  Generating concat visualization...")
+        concat_img = visualize_sample_together(img_cv2, outputs, estimator.faces)
 
-    # Add hand box to concat image: [original, hand_box, skeleton, mesh, side view]
-    # Need to split the concat_img into parts
-    h, w = img_cv2.shape[:2]
-    img_orig = concat_img[:, :w]
-    img_keypoints = concat_img[:, w:2*w]
-    img_mesh = concat_img[:, 2*w:3*w]
-    img_side = concat_img[:, 3*w:]
+        # Add hand box to concat image: [original, hand_box, skeleton, mesh, side view]
+        # Need to split the concat_img into parts
+        h, w = img_cv2.shape[:2]
+        img_orig = concat_img[:, :w]
+        img_keypoints = concat_img[:, w:2*w]
+        img_mesh = concat_img[:, 2*w:3*w]
+        img_side = concat_img[:, 3*w:]
 
-    # Re-concat: [original, hand_box, skeleton, mesh, side view]
-    concat_with_hands = np.concatenate([img_orig, hand_box_img, img_keypoints, img_mesh, img_side], axis=1)
-    concat_path = os.path.join(args.output_dir, "concat_all.jpg")
-    cv2.imwrite(concat_path, concat_with_hands.astype(np.uint8))
-    print(f"  Saved Concat visualization: {concat_path}")
-    print(f"  Layout: [Original | Hand Box | Skeleton | Mesh | Side View]")
+        # Re-concat: [original, hand_box, skeleton, mesh, side view]
+        concat_with_hands = np.concatenate([img_orig, hand_box_img, img_keypoints, img_mesh, img_side], axis=1)
+        concat_path = os.path.join(args.output_dir, "concat_all.jpg")
+        cv2.imwrite(concat_path, concat_with_hands.astype(np.uint8))
+        print(f"  Saved Concat visualization: {concat_path}")
+        print(f"  Layout: [Original | Hand Box | Skeleton | Mesh | Side View]")
 
     # ============================================================
     # 3. Visualize 2D keypoints

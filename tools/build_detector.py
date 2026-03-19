@@ -220,11 +220,10 @@ def run_yolo11(
     else:
         boxes = np.array(boxes_list, dtype=np.float32)
 
-    # Sort boxes to keep a consistent output order
+    # Sort by box area descending so index 0 is always the largest (closest) person
     if len(boxes) > 0:
-        sorted_indices = np.lexsort(
-            (boxes[:, 3], boxes[:, 2], boxes[:, 1], boxes[:, 0])
-        )
+        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        sorted_indices = np.argsort(areas)[::-1]
         boxes = boxes[sorted_indices]
 
     print(f"          [DEBUG] YOLO11 detected {len(boxes)} person(s)")
@@ -337,11 +336,10 @@ def run_yolo_pose(
         boxes = np.array(boxes_list, dtype=np.float32)
         keypoints = np.array(keypoints_list, dtype=np.float32)
 
-    # Sort boxes and keypoints to keep consistent order
+    # Sort by box area descending so index 0 is always the largest (closest) person
     if len(boxes) > 0:
-        sorted_indices = np.lexsort(
-            (boxes[:, 3], boxes[:, 2], boxes[:, 1], boxes[:, 0])
-        )
+        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        sorted_indices = np.argsort(areas)[::-1]
         boxes = boxes[sorted_indices]
         keypoints = keypoints[sorted_indices]
 

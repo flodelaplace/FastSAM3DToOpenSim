@@ -1,7 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 import numpy as np
 import cv2
-from sam_3d_body.visualization.renderer import Renderer
 from sam_3d_body.visualization.skeleton_visualizer import SkeletonVisualizer
 from sam_3d_body.metadata.mhr70 import pose_info as mhr70_pose_info
 
@@ -61,6 +60,7 @@ def visualize_sample(img_cv2, outputs, faces):
                 2,
             )
 
+        from sam_3d_body.visualization.renderer import Renderer
         renderer = Renderer(focal_length=person_output["focal_length"], faces=faces)
         img2 = (
             renderer(
@@ -136,6 +136,7 @@ def visualize_sample_together(img_cv2, outputs, faces):
         all_pred_vertices = all_pred_vertices - fake_pred_cam_t
 
         # Render front view
+        from sam_3d_body.visualization.renderer import Renderer
         renderer = Renderer(focal_length=person_output["focal_length"], faces=all_faces)
         img_mesh = (
             renderer(

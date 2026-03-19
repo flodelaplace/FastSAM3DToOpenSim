@@ -2,15 +2,27 @@
 
 import os
 
-if "PYOPENGL_PLATFORM" not in os.environ:
-    os.environ["PYOPENGL_PLATFORM"] = "egl"
 from typing import List, Optional
 
 import cv2
 import numpy as np
-import pyrender
 import torch
 import trimesh
+
+# pyrender is imported lazily to avoid EGL/OpenGL issues on Windows
+# when only mesh saving (not rendering) is needed
+_pyrender = None
+pyrender = None  # module-level alias, populated lazily by _ensure_pyrender()
+
+def _get_pyrender():
+    global _pyrender, pyrender
+    if _pyrender is None:
+        if "PYOPENGL_PLATFORM" not in os.environ:
+            os.environ["PYOPENGL_PLATFORM"] = "egl"
+        import pyrender as _pr
+        _pyrender = _pr
+        pyrender = _pr
+    return _pyrender
 
 
 def get_light_poses(n_lights=5, elevation=np.pi / 3, dist=12):
@@ -97,10 +109,11 @@ def rotz(theta):
     )
 
 
-def create_raymond_lights() -> List[pyrender.Node]:
+def create_raymond_lights() -> List:
     """
     Return raymond light nodes for the scene.
     """
+    _get_pyrender()
     thetas = np.pi * np.array([1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0])
     phis = np.pi * np.array([0.0, 2.0 / 3.0, 4.0 / 3.0])
 
@@ -170,6 +183,7 @@ class Renderer:
             imgname (Optional[str]): Contains the original image filenamee. Used only if full_frame == True.
         """
 
+        _get_pyrender()
         if full_frame:
             image = cv2.imread(imgname).astype(np.float32)
         image = image / 255.0
@@ -299,6 +313,7 @@ class Renderer:
         render_res=[256, 256],
     ):
 
+        _get_pyrender()
         renderer = pyrender.OffscreenRenderer(
             viewport_width=render_res[0], viewport_height=render_res[1], point_size=1.0
         )
@@ -365,6 +380,7 @@ class Renderer:
         focal_length=None,
     ):
 
+        _get_pyrender()
         renderer = pyrender.OffscreenRenderer(
             viewport_width=render_res[0], viewport_height=render_res[1], point_size=1.0
         )

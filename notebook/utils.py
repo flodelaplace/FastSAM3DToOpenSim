@@ -13,7 +13,6 @@ import torch
 
 from sam_3d_body import load_sam_3d_body_hf, load_sam_3d_body, SAM3DBodyEstimator
 from sam_3d_body.metadata.mhr70 import pose_info as mhr70_pose_info
-from sam_3d_body.visualization.renderer import Renderer
 from sam_3d_body.visualization.skeleton_visualizer import SkeletonVisualizer
 
 LIGHT_BLUE = (0.65098039, 0.74117647, 0.85882353)
@@ -229,6 +228,7 @@ def visualize_3d_mesh(
     results = []
     viz_total_start = time.time()
 
+    from sam_3d_body.visualization.renderer import Renderer
     for pid, person_output in enumerate(outputs):
         person_start = time.time()
 
@@ -329,6 +329,7 @@ def save_mesh_results(
 
         # Create renderer for this person
         t0 = time.time()
+        from sam_3d_body.visualization.renderer import Renderer
         renderer = Renderer(focal_length=person_output["focal_length"], faces=faces)
         print(f"      [save_mesh_results] person_{pid}_create_renderer: {time.time() - t0:.4f}s")
 
@@ -344,21 +345,24 @@ def save_mesh_results(
         print(f"      [save_mesh_results] person_{pid}_export_mesh: {time.time() - t0:.4f}s")
 
         # Save individual overlay image
+        overlay_filename = None
         t0 = time.time()
-        img_mesh_overlay = (
-            renderer(
-                vertices,
-                cam_t,
-                img_cv2.copy(),
-                mesh_base_color=LIGHT_BLUE,
-                scene_bg_color=(1, 1, 1),
-            )
-            * 255
-        ).astype(np.uint8)
-
-        overlay_filename = f"{image_name}_overlay_{pid:03d}.png"
-        cv2.imwrite(os.path.join(save_dir, overlay_filename), img_mesh_overlay)
-        print(f"      [save_mesh_results] person_{pid}_save_overlay: {time.time() - t0:.4f}s")
+        try:
+            img_mesh_overlay = (
+                renderer(
+                    vertices,
+                    cam_t,
+                    img_cv2.copy(),
+                    mesh_base_color=LIGHT_BLUE,
+                    scene_bg_color=(1, 1, 1),
+                )
+                * 255
+            ).astype(np.uint8)
+            overlay_filename = f"{image_name}_overlay_{pid:03d}.png"
+            cv2.imwrite(os.path.join(save_dir, overlay_filename), img_mesh_overlay)
+            print(f"      [save_mesh_results] person_{pid}_save_overlay: {time.time() - t0:.4f}s")
+        except Exception as e:
+            print(f"      [save_mesh_results] person_{pid}_save_overlay SKIPPED (OpenGL unavailable: {e})")
 
         # Save bbox image
         t0 = time.time()
@@ -377,7 +381,8 @@ def save_mesh_results(
 
         print(f"      [save_mesh_results] person_{pid}_total: {time.time() - person_start:.4f}s")
         print(f"Saved mesh: {mesh_path}")
-        print(f"Saved overlay: {os.path.join(save_dir, overlay_filename)}")
+        if overlay_filename:
+            print(f"Saved overlay: {os.path.join(save_dir, overlay_filename)}")
         print(f"Saved bbox: {os.path.join(save_dir, bbox_filename)}")
 
     print(f"      [save_mesh_results] all_persons_total: {time.time() - save_total_start:.4f}s")
