@@ -462,11 +462,186 @@ def write_skeleton_glb(
 # Mesh GLB writer (full body mesh animation using morph targets)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Joint / bone overlay constants ───────────────────────────────────────────
+# (keypoint_index, side)  side: 'R'=orange, 'L'=green, 'C'=blue
+_MESH_JOINT_MARKERS = [
+    # Body
+    (0,  'C', 0.018),   # nose/head
+    (5,  'L', 0.020),   # left_shoulder
+    (6,  'R', 0.020),   # right_shoulder
+    (7,  'L', 0.017),   # left_elbow
+    (8,  'R', 0.017),   # right_elbow
+    (9,  'L', 0.020),   # left_hip
+    (10, 'R', 0.020),   # right_hip
+    (11, 'L', 0.018),   # left_knee
+    (12, 'R', 0.018),   # right_knee
+    (13, 'L', 0.015),   # left_ankle
+    (14, 'R', 0.015),   # right_ankle
+    (17, 'L', 0.012),   # left_heel
+    (20, 'R', 0.012),   # right_heel
+    (15, 'L', 0.010),   # left_big_toe
+    (16, 'L', 0.009),   # left_small_toe
+    (18, 'R', 0.010),   # right_big_toe
+    (19, 'R', 0.009),   # right_small_toe
+    (69, 'C', 0.016),   # neck
+    # Hands (full inference mode)
+    (41, 'R', 0.013),   # right_wrist
+    (62, 'L', 0.013),   # left_wrist
+    (21, 'R', 0.008),   # right_thumb_tip
+    (25, 'R', 0.008),   # right_index_tip
+    (29, 'R', 0.008),   # right_middle_tip
+    (33, 'R', 0.008),   # right_ring_tip
+    (37, 'R', 0.008),   # right_pinky_tip
+    (24, 'R', 0.007),   # right_thumb_knuckle
+    (28, 'R', 0.007),   # right_index_knuckle
+    (32, 'R', 0.007),   # right_middle_knuckle
+    (36, 'R', 0.007),   # right_ring_knuckle
+    (40, 'R', 0.007),   # right_pinky_knuckle
+    (42, 'L', 0.008),   # left_thumb_tip
+    (46, 'L', 0.008),   # left_index_tip
+    (50, 'L', 0.008),   # left_middle_tip
+    (54, 'L', 0.008),   # left_ring_tip
+    (58, 'L', 0.008),   # left_pinky_tip
+    (45, 'L', 0.007),   # left_thumb_knuckle
+    (49, 'L', 0.007),   # left_index_knuckle
+    (53, 'L', 0.007),   # left_middle_knuckle
+    (57, 'L', 0.007),   # left_ring_knuckle
+    (61, 'L', 0.007),   # left_pinky_knuckle
+]
+_MESH_BONE_PAIRS = [
+    # Arms
+    (5,  7),    # L shoulder → elbow
+    (7,  62),   # L elbow → wrist
+    (6,  8),    # R shoulder → elbow
+    (8,  41),   # R elbow → wrist
+    # Legs
+    (9,  11),   # L hip → knee
+    (11, 13),   # L knee → ankle
+    (10, 12),   # R hip → knee
+    (12, 14),   # R knee → ankle
+    # Feet
+    (13, 15),   # L ankle → big_toe
+    (13, 16),   # L ankle → small_toe
+    (13, 17),   # L ankle → heel
+    (14, 18),   # R ankle → big_toe
+    (14, 19),   # R ankle → small_toe
+    (14, 20),   # R ankle → heel
+    # Torso
+    (5,  6),    # shoulders across
+    (9,  10),   # hips across
+    (5,  9),    # L trunk
+    (6,  10),   # R trunk
+    (69, 5),    # neck → L shoulder
+    (69, 6),    # neck → R shoulder
+    # Right hand fingers
+    (41, 24),   # wrist → thumb_knuckle
+    (24, 23), (23, 22), (22, 21),        # thumb
+    (41, 28),   # wrist → index_knuckle
+    (28, 27), (27, 26), (26, 25),        # index
+    (41, 32),   # wrist → middle_knuckle
+    (32, 31), (31, 30), (30, 29),        # middle
+    (41, 36),   # wrist → ring_knuckle
+    (36, 35), (35, 34), (34, 33),        # ring
+    (41, 40),   # wrist → pinky_knuckle
+    (40, 39), (39, 38), (38, 37),        # pinky
+    # Left hand fingers
+    (62, 45),   # wrist → thumb_knuckle
+    (45, 44), (44, 43), (43, 42),        # thumb
+    (62, 49),   # wrist → index_knuckle
+    (49, 48), (48, 47), (47, 46),        # index
+    (62, 53),   # wrist → middle_knuckle
+    (53, 52), (52, 51), (51, 50),        # middle
+    (62, 57),   # wrist → ring_knuckle
+    (57, 56), (56, 55), (55, 54),        # ring
+    (62, 61),   # wrist → pinky_knuckle
+    (61, 60), (60, 59), (59, 58),        # pinky
+]
+_SIDE_COLORS = {
+    'R': [1.00, 0.45, 0.08, 1.0],
+    'L': [0.08, 0.85, 0.25, 1.0],
+    'C': [0.20, 0.50, 1.00, 1.0],
+}
+
+
+def _sphere_verts_faces(radius: float, segments: int = 8, rings: int = 6):
+    """Return (verts float32 [N,3], faces uint32 [M*3])."""
+    import math
+    verts = []
+    for r in range(rings + 1):
+        phi = math.pi * r / rings
+        for s in range(segments):
+            theta = 2 * math.pi * s / segments
+            verts.append([
+                radius * math.sin(phi) * math.cos(theta),
+                radius * math.cos(phi),
+                radius * math.sin(phi) * math.sin(theta),
+            ])
+    faces = []
+    for r in range(rings):
+        for s in range(segments):
+            ns = (s + 1) % segments
+            a = r * segments + s
+            b = r * segments + ns
+            c = (r + 1) * segments + s
+            d = (r + 1) * segments + ns
+            faces.extend([a, c, b, b, c, d])
+    return np.array(verts, dtype=np.float32), np.array(faces, dtype=np.uint32)
+
+
+def _cylinder_verts_faces(radius: float = 0.010, segments: int = 6):
+    """Unit cylinder (length=1) along Y from -0.5 to +0.5."""
+    import math
+    verts = []
+    for cap in range(2):
+        y = -0.5 + cap
+        for s in range(segments):
+            a = 2 * math.pi * s / segments
+            verts.append([radius * math.cos(a), y, radius * math.sin(a)])
+    verts.append([0.0, -0.5, 0.0])   # bottom cap centre
+    verts.append([0.0,  0.5, 0.0])   # top cap centre
+    faces = []
+    for s in range(segments):
+        ns = (s + 1) % segments
+        a, b, c, d = s, ns, segments + s, segments + ns
+        faces.extend([a, c, b, b, c, d])
+    bot_c = 2 * segments
+    top_c = 2 * segments + 1
+    for s in range(segments):
+        ns = (s + 1) % segments
+        faces.extend([bot_c, ns, s])
+        faces.extend([top_c, segments + s, segments + ns])
+    return np.array(verts, dtype=np.float32), np.array(faces, dtype=np.uint32)
+
+
+def _quat_y_to_dir(d: np.ndarray) -> np.ndarray:
+    """glTF quaternion [x,y,z,w] rotating local Y to direction d."""
+    import math
+    n = np.linalg.norm(d)
+    if n < 1e-6:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    d = d / n
+    dot = float(d[1])          # dot(Y, d)
+    cross = np.array([d[2], 0.0, -d[0]], dtype=np.float64)    # Y × d = (dz, 0, -dx)
+    cn = np.linalg.norm(cross)
+    if cn < 1e-6:
+        if dot > 0:
+            return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        else:
+            return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    cos_h = math.sqrt(max(0.0, (1.0 + dot) / 2.0))
+    sin_h = math.sqrt(max(0.0, (1.0 - dot) / 2.0))
+    axis = cross / cn
+    return np.array([axis[0] * sin_h, axis[1] * sin_h, axis[2] * sin_h, cos_h],
+                    dtype=np.float32)
+
+
 def write_mesh_glb(
     filepath: str | Path,
     timestamps: List[float],
     frames_verts: List[np.ndarray | None],
     faces: np.ndarray,
+    frames_kpts: List[np.ndarray | None] | None = None,
+    frames_cam_t: List[np.ndarray | None] | None = None,
 ) -> None:
     """Write animated full body mesh as GLB using morph targets.
 
@@ -476,9 +651,12 @@ def write_mesh_glb(
     timestamps : frame timestamps in seconds
     frames_verts : per-frame [18439, 3] vertex arrays in camera space (or None)
     faces : [N_faces, 3] int triangle indices (from estimator.faces)
+    frames_kpts : per-frame [70, 3] camera-space keypoints (no cam_t), or None
+    frames_cam_t : per-frame [3] camera translation, or None
     """
     filepath = Path(filepath)
 
+    # ── Fill mesh frames (forward-fill missing) ───────────────────────────────
     last_good = None
     filled = []
     for v in frames_verts:
@@ -486,10 +664,7 @@ def write_mesh_glb(
             verts_yup = v.copy().astype(np.float32)
             verts_yup[:, 1] = -verts_yup[:, 1]   # Y-up
             last_good = verts_yup
-        if last_good is None:
-            filled.append(None)
-        else:
-            filled.append(last_good.copy())
+        filled.append(last_good.copy() if last_good is not None else None)
 
     if not any(f is not None for f in filled):
         return
@@ -500,14 +675,39 @@ def write_mesh_glb(
 
     N_frames = len(filled)
     N_morphs = N_frames - 1
-    base_pos = filled[0]
     faces_np = np.asarray(faces, dtype=np.uint32).flatten()
 
-    def _pack_f32(a): return a.astype(np.float32).tobytes()
-    def _pack_u32(a): return a.astype(np.uint32).tobytes()
+    # ── Build per-frame world-space keypoints (aligned with mesh) ─────────────
+    has_kpts = (frames_kpts is not None and frames_cam_t is not None)
+    kpts_world: List[np.ndarray | None] = [None] * N_frames
+    if has_kpts:
+        last_kpts: np.ndarray | None = None
+        for i, (k, ct) in enumerate(zip(frames_kpts, frames_cam_t)):
+            if k is not None and ct is not None and not np.any(np.isnan(k)):
+                w = (k + ct[None, :]).astype(np.float32)
+                w[:, 1] = -w[:, 1]   # Y-up
+                last_kpts = w
+            kpts_world[i] = last_kpts.copy() if last_kpts is not None else None
+
+    # ── Center at pelvis each frame (remove global translation) ───────────────
+    if has_kpts:
+        last_pelvis = np.zeros(3, dtype=np.float32)
+        for i in range(N_frames):
+            kw = kpts_world[i]
+            if kw is not None:
+                last_pelvis = ((kw[9] + kw[10]) / 2.0).astype(np.float32)
+            filled[i] = filled[i] - last_pelvis[None, :]
+            if kpts_world[i] is not None:
+                kpts_world[i] = kpts_world[i] - last_pelvis[None, :]
+
+    base_pos = filled[0]
+
+    # ── Binary buffer helpers ─────────────────────────────────────────────────
+    def _pack_f32(a): return np.asarray(a, dtype=np.float32).tobytes()
+    def _pack_u32(a): return np.asarray(a, dtype=np.uint32).tobytes()
 
     byte_offset = 0
-    chunks = []
+    chunks: list[bytes] = []
 
     def _add(data: bytes):
         nonlocal byte_offset
@@ -518,31 +718,94 @@ def write_mesh_glb(
         byte_offset += len(data)
         return start, len(data) - pad
 
+    def _bounds(arr):
+        return arr.min(axis=0).tolist(), arr.max(axis=0).tolist()
+
+    # ── Body mesh geometry ────────────────────────────────────────────────────
     off0, len0 = _add(_pack_f32(base_pos))
     off_i, len_i = _add(_pack_u32(faces_np))
 
-    morph_offsets, morph_lens, morph_deltas = [], [], []
+    morph_deltas, morph_offsets, morph_lens = [], [], []
     for f in filled[1:]:
-        delta = f - base_pos
+        delta = (f - base_pos).astype(np.float32)
         o, l_ = _add(_pack_f32(delta))
         morph_offsets.append(o); morph_lens.append(l_); morph_deltas.append(delta)
 
+    # ── Shared timestamp accessor ─────────────────────────────────────────────
     anim_times = np.array([float(t) for t in timestamps], dtype=np.float32)
     off_t, len_t = _add(_pack_f32(anim_times))
 
+    # ── Morph weights ─────────────────────────────────────────────────────────
     weights_np = np.zeros((N_frames, max(N_morphs, 1)), dtype=np.float32)
     for f in range(1, N_frames):
         weights_np[f, f - 1] = 1.0
     off_w, len_w = _add(_pack_f32(weights_np))
 
+    # ── Overlay geometry: sphere + cylinder ───────────────────────────────────
+    sph_v, sph_f = _sphere_verts_faces(radius=1.0, segments=8, rings=5)
+    cyl_v, cyl_f = _cylinder_verts_faces(radius=1.0, segments=6)
+    off_sv, len_sv = _add(_pack_f32(sph_v))
+    off_sf, len_sf = _add(_pack_u32(sph_f))
+    off_cv, len_cv = _add(_pack_f32(cyl_v))
+    off_cf, len_cf = _add(_pack_u32(cyl_f))
+
+    # ── Per-joint translation data ────────────────────────────────────────────
+    joint_trans_data: list[tuple[int, np.ndarray]] = []   # (kpt_idx, [N,3])
+    if has_kpts:
+        for kpt_idx, side, radius in _MESH_JOINT_MARKERS:
+            trans = np.zeros((N_frames, 3), dtype=np.float32)
+            for fi, kw in enumerate(kpts_world):
+                if kw is not None and kpt_idx < kw.shape[0]:
+                    trans[fi] = kw[kpt_idx]
+                elif fi > 0:
+                    trans[fi] = trans[fi - 1]
+            joint_trans_data.append((kpt_idx, trans))
+
+    # ── Per-bone translation / rotation / scale data ──────────────────────────
+    # Finger keypoints start at index 21 (right hand) and 42 (left hand)
+    _FINGER_INDICES = set(range(21, 62))
+    bone_trs_data: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+    if has_kpts:
+        for a_idx, b_idx in _MESH_BONE_PAIRS:
+            stick_r = 0.004 if (a_idx in _FINGER_INDICES or b_idx in _FINGER_INDICES) else 0.007
+            tr = np.zeros((N_frames, 3), dtype=np.float32)
+            ro = np.zeros((N_frames, 4), dtype=np.float32)
+            sc = np.ones((N_frames, 3), dtype=np.float32)
+            ro[:, 3] = 1.0   # identity quaternion w=1
+            for fi, kw in enumerate(kpts_world):
+                if kw is not None and max(a_idx, b_idx) < kw.shape[0]:
+                    pa = kw[a_idx]; pb = kw[b_idx]
+                    tr[fi] = (pa + pb) * 0.5
+                    d = pb - pa
+                    length = float(np.linalg.norm(d))
+                    ro[fi] = _quat_y_to_dir(d)
+                    sc[fi] = [stick_r, length, stick_r]
+                elif fi > 0:
+                    tr[fi] = tr[fi - 1]
+                    ro[fi] = ro[fi - 1]
+                    sc[fi] = sc[fi - 1]
+            bone_trs_data.append((tr, ro, sc))
+
+    # ── Pack overlay animation data ───────────────────────────────────────────
+    joint_trans_accs: list[int] = []
+    for _, trans in joint_trans_data:
+        o, l_ = _add(_pack_f32(trans))
+        joint_trans_accs.append((o, l_, len(joint_trans_data[0][1])))
+
+    bone_trans_accs: list[tuple] = []
+    bone_rot_accs:   list[tuple] = []
+    bone_scale_accs: list[tuple] = []
+    for tr, ro, sc in bone_trs_data:
+        ot, lt = _add(_pack_f32(tr)); bone_trans_accs.append((ot, lt))
+        or_, lr = _add(_pack_f32(ro)); bone_rot_accs.append((or_, lr))
+        os, ls = _add(_pack_f32(sc)); bone_scale_accs.append((os, ls))
+
     bin_data = b''.join(chunks)
 
-    def _bounds(arr):
-        return arr.min(axis=0).tolist(), arr.max(axis=0).tolist()
-
+    # ── Build glTF JSON ───────────────────────────────────────────────────────
     bufferViews = [
-        {"buffer": 0, "byteOffset": off0, "byteLength": len0, "target": 34962},
-        {"buffer": 0, "byteOffset": off_i, "byteLength": len_i, "target": 34963},
+        {"buffer": 0, "byteOffset": off0,  "byteLength": len0,  "target": 34962},
+        {"buffer": 0, "byteOffset": off_i,  "byteLength": len_i,  "target": 34963},
     ]
     accessors = [
         {
@@ -568,6 +831,7 @@ def write_mesh_glb(
         })
         morph_targets.append({"POSITION": acc_idx})
 
+    # Timestamp accessor (shared by all channels)
     bv_t = len(bufferViews)
     bufferViews.append({"buffer": 0, "byteOffset": off_t, "byteLength": len_t})
     acc_t = len(accessors)
@@ -577,6 +841,7 @@ def write_mesh_glb(
         "min": [float(anim_times.min())], "max": [float(anim_times.max())],
     })
 
+    # Morph weights accessor
     bv_w = len(bufferViews)
     bufferViews.append({"buffer": 0, "byteOffset": off_w, "byteLength": len_w})
     acc_w = len(accessors)
@@ -585,37 +850,160 @@ def write_mesh_glb(
         "count": N_frames * max(N_morphs, 1), "type": "SCALAR",
     })
 
-    gltf = {
+    # Sphere geometry accessors
+    bv_sv = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": off_sv, "byteLength": len_sv, "target": 34962})
+    acc_sv = len(accessors);  accessors.append({"bufferView": bv_sv, "byteOffset": 0, "componentType": 5126, "count": len(sph_v), "type": "VEC3", **dict(zip(["min","max"], _bounds(sph_v)))})
+    bv_sf = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": off_sf, "byteLength": len_sf, "target": 34963})
+    acc_sf = len(accessors);  accessors.append({"bufferView": bv_sf, "byteOffset": 0, "componentType": 5125, "count": len(sph_f), "type": "SCALAR"})
+
+    bv_cv = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": off_cv, "byteLength": len_cv, "target": 34962})
+    acc_cv = len(accessors);  accessors.append({"bufferView": bv_cv, "byteOffset": 0, "componentType": 5126, "count": len(cyl_v), "type": "VEC3", **dict(zip(["min","max"], _bounds(cyl_v)))})
+    bv_cf = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": off_cf, "byteLength": len_cf, "target": 34963})
+    acc_cf = len(accessors);  accessors.append({"bufferView": bv_cf, "byteOffset": 0, "componentType": 5125, "count": len(cyl_f), "type": "SCALAR"})
+
+    # Per-joint translation accessors
+    joint_acc_t: list[int] = []
+    for o, l_, cnt in joint_trans_accs:
+        bv = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": o, "byteLength": l_})
+        ac = len(accessors);   accessors.append({"bufferView": bv, "byteOffset": 0, "componentType": 5126, "count": N_frames, "type": "VEC3"})
+        joint_acc_t.append(ac)
+
+    # Per-bone translation / rotation / scale accessors
+    bone_acc_t: list[int] = []
+    bone_acc_r: list[int] = []
+    bone_acc_s: list[int] = []
+    for ot, lt in bone_trans_accs:
+        bv = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": ot, "byteLength": lt})
+        ac = len(accessors);   accessors.append({"bufferView": bv, "byteOffset": 0, "componentType": 5126, "count": N_frames, "type": "VEC3"})
+        bone_acc_t.append(ac)
+    for or_, lr in bone_rot_accs:
+        bv = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": or_, "byteLength": lr})
+        ac = len(accessors);   accessors.append({"bufferView": bv, "byteOffset": 0, "componentType": 5126, "count": N_frames, "type": "VEC4"})
+        bone_acc_r.append(ac)
+    for os, ls in bone_scale_accs:
+        bv = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": os, "byteLength": ls})
+        ac = len(accessors);   accessors.append({"bufferView": bv, "byteOffset": 0, "componentType": 5126, "count": N_frames, "type": "VEC3"})
+        bone_acc_s.append(ac)
+
+    # ── Materials ─────────────────────────────────────────────────────────────
+    materials = [
+        {   # 0: body skin — translucent blue
+            "name": "body_skin",
+            "pbrMetallicRoughness": {
+                "baseColorFactor": [0.45, 0.62, 0.82, 0.38],
+                "roughnessFactor": 0.70, "metallicFactor": 0.0,
+            },
+            "alphaMode": "BLEND", "doubleSided": True,
+        },
+        {   # 1: right joint — orange
+            "name": "joint_right",
+            "pbrMetallicRoughness": {"baseColorFactor": [1.00, 0.45, 0.08, 1.0], "roughnessFactor": 0.22, "metallicFactor": 0.15},
+        },
+        {   # 2: left joint — green
+            "name": "joint_left",
+            "pbrMetallicRoughness": {"baseColorFactor": [0.08, 0.85, 0.25, 1.0], "roughnessFactor": 0.22, "metallicFactor": 0.15},
+        },
+        {   # 3: centre joint — blue
+            "name": "joint_center",
+            "pbrMetallicRoughness": {"baseColorFactor": [0.20, 0.50, 1.00, 1.0], "roughnessFactor": 0.22, "metallicFactor": 0.15},
+        },
+        {   # 4: bone stick — ivory
+            "name": "bone_ivory",
+            "pbrMetallicRoughness": {"baseColorFactor": [0.90, 0.86, 0.74, 1.0], "roughnessFactor": 0.55, "metallicFactor": 0.05},
+        },
+    ]
+    _side_mat = {'R': 1, 'L': 2, 'C': 3}
+
+    # ── Sphere meshes (one per joint, different scale encodes radius) ──────────
+    # We use scale [r,r,r] per node to set per-joint radius at runtime.
+    # One shared sphere mesh (material varies by side — create 3 sphere meshes).
+    sph_meshes: dict[str, int] = {}   # side -> mesh index
+    meshes_list = [
+        {
+            "name": "body",
+            "primitives": [{"attributes": {"POSITION": 0}, "indices": 1, "mode": 4,
+                            "material": 0, "targets": morph_targets}],
+            "weights": [0.0] * max(N_morphs, 1),
+        }
+    ]
+    for side, mat_idx in _side_mat.items():
+        mesh_idx = len(meshes_list)
+        sph_meshes[side] = mesh_idx
+        meshes_list.append({
+            "name": f"sphere_{side}",
+            "primitives": [{"attributes": {"POSITION": acc_sv}, "indices": acc_sf, "mode": 4, "material": mat_idx}],
+        })
+    cyl_mesh_idx = len(meshes_list)
+    meshes_list.append({
+        "name": "bone_cyl",
+        "primitives": [{"attributes": {"POSITION": acc_cv}, "indices": acc_cf, "mode": 4, "material": 4}],
+    })
+
+    # ── Nodes ─────────────────────────────────────────────────────────────────
+    # node 0: body mesh
+    nodes_list = [{"mesh": 0}]
+    scene_nodes = [0]
+
+    joint_node_indices: list[int] = []
+    for i, (kpt_idx, side, radius) in enumerate(_MESH_JOINT_MARKERS):
+        if not has_kpts:
+            break
+        node_idx = len(nodes_list)
+        nodes_list.append({
+            "mesh": sph_meshes[side],
+            "scale": [radius, radius, radius],
+        })
+        scene_nodes.append(node_idx)
+        joint_node_indices.append(node_idx)
+
+    bone_node_indices: list[int] = []
+    for i in range(len(_MESH_BONE_PAIRS)):
+        if not has_kpts:
+            break
+        node_idx = len(nodes_list)
+        nodes_list.append({"mesh": cyl_mesh_idx})
+        scene_nodes.append(node_idx)
+        bone_node_indices.append(node_idx)
+
+    # ── Animation samplers + channels ─────────────────────────────────────────
+    anim_samplers = [
+        {"input": acc_t, "output": acc_w, "interpolation": "STEP"},          # morph weights
+    ]
+    anim_channels = [
+        {"sampler": 0, "target": {"node": 0, "path": "weights"}},
+    ]
+
+    for i, (node_idx, acc_tr) in enumerate(zip(joint_node_indices, joint_acc_t)):
+        s_idx = len(anim_samplers)
+        anim_samplers.append({"input": acc_t, "output": acc_tr, "interpolation": "LINEAR"})
+        anim_channels.append({"sampler": s_idx, "target": {"node": node_idx, "path": "translation"}})
+
+    for i, node_idx in enumerate(bone_node_indices):
+        s_t = len(anim_samplers)
+        anim_samplers.append({"input": acc_t, "output": bone_acc_t[i], "interpolation": "LINEAR"})
+        anim_channels.append({"sampler": s_t, "target": {"node": node_idx, "path": "translation"}})
+        s_r = len(anim_samplers)
+        anim_samplers.append({"input": acc_t, "output": bone_acc_r[i], "interpolation": "LINEAR"})
+        anim_channels.append({"sampler": s_r, "target": {"node": node_idx, "path": "rotation"}})
+        s_s = len(anim_samplers)
+        anim_samplers.append({"input": acc_t, "output": bone_acc_s[i], "interpolation": "LINEAR"})
+        anim_channels.append({"sampler": s_s, "target": {"node": node_idx, "path": "scale"}})
+
+    # ── Assemble glTF ─────────────────────────────────────────────────────────
+    gltf: dict = {
         "asset": {"version": "2.0", "generator": "FastSAM3DBody OpenSim Exporter"},
         "scene": 0,
-        "scenes": [{"nodes": [0]}],
-        "nodes": [{"mesh": 0}],
-        "meshes": [
-            {
-                "name": "body",
-                "primitives": [
-                    {
-                        "attributes": {"POSITION": 0},
-                        "indices": 1,
-                        "mode": 4,
-                        "targets": morph_targets,
-                    }
-                ],
-                "weights": [0.0] * max(N_morphs, 1),
-            }
-        ],
-        "animations": [
-            {
-                "name": "take",
-                "samplers": [{"input": acc_t, "output": acc_w, "interpolation": "STEP"}],
-                "channels": [{"sampler": 0, "target": {"node": 0, "path": "weights"}}],
-            }
-        ],
+        "scenes": [{"nodes": scene_nodes}],
+        "nodes": nodes_list,
+        "meshes": meshes_list,
+        "materials": materials,
+        "animations": [{"name": "take", "samplers": anim_samplers, "channels": anim_channels}],
         "accessors": accessors,
         "bufferViews": bufferViews,
         "buffers": [{"byteLength": len(bin_data)}],
     }
 
+    # ── Write GLB ─────────────────────────────────────────────────────────────
     json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
     pad_j = (4 - len(json_bytes) % 4) % 4
     json_bytes += b' ' * pad_j
@@ -623,7 +1011,10 @@ def write_mesh_glb(
     bin_data += b'\x00' * pad_b
 
     json_chunk = struct.pack("<II", len(json_bytes), 0x4E4F534A) + json_bytes
-    bin_chunk  = struct.pack("<II", len(bin_data), 0x004E4942) + bin_data
+    bin_chunk  = struct.pack("<II", len(bin_data),   0x004E4942) + bin_data
     header = struct.pack("<III", 0x46546C67, 2, 12 + len(json_chunk) + len(bin_chunk))
 
     filepath.write_bytes(header + json_chunk + bin_chunk)
+    n_joints = len(joint_node_indices)
+    n_bones  = len(bone_node_indices)
+    print(f"  Mesh GLB: {n_joints} joint spheres, {n_bones} bone sticks, translucent skin")

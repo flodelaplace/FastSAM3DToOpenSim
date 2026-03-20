@@ -444,7 +444,8 @@ def main(args):
 
     if not args.no_mesh_glb:
         print(f"  Writing mesh GLB  → {mesh_glb}")
-        write_mesh_glb(mesh_glb, timestamps, all_verts, estimator.faces)
+        write_mesh_glb(mesh_glb, timestamps, all_verts, estimator.faces,
+                       frames_kpts=all_kpts_raw, frames_cam_t=all_cam_t)
 
     # Write processing report (matches SAM3D-OpenSim convention)
     report_path = os.path.join(args.output_dir, "processing_report.json")

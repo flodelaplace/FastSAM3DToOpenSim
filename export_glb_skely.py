@@ -26,6 +26,10 @@ parser.add_argument('--output', '-o', required=True, help='Output GLB file path'
 parser.add_argument('--trc', default=None, help='Optional TRC file for marker-guided spine rotation')
 parser.add_argument('--fps', type=int, default=30, help='Target FPS (default: 30)')
 parser.add_argument('--rig', default='metarig_skely', help='Armature name (default: metarig_skely)')
+parser.add_argument('--no_translation', action='store_true', default=True,
+                    help='Remove global pelvis translation (keep rotation). Default: True.')
+parser.add_argument('--with_translation', dest='no_translation', action='store_false',
+                    help='Keep global pelvis translation.')
 args = parser.parse_args(argv)
 
 import bpy
@@ -205,7 +209,7 @@ def set_bone_rotation_quat(bone, x, y, z, euler_order='YZX'):
     bone.rotation_quaternion = quat
 
 
-def apply_motion(rig_name, mot_path, target_fps=30, trc_path=None):
+def apply_motion(rig_name, mot_path, target_fps=30, trc_path=None, no_translation=True):
     """Apply .mot motion data to the skeleton using quaternions.
 
     If trc_path is provided, TRC marker positions drive the torso chain
@@ -349,9 +353,13 @@ def apply_motion(rig_name, mot_path, target_fps=30, trc_path=None):
             pro_sup_l = radians(pro_sup_l)
 
         # === PELVIS (spine bone) ===
-        rig.pose.bones['spine'].location.x = -pelvis_tz
-        rig.pose.bones['spine'].location.y = pelvis_ty
-        rig.pose.bones['spine'].location.z = pelvis_tx
+        if no_translation:
+            # Zero global translation — keep only rotation (character stays centred)
+            rig.pose.bones['spine'].location = Vector((0, 0, 0))
+        else:
+            rig.pose.bones['spine'].location.x = -pelvis_tz
+            rig.pose.bones['spine'].location.y = pelvis_ty
+            rig.pose.bones['spine'].location.z = pelvis_tx
         rig.pose.bones['spine'].keyframe_insert(data_path="location", frame=frame)
 
         set_bone_rotation_quat(rig.pose.bones['spine'],
@@ -454,6 +462,138 @@ def apply_motion(rig_name, mot_path, target_fps=30, trc_path=None):
 
     print(f"  Applied {frame} frames using QUATERNION rotations")
     return frame
+
+
+# ---------------------------------------------------------------------------
+# Visual enhancement: smooth translucent skin + joint spheres + bone sticks
+# ---------------------------------------------------------------------------
+
+# Joint markers: (control_bone, RGBA colour, sphere_radius)
+_JOINT_MARKERS = [
+    # Right side — orange
+    ('thigh.R',     (0.90, 0.38, 0.08, 1.0), 0.040),   # knee R
+    ('shin.R',      (0.90, 0.38, 0.08, 1.0), 0.036),   # ankle R
+    ('foot.R',      (0.82, 0.22, 0.08, 1.0), 0.028),   # toe R
+    ('upper_arm.R', (0.90, 0.38, 0.08, 1.0), 0.036),   # elbow R
+    ('forearm.R',   (0.88, 0.38, 0.08, 1.0), 0.030),   # wrist R
+    # Left side — green
+    ('thigh.L',     (0.08, 0.78, 0.22, 1.0), 0.040),   # knee L
+    ('shin.L',      (0.08, 0.78, 0.22, 1.0), 0.036),   # ankle L
+    ('foot.L',      (0.08, 0.68, 0.20, 1.0), 0.028),   # toe L
+    ('upper_arm.L', (0.08, 0.78, 0.22, 1.0), 0.036),   # elbow L
+    ('forearm.L',   (0.08, 0.78, 0.22, 1.0), 0.030),   # wrist L
+    # Centre spine — blue → teal
+    ('spine',       (0.20, 0.40, 0.85, 1.0), 0.042),   # pelvis
+    ('spine.001',   (0.18, 0.48, 0.82, 1.0), 0.036),   # L5/S1
+    ('spine.002',   (0.16, 0.56, 0.80, 1.0), 0.034),   # L1
+    ('spine.003',   (0.14, 0.64, 0.76, 1.0), 0.034),   # chest
+    ('spine.004',   (0.18, 0.74, 0.68, 1.0), 0.030),   # neck base
+    ('spine.006',   (0.22, 0.80, 0.60, 1.0), 0.028),   # head top
+]
+
+# Bone sticks: control bones to draw as white capsules
+_BONE_STICKS = [
+    'thigh.R', 'shin.R', 'foot.R',
+    'thigh.L', 'shin.L', 'foot.L',
+    'upper_arm.R', 'forearm.R', 'hand.R',
+    'upper_arm.L', 'forearm.L', 'hand.L',
+    'spine', 'spine.001', 'spine.002', 'spine.003', 'spine.004', 'spine.005',
+]
+
+
+def _make_mat(name, rgba, roughness=0.3, metallic=0.1):
+    mat = bpy.data.materials.new(name=name)
+    mat.use_nodes = True
+    bsdf = mat.node_tree.nodes["Principled BSDF"]
+    bsdf.inputs["Base Color"].default_value = rgba
+    bsdf.inputs["Roughness"].default_value = roughness
+    bsdf.inputs["Metallic"].default_value = metallic
+    return mat
+
+
+def _bone_parent(obj, rig, bone_name):
+    """Parent obj to bone; after this, obj.location / rotation_euler are in bone-local space."""
+    from mathutils import Matrix
+    obj.parent = rig
+    obj.parent_type = 'BONE'
+    obj.parent_bone = bone_name
+    obj.matrix_parent_inverse = Matrix()   # identity → coords interpreted in bone space
+
+
+def setup_visuals(rig_name):
+    """Smooth shading, translucent skin, coloured joint spheres, bone sticks."""
+    import math
+    from mathutils import Matrix
+
+    rig = bpy.data.objects[rig_name]
+
+    # ── 1. Smooth shading + translucent skin ─────────────────────────────────
+    skin_count = 0
+    for obj in bpy.data.objects:
+        if obj.type != 'MESH' or obj.parent != rig:
+            continue
+        if obj.name.startswith(('jnt_', 'stk_')):
+            continue
+        bpy.context.view_layer.objects.active = obj
+        bpy.ops.object.shade_smooth()
+        for mat in obj.data.materials:
+            if mat is None:
+                continue
+            mat.use_nodes = True
+            bsdf = mat.node_tree.nodes.get("Principled BSDF")
+            if bsdf:
+                bsdf.inputs["Alpha"].default_value = 0.35
+            mat.blend_method = 'BLEND'
+            mat.use_backface_culling = False
+        skin_count += 1
+    print(f"  Smooth shading + translucent applied to {skin_count} skin segments")
+
+    # ── 2. Coloured joint spheres ─────────────────────────────────────────────
+    sphere_count = 0
+    for bone_name, color, radius in _JOINT_MARKERS:
+        if bone_name not in rig.data.bones:
+            continue
+        bpy.ops.mesh.primitive_uv_sphere_add(
+            radius=radius, location=(0, 0, 0), segments=10, ring_count=8
+        )
+        sphere = bpy.context.active_object
+        sphere.name = f"jnt_{bone_name.replace('.', '_')}"
+        bpy.ops.object.shade_smooth()
+        sphere.data.materials.clear()
+        sphere.data.materials.append(
+            _make_mat(f"mat_jnt_{bone_name}", color, roughness=0.22, metallic=0.18)
+        )
+        _bone_parent(sphere, rig, bone_name)
+        sphere_count += 1
+    print(f"  Added {sphere_count} joint spheres")
+
+    # ── 3. Bone sticks (thin cylinders in bone-local space) ───────────────────
+    stick_count = 0
+    for bone_name in _BONE_STICKS:
+        if bone_name not in rig.data.bones:
+            continue
+        bone_len = rig.data.bones[bone_name].length
+        if bone_len < 0.005:
+            continue
+        bpy.ops.mesh.primitive_cylinder_add(
+            radius=0.012, depth=bone_len,
+            location=(0, 0, 0), vertices=6,
+        )
+        stick = bpy.context.active_object
+        stick.name = f"stk_{bone_name.replace('.', '_')}"
+        bpy.ops.object.shade_smooth()
+        stick.data.materials.clear()
+        stick.data.materials.append(
+            _make_mat(f"mat_stk_{bone_name}", (0.88, 0.84, 0.72, 1.0),
+                      roughness=0.55, metallic=0.05)
+        )
+        _bone_parent(stick, rig, bone_name)
+        # Rotate cylinder (default along Z) to align with bone-local Y (tail→head)
+        # and shift centre to bone midpoint
+        stick.rotation_euler = (math.pi / 2, 0, 0)
+        stick.location = (0, bone_len / 2, 0)
+        stick_count += 1
+    print(f"  Added {stick_count} bone sticks")
 
 
 def cleanup_scene(rig_name):
@@ -572,7 +712,9 @@ def main():
 
     cleanup_scene(args.rig)
     setup_camera()
-    apply_motion(args.rig, args.mot, target_fps=args.fps, trc_path=args.trc)
+    apply_motion(args.rig, args.mot, target_fps=args.fps, trc_path=args.trc,
+                 no_translation=args.no_translation)
+    setup_visuals(args.rig)
 
     # Export GLB (quaternion native, no Euler angle wrapping issues)
     glb_path = args.output
