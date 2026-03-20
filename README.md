@@ -3,8 +3,9 @@
 > **OpenSim biomechanics extension of [Fast SAM 3D Body](https://github.com/yangtiming/Fast-SAM-3D-Body)**
 >
 > Takes the Fast-SAM-3D-Body inference pipeline and exports every frame of a video directly
-> to OpenSim-ready files: TRC marker trajectories, MOT joint angles, and animated GLB files
-> for Blender / three.js.
+> to OpenSim-ready files: TRC marker trajectories, IK-solved MOT joint angles, body model,
+> and a rigged animated GLB skeleton for Blender / three.js.
+> Matches the output format of [SAM3D-OpenSim](https://github.com/AitorIriondo/SAM3D-OpenSim).
 
 ---
 
@@ -14,55 +15,65 @@
 |---------|-----------------|-----------|
 | 3D body mesh inference | ✓ | ✓ |
 | Annotated video output | ✓ | ✓ |
-| OpenSim TRC marker file | — | ✓ |
-| OpenSim MOT joint angle file | — | ✓ |
-| Animated skeleton GLB (Blender / three.js) | — | ✓ |
+| OpenSim TRC marker file (73 markers, mm) | — | ✓ |
+| OpenSim IK-solved MOT (40 DOF, via OpenSim 4.5) | — | ✓ |
+| Pose2Sim_Simple body model | — | ✓ |
+| Rigged animated skeleton GLB (Blender / three.js) | — | ✓ |
 | Animated full-body mesh GLB | — | ✓ (opt-in) |
-| `--hands` flag to toggle hand tracking | — | ✓ |
+| Timestamped output folders | — | ✓ |
 | Full setup guides for Linux + Windows | — | ✓ |
-| Per-GPU expected FPS table | — | ✓ |
 | TRT engine build instructions | partial | ✓ |
 
 ---
 
 ## Output files
 
-For each input video, the pipeline writes:
+Each run creates a timestamped folder: `output_YYYYMMDD_HHMMSS_<videoname>/`
 
 ```
-output_opensim/
-  <video_name>_skeleton.mp4    — annotated video with 2D skeleton overlay
-  <video_name>.trc             — OpenSim marker file (24 body landmarks, metres, Y-up)
-  <video_name>.mot             — OpenSim motion file (15 joint angles, degrees)
-  <video_name>_skeleton.glb    — animated skeleton  (~340 KB for 1136 frames)
-  <video_name>_mesh.glb        — animated full-body mesh (opt-in, --mesh_glb)
+output_20260320_173750_myvideo/
+  markers_<name>_skeleton.mp4    — annotated video with 2D skeleton overlay
+  markers_<name>.trc             — 73 OpenSim markers in mm, Y-up
+  markers_<name>_ik.mot          — IK-solved joint angles, 40 DOF, degrees
+  markers_<name>_model.osim      — Pose2Sim_Simple body model
+  markers_<name>.glb             — rigged animated skeleton (~1.3 MB for 584 frames)
+  markers_<name>_mesh.glb        — animated full-body mesh (~126 MB, skip with --no_mesh_glb)
+  _ik_marker_errors.sto          — IK marker tracking residuals per frame
+  inference_meta.json            — video metadata
+  video_outputs.json             — per-frame raw 3D keypoints
+  processing_report.json         — pipeline summary: timings, IK/GLB status
 ```
 
-### TRC marker set — 24 landmarks
+### TRC marker set — 73 landmarks
 
-nose · l/r shoulder · l/r elbow · l/r wrist · l/r hip · l/r knee · l/r ankle ·
-l/r big toe · l/r small toe · l/r heel · l/r olecranon · l/r acromion · neck
+**Body (30):** Nose · LEye · REye · LEar · REar · LShoulder · RShoulder · LElbow · RElbow ·
+LHip · RHip · LKnee · RKnee · LAnkle · RAnkle · LBigToe · LSmallToe · LHeel ·
+RBigToe · RSmallToe · RHeel · RWrist · LWrist · LOlecranon · ROlecranon ·
+LCubitalFossa · RCubitalFossa · LAcromion · RAcromion · Neck
 
-### MOT joint angles — 15 columns
+**Derived (3):** PelvisCenter · Thorax · SpineMid
 
-pelvis translation (tx/ty/tz) · l/r hip flexion · l/r hip adduction ·
-l/r knee flexion · l/r ankle dorsiflexion · l/r elbow flexion ·
-trunk flexion · trunk lateral lean
+**Hands (40):** full finger tracking (20 per hand) — only present with `--inference_type full`
 
-> The MOT file uses geometric estimation from 3D landmark positions — no SMPL model needed.
-> For production biomechanics, run OpenSim Inverse Kinematics on the TRC file instead;
-> that output will be more accurate.
+### MOT joint angles — 40 DOF
+
+OpenSim IK-solved via `InverseKinematicsTool` using the Pose2Sim_Simple model.
+Columns: pelvis tx/ty/tz/tilt/list/rotation · l/r hip flexion/adduction/rotation ·
+l/r knee angle · l/r ankle angle · lumbar extension/bending/rotation ·
+arm flex/add/rot · elbow flex · pro/sup · wrist flex/dev (both sides).
 
 ---
 
-## Performance (measured, RTX 5090 Laptop, Linux)
+## Performance (measured, RTX 5090 Laptop, Linux, 848×480)
 
-| Mode | FPS |
-|------|-----|
-| Body only — `--inference_type body` (default) | **14.7 fps** |
-| Body + hands — `--hands` | **5.2 fps** |
+| Mode | Inference FPS | Total time (19.5 s video) |
+|------|:---:|:---:|
+| `body` — no hands | **~14 fps** | ~50 s |
+| `full` — body + hands (IK-ready) | **~5.3 fps** | ~115 s |
 
-See [COMPROMISES.md](COMPROMISES.md) for a full breakdown of every trade-off made to reach these numbers.
+Total time includes inference, post-processing, OpenSim IK, and Blender GLB export.
+
+See [COMPROMISES.md](COMPROMISES.md) for a breakdown of every trade-off.
 
 ---
 
@@ -72,6 +83,18 @@ See [COMPROMISES.md](COMPROMISES.md) for a full breakdown of every trade-off mad
 
 - **Linux**: [SETUP.md](SETUP.md)
 - **Windows**: [WINDOWS_SETUP.md](WINDOWS_SETUP.md)
+
+Additional dependencies for the full pipeline:
+
+```bash
+# OpenSim 4.5 (IK solver)
+conda create -n opensim python=3.10
+conda install -n opensim -c opensim-org opensim
+
+# Blender + numpy (rigged GLB export)
+sudo apt install blender
+pip3.12 install numpy --break-system-packages
+```
 
 ### 2. Run
 
@@ -85,7 +108,7 @@ DEBUG_NAN=0 PARALLEL_DECODERS=0 COMPILE_WARMUP_BATCH_SIZES=1 \
 python demo_video_opensim.py \
     --video_path ./videos/my_video.mp4 \
     --detector_model checkpoints/yolo/yolo11m-pose.engine \
-    --inference_type body \
+    --inference_type full \
     --fx 1371
 ```
 
@@ -93,21 +116,17 @@ Replace `--fx 1371` with your camera focal length in pixels
 (see [HOW_TO_RUN.md](HOW_TO_RUN.md) for how to compute it).
 If unknown, omit `--fx` and the pipeline will estimate it from the image.
 
-To include hands (5.2 fps instead of 14.7 fps):
-
-```bash
-# add --hands to the command above
-python demo_video_opensim.py ... --hands
-```
-
 ### 3. Open in OpenSim
 
-1. **Scale**: `Tools → Scale → load your .osim model` using a static standing TRC
-2. **Inverse Kinematics**: `Tools → Inverse Kinematics → load TRC` → outputs a solved MOT
+The IK MOT is written automatically. Load directly without re-running IK:
+
+1. `File → Open Model` → select `markers_<name>_model.osim`
+2. `File → Load Motion` → select `markers_<name>_ik.mot`
+3. `File → Open Motion Capture Data` → select `markers_<name>.trc` to inspect markers
 
 ### 4. Open in Blender
 
-`File → Import → glTF 2.0` → select `_skeleton.glb` or `_mesh.glb`
+`File → Import → glTF 2.0` → select `markers_<name>.glb` (rigged skeleton) or `markers_<name>_mesh.glb`
 
 ---
 
@@ -117,24 +136,48 @@ python demo_video_opensim.py ... --hands
 |------|---------|-------------|
 | `--video_path` | — | Input video |
 | `--fx` | auto (MoGe) | Camera focal length in pixels |
-| `--inference_type` | `body` | `body` = 14.7 fps · `full` = hands, 5.2 fps |
-| `--hands` | off | Shorthand for `--inference_type full` |
-| `--mesh_glb` | off | Also write animated full-body mesh GLB |
+| `--inference_type` | `full` | `full` = body + hands (73 markers, IK-ready) · `body` = faster, fewer markers |
+| `--person_height` | `1.75` | Known subject height in metres — scales 3D output |
+| `--no_mesh_glb` | off | Skip full-body mesh GLB export (saves ~125 MB) |
 | `--target_fps` | 0 | Downsample input to this FPS (0 = every frame) |
 | `--max_frames` | 0 | Stop after N frames (0 = full video) |
-| `--output_dir` | `./output_opensim` | Output directory |
+| `--output_dir` | auto | Output directory (default: `output_YYYYMMDD_HHMMSS_<name>/`) |
 
 ---
 
-## Coordinate system
+## Coordinate system (TRC)
 
 All 3D outputs use **OpenSim Y-up** convention:
 
 ```
-X = camera X (lateral, rightward)
-Y = −camera Y (vertical, upward)
-Z = camera Z (depth, forward into scene)
-Units: metres
+X = forward (anterior)
+Y = up (superior)
+Z = right (lateral)
+Units: millimetres (mm)
+```
+
+---
+
+## Post-processing pipeline
+
+```
+Camera-space keypoints  (N, 70, 3)
+    │
+    ▼  PostProcessor
+    │    ├─ interpolate missing frames
+    │    ├─ normalise bone lengths (anthropometric proportions)
+    │    └─ Butterworth low-pass filter  (6 Hz, order 4)
+    ▼  CoordinateTransformer
+    │    ├─ rotate camera → OpenSim Y-up
+    │    ├─ scale to subject height
+    │    ├─ centre pelvis at origin (XZ)
+    │    ├─ align feet to ground (Y=0) per frame
+    │    └─ correct forward lean (auto-detected)
+    ▼  KeypointConverter   (MHR70 → 73 OpenSim markers)
+    ▼  TRCExporter         → markers_<name>.trc  (mm)
+    ▼  OpenSim IK          → markers_<name>_ik.mot  (subprocess → opensim env)
+    ▼  Blender GLB         → markers_<name>.glb  (subprocess → blender + rigify rig)
+    ▼  write_mesh_glb()    → markers_<name>_mesh.glb
 ```
 
 ---
@@ -151,44 +194,15 @@ Without these, the offline export pipeline works fully.
 
 ---
 
-## Architecture
-
-```
-Input video
-    │
-    ▼
-YOLO v11 pose detector
-    │  bounding boxes + 2D keypoints
-    ▼
-MoGe depth / FOV estimator  (TRT, model=s, level=0)
-    │  camera intrinsics + depth conditioning
-    ▼
-DINOv3-ViT/H backbone  (TRT, 512×512, FP16)
-    │  image tokens [B, 1280, 32, 32]
-    ▼
-MHR body decoder  (torch.compile, 2 intermediate layers)
-    │  pred_keypoints_3d [70, 3]
-    │  pred_cam_t [3]
-    │  pred_vertices [18439, 3]
-    ▼
-OpenSim exporter  (sam_3d_body/export/opensim_exporter.py)
-    ├── write_trc()           →  .trc
-    ├── write_mot()           →  .mot
-    ├── write_skeleton_glb()  →  _skeleton.glb  (skeletal skinning, O(N × 24))
-    └── write_mesh_glb()      →  _mesh.glb      (morph targets, opt-in)
-```
-
----
-
 ## Documentation index
 
 | File | Contents |
 |------|----------|
-| [HOW_TO_RUN.md](HOW_TO_RUN.md) | Run commands, all flags, focal length calculation, OpenSim workflow |
+| [HOW_TO_RUN.md](HOW_TO_RUN.md) | Run commands, all flags, focal length calculation, OpenSim workflow, dependency setup |
 | [SETUP.md](SETUP.md) | Linux install, all GPU variants (5090/5070Ti/5070/4090/A3000…), TRT build |
 | [WINDOWS_SETUP.md](WINDOWS_SETUP.md) | Windows install, cmd/PowerShell commands, Windows-specific issues |
 | [SETTINGS.md](SETTINGS.md) | Every environment variable, TRT engine specs, benchmark table |
-| [COMPROMISES.md](COMPROMISES.md) | Every accuracy trade-off made to reach 14.7 fps, with measured numbers |
+| [COMPROMISES.md](COMPROMISES.md) | Every accuracy trade-off made to reach these speeds, with measured numbers |
 
 ---
 

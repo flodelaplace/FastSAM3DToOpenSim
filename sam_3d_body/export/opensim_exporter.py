@@ -1,198 +1,151 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 """
-OpenSim export utilities: TRC, MOT, and GLB from MHR inference output.
+OpenSim export utilities: MOT, GLB, and MarkerSet .osim from processed markers.
 
-Coordinate system
------------------
-MHR outputs are in camera space:
-  X: rightward in image
-  Y: downward in image
-  Z: into screen (depth)
+This module provides the low-level writers for OpenSim-format output files.
+Coordinate transformation, bone normalisation, Butterworth filtering, and TRC
+export are handled by the pipeline modules:
 
-World-space position = pred_keypoints_3d + pred_cam_t[None, :]
+  sam_3d_body/export/post_processing.py      — PostProcessor
+  sam_3d_body/export/coordinate_transform.py — CoordinateTransformer
+  sam_3d_body/export/keypoint_converter.py   — KeypointConverter
+  sam_3d_body/export/trc_exporter.py         — TRCExporter
 
-OpenSim / TRC convention (Y-up):
-  X_os = cam_X   (lateral, right)
-  Y_os = -cam_Y  (vertical, up)
-  Z_os = cam_Z   (depth, forward into scene)
+Coordinate system (all inputs to these writers must already be in Y-up):
+  X = forward (anterior)
+  Y = up
+  Z = right (lateral)
+  Units: metres
 
-Units: metres (the MHR model predicts in metres).
-
-TRC marker subset
------------------
-22 anatomical landmarks from the MHR-70 set (body only, no fingers):
-  nose(0), l_shoulder(5), r_shoulder(6), l_elbow(7), r_elbow(8),
-  l_hip(9), r_hip(10), l_knee(11), r_knee(12), l_ankle(13), r_ankle(14),
-  l_big_toe(15), l_small_toe(16), l_heel(17), r_big_toe(18),
-  r_small_toe(19), r_heel(20), r_wrist(41), l_wrist(62),
-  l_olecranon(63), r_olecranon(64), l_acromion(67), r_acromion(68), neck(69)
+Marker array layout (27 markers, matches KeypointConverter body_only output):
+  0:Nose, 1:LShoulder, 2:RShoulder, 3:LElbow, 4:RElbow,
+  5:LHip, 6:RHip, 7:LKnee, 8:RKnee, 9:LAnkle, 10:RAnkle,
+  11:LBigToe, 12:LSmallToe, 13:LHeel, 14:RBigToe, 15:RSmallToe, 16:RHeel,
+  17:RWrist, 18:LWrist, 19:LOlecranon, 20:ROlecranon,
+  21:LAcromion, 22:RAcromion, 23:Neck,
+  24:PelvisCenter, 25:Thorax, 26:SpineMid  (derived)
 """
 
 from __future__ import annotations
 
 import struct
 import json
-import base64
 from pathlib import Path
 from typing import List
 
 import numpy as np
 
-# ── Body marker subset (index into the 70-joint MHR keypoint array) ──────────
-BODY_MARKER_IDX = [
-    0,   # nose
-    5,   # left_shoulder
-    6,   # right_shoulder
-    7,   # left_elbow
-    8,   # right_elbow
-    9,   # left_hip
-    10,  # right_hip
-    11,  # left_knee
-    12,  # right_knee
-    13,  # left_ankle
-    14,  # right_ankle
-    15,  # left_big_toe
-    16,  # left_small_toe
-    17,  # left_heel
-    18,  # right_big_toe
-    19,  # right_small_toe
-    20,  # right_heel
-    41,  # right_wrist
-    62,  # left_wrist
-    63,  # left_olecranon
-    64,  # right_olecranon
-    67,  # left_acromion
-    68,  # right_acromion
-    69,  # neck
-]
-
+# ── Marker names (order matches KeypointConverter body_only + derived output) ─
+# Indices 0-4: head   5-6: shoulder   7-8: elbow   9-10: hip  11-12: knee
+# 13-14: ankle  15-20: feet  21-22: wrist  23-24: olecranon
+# 25-26: cubital fossa  27-28: acromion  29: neck  30-32: derived
 BODY_MARKER_NAMES = [
-    "nose",
-    "l_shoulder", "r_shoulder",
-    "l_elbow",    "r_elbow",
-    "l_hip",      "r_hip",
-    "l_knee",     "r_knee",
-    "l_ankle",    "r_ankle",
-    "l_big_toe",  "l_small_toe", "l_heel",
-    "r_big_toe",  "r_small_toe", "r_heel",
-    "r_wrist",    "l_wrist",
-    "l_olecranon", "r_olecranon",
-    "l_acromion",  "r_acromion",
-    "neck",
+    "Nose",
+    "LEye",      "REye",
+    "LEar",      "REar",
+    "LShoulder", "RShoulder",
+    "LElbow",    "RElbow",
+    "LHip",      "RHip",
+    "LKnee",     "RKnee",
+    "LAnkle",    "RAnkle",
+    "LBigToe",   "LSmallToe", "LHeel",
+    "RBigToe",   "RSmallToe", "RHeel",
+    "RWrist",    "LWrist",
+    "LOlecranon", "ROlecranon",
+    "LCubitalFossa", "RCubitalFossa",
+    "LAcromion",  "RAcromion",
+    "Neck",
+    # Derived markers (appended by KeypointConverter)
+    "PelvisCenter", "Thorax", "SpineMid",
 ]
 
-assert len(BODY_MARKER_IDX) == len(BODY_MARKER_NAMES)
-
-# Skeleton connectivity for GLB line visualization (marker index pairs)
+# Skeleton connectivity for GLB line visualisation (marker index pairs)
+# Indices reflect the new BODY_MARKER_NAMES ordering above.
 SKELETON_LINKS = [
-    (1, 2),   # l_shoulder - r_shoulder
-    (1, 3),   # l_shoulder - l_elbow
-    (3, 18),  # l_elbow    - l_wrist
-    (2, 4),   # r_shoulder - r_elbow
-    (4, 17),  # r_elbow    - r_wrist
-    (1, 5),   # l_shoulder - l_hip
-    (2, 6),   # r_shoulder - r_hip
-    (5, 6),   # l_hip      - r_hip
-    (5, 7),   # l_hip      - l_knee
-    (7, 9),   # l_knee     - l_ankle
-    (9, 11),  # l_ankle    - l_big_toe
-    (9, 13),  # l_ankle    - l_heel
-    (6, 8),   # r_hip      - r_knee
-    (8, 10),  # r_knee     - r_ankle
-    (10, 14), # r_ankle    - r_big_toe
-    (10, 16), # r_ankle    - r_heel
-    (21, 22), # l_acromion - r_acromion
-    (21, 23), # l_acromion - neck
-    (22, 23), # r_acromion - neck
-    (0, 23),  # nose       - neck
+    (5,  6),  # LShoulder  - RShoulder
+    (5,  7),  # LShoulder  - LElbow
+    (7,  22), # LElbow     - LWrist
+    (6,  8),  # RShoulder  - RElbow
+    (8,  21), # RElbow     - RWrist
+    (5,  9),  # LShoulder  - LHip
+    (6,  10), # RShoulder  - RHip
+    (9,  10), # LHip       - RHip
+    (9,  11), # LHip       - LKnee
+    (11, 13), # LKnee      - LAnkle
+    (13, 15), # LAnkle     - LBigToe
+    (13, 17), # LAnkle     - LHeel
+    (10, 12), # RHip       - RKnee
+    (12, 14), # RKnee      - RAnkle
+    (14, 18), # RAnkle     - RBigToe
+    (14, 20), # RAnkle     - RHeel
+    (27, 28), # LAcromion  - RAcromion
+    (27, 29), # LAcromion  - Neck
+    (28, 29), # RAcromion  - Neck
+    (0,  29), # Nose       - Neck
 ]
 
 
-def cam_to_opensim(pts: np.ndarray) -> np.ndarray:
-    """Convert camera-space points [N, 3] to OpenSim Y-up [N, 3].
-
-    camera: X-right, Y-down, Z-forward
-    opensim: X-right, Y-up, Z-forward
-    """
-    out = pts.copy()
-    out[:, 1] = -pts[:, 1]
-    return out
-
-
-def extract_body_markers(person: dict) -> np.ndarray | None:
-    """Return [N_markers, 3] world-space Y-up marker positions or None."""
-    kpts = person.get("pred_keypoints_3d")   # [70, 3] body-local
-    cam_t = person.get("pred_cam_t")          # [3]
-    if kpts is None or cam_t is None:
-        return None
-    if np.any(np.isnan(kpts)) or np.any(np.isnan(cam_t)):
-        return None
-    world = kpts + cam_t[None, :]              # camera-space
-    markers = world[BODY_MARKER_IDX]           # [N_markers, 3]
-    return cam_to_opensim(markers)             # Y-up
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# TRC writer
+# OpenSim MarkerSet .osim writer
 # ─────────────────────────────────────────────────────────────────────────────
 
-def write_trc(
-    filepath: str | Path,
-    timestamps: List[float],
-    frames_markers: List[np.ndarray | None],
-    marker_names: List[str] = BODY_MARKER_NAMES,
-    units: str = "m",
-) -> None:
-    """Write an OpenSim TRC file.
+def write_markerset_osim(filepath: str | Path) -> None:
+    """Write an OpenSim MarkerSet .osim file for all 27 body markers.
 
-    Parameters
-    ----------
-    filepath : path for the .trc file
-    timestamps : list of frame timestamps in seconds (length N_frames)
-    frames_markers : list of [N_markers, 3] arrays or None for missing frames
-    marker_names : marker label strings
-    units : 'm' for metres (OpenSim default)
+    Uses gait2392 body segment names and the <body> tag format compatible with
+    OpenSim 4.x Scale Tool and IK Tool.  Marker names match TRC column headers.
     """
-    filepath = Path(filepath)
-    N = len(timestamps)
-    M = len(marker_names)
-    data_rate = 1.0 / (timestamps[1] - timestamps[0]) if N > 1 else 30.0
+    MARKER_BODIES = {
+        "Nose":          "head",
+        "Neck":          "torso",
+        "LAcromion":     "torso",
+        "RAcromion":     "torso",
+        "LShoulder":     "humerus_l",
+        "RShoulder":     "humerus_r",
+        "LOlecranon":    "ulna_l",
+        "ROlecranon":    "ulna_r",
+        "LElbow":        "ulna_l",
+        "RElbow":        "ulna_r",
+        "LWrist":        "hand_l",
+        "RWrist":        "hand_r",
+        "LHip":          "pelvis",
+        "RHip":          "pelvis",
+        "LKnee":         "tibia_l",
+        "RKnee":         "tibia_r",
+        "LAnkle":        "talus_l",
+        "RAnkle":        "talus_r",
+        "LHeel":         "calcn_l",
+        "RHeel":         "calcn_r",
+        "LBigToe":       "toes_l",
+        "LSmallToe":     "toes_l",
+        "RBigToe":       "toes_r",
+        "RSmallToe":     "toes_r",
+        "PelvisCenter":  "pelvis",
+        "Thorax":        "torso",
+        "SpineMid":      "torso",
+    }
 
-    # Fill missing frames by last known pose (forward fill)
-    last_good = np.zeros((M, 3), dtype=np.float64)
-    filled = []
-    for m in frames_markers:
-        if m is not None and not np.any(np.isnan(m)):
-            last_good = m.astype(np.float64)
-        filled.append(last_good.copy())
-
-    with open(filepath, "w") as f:
-        # Header rows
-        f.write(f"PathFileType\t4\t(X/Y/Z)\t{filepath.name}\n")
-        f.write(
-            f"DataRate\tCameraRate\tNumFrames\tNumMarkers\tUnits\t"
-            f"OrigDataRate\tOrigDataStartFrame\tOrigNumFrames\n"
-        )
-        f.write(
-            f"{data_rate:.4f}\t{data_rate:.4f}\t{N}\t{M}\t{units}\t"
-            f"{data_rate:.4f}\t1\t{N}\n"
-        )
-        # Marker names row: Frame# | Time | Name1 | | | Name2 | | | ...
-        names_row = "Frame#\tTime\t" + "\t\t\t".join(marker_names) + "\t\t"
-        f.write(names_row + "\n")
-        # Coordinate labels row
-        coord_labels = "\t\t" + "\t".join(
-            [f"X{i+1}\tY{i+1}\tZ{i+1}" for i in range(M)]
-        )
-        f.write(coord_labels + "\n")
-        f.write("\n")  # blank line (some TRC readers expect this)
-
-        # Data rows
-        for fi, (ts, m) in enumerate(zip(timestamps, filled)):
-            row = f"{fi+1}\t{ts:.6f}"
-            for j in range(M):
-                row += f"\t{m[j,0]:.6f}\t{m[j,1]:.6f}\t{m[j,2]:.6f}"
-            f.write(row + "\n")
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8" ?>',
+        '<OpenSimDocument Version="40000">',
+        '\t<MarkerSet name="FastSAM3DBody_markers">',
+        '\t\t<objects>',
+    ]
+    for name in BODY_MARKER_NAMES:
+        body = MARKER_BODIES.get(name, "torso")
+        lines += [
+            f'\t\t\t<Marker name="{name}">',
+            f'\t\t\t\t<body>{body}</body>',
+            '\t\t\t\t<location>0 0 0</location>',
+            '\t\t\t\t<fixed>false</fixed>',
+            '\t\t\t</Marker>',
+        ]
+    lines += [
+        '\t\t</objects>',
+        '\t</MarkerSet>',
+        '</OpenSimDocument>',
+    ]
+    Path(filepath).write_text("\n".join(lines) + "\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,69 +169,56 @@ def _signed_angle_axis(v1, v2, axis):
 def compute_joint_angles(markers: np.ndarray) -> dict:
     """Compute approximate anatomical joint angles from Y-up marker positions.
 
-    Markers order follows BODY_MARKER_NAMES:
-      0:nose, 1:l_shoulder, 2:r_shoulder, 3:l_elbow, 4:r_elbow,
-      5:l_hip, 6:r_hip, 7:l_knee, 8:r_knee, 9:l_ankle, 10:r_ankle,
-      11:l_big_toe, 12:l_small_toe, 13:l_heel, 14:r_big_toe,
-      15:r_small_toe, 16:r_heel, 17:r_wrist, 18:l_wrist,
-      19:l_olecranon, 20:r_olecranon, 21:l_acromion, 22:r_acromion, 23:neck
-
+    Markers order follows BODY_MARKER_NAMES (indices 0-26).
     Returns degrees (positive = anatomical flexion convention where noted).
     """
     up = np.array([0.0, 1.0, 0.0])
-    fwd = np.array([0.0, 0.0, 1.0])  # Z is depth in our convention
+    fwd = np.array([0.0, 0.0, 1.0])
 
-    # Anatomical directions
-    l_hip    = markers[5];  r_hip    = markers[6]
-    l_knee   = markers[7];  r_knee   = markers[8]
-    l_ankle  = markers[9];  r_ankle  = markers[10]
-    l_heel   = markers[13]; r_heel   = markers[16]
-    l_btoe   = markers[11]; r_btoe   = markers[14]
-    l_shldr  = markers[1];  r_shldr  = markers[2]
-    l_elbow  = markers[3];  r_elbow  = markers[4]
-    l_wrist  = markers[18]; r_wrist  = markers[17]
+    # Indices match BODY_MARKER_NAMES (0=Nose,1=LEye,2=REye,3=LEar,4=REar,
+    # 5=LShoulder,6=RShoulder,7=LElbow,8=RElbow,9=LHip,10=RHip,
+    # 11=LKnee,12=RKnee,13=LAnkle,14=RAnkle,15=LBigToe,16=LSmallToe,
+    # 17=LHeel,18=RBigToe,19=RSmallToe,20=RHeel,21=RWrist,22=LWrist,…)
+    l_hip    = markers[9];  r_hip    = markers[10]
+    l_knee   = markers[11]; r_knee   = markers[12]
+    l_ankle  = markers[13]; r_ankle  = markers[14]
+    l_heel   = markers[17]; r_heel   = markers[20]
+    l_btoe   = markers[15]; r_btoe   = markers[18]
+    l_shldr  = markers[5];  r_shldr  = markers[6]
+    l_elbow  = markers[7];  r_elbow  = markers[8]
+    l_wrist  = markers[22]; r_wrist  = markers[21]
     pelvis   = (l_hip + r_hip) / 2
     mid_shldr = (l_shldr + r_shldr) / 2
 
     def _seg(a, b):
         d = b - a; n = np.linalg.norm(d); return d / n if n > 1e-6 else fwd.copy()
 
-    # Knee flexion: angle between thigh and shank (0 = straight, 90 = 90° flexed)
     l_knee_flex = 180.0 - _vec_angle(_seg(l_hip, l_knee), _seg(l_knee, l_ankle))
     r_knee_flex = 180.0 - _vec_angle(_seg(r_hip, r_knee), _seg(r_knee, r_ankle))
 
-    # Hip flexion: angle of thigh from vertical (in sagittal plane)
     lateral = _seg(l_hip, r_hip)
     sagittal_normal = np.cross(up, lateral); sagittal_normal /= np.linalg.norm(sagittal_normal) + 1e-9
     l_thigh = _seg(l_hip, l_knee)
     r_thigh = _seg(r_hip, r_knee)
     l_hip_flex = _signed_angle_axis(-up, l_thigh, lateral)
     r_hip_flex = _signed_angle_axis(-up, r_thigh, -lateral)
+    l_hip_abd  = _signed_angle_axis(-up, l_thigh, sagittal_normal)
+    r_hip_abd  = _signed_angle_axis(-up, r_thigh, -sagittal_normal)
 
-    # Hip abduction: lateral deviation of thigh from vertical in frontal plane
-    l_hip_abd = _signed_angle_axis(-up, l_thigh, sagittal_normal)
-    r_hip_abd = _signed_angle_axis(-up, r_thigh, -sagittal_normal)
-
-    # Ankle dorsiflexion: angle between shank and foot (90° = neutral)
-    l_foot = _seg(l_heel, l_btoe)
-    r_foot = _seg(r_heel, r_btoe)
-    l_shank = _seg(l_knee, l_ankle)
-    r_shank = _seg(r_knee, r_ankle)
+    l_foot  = _seg(l_heel, l_btoe); r_foot  = _seg(r_heel, r_btoe)
+    l_shank = _seg(l_knee, l_ankle); r_shank = _seg(r_knee, r_ankle)
     l_ankle_df = 90.0 - _vec_angle(l_shank, l_foot)
     r_ankle_df = 90.0 - _vec_angle(r_shank, r_foot)
 
-    # Elbow flexion
     l_uarm = _seg(l_shldr, l_elbow); l_farm = _seg(l_elbow, l_wrist)
     r_uarm = _seg(r_shldr, r_elbow); r_farm = _seg(r_elbow, r_wrist)
     l_elbow_flex = 180.0 - _vec_angle(l_uarm, l_farm)
     r_elbow_flex = 180.0 - _vec_angle(r_uarm, r_farm)
 
-    # Trunk lean (forward/backward): angle of trunk from vertical
     trunk = _seg(pelvis, mid_shldr)
     trunk_flex = _signed_angle_axis(up, trunk, lateral)
     trunk_lat  = _signed_angle_axis(up, trunk, sagittal_normal)
 
-    # Pelvis tx/ty/tz: position of midpoint of hips (translation)
     return {
         "pelvis_tx":     float(pelvis[0]),
         "pelvis_ty":     float(pelvis[1]),
@@ -307,7 +247,6 @@ def write_mot(
     filepath = Path(filepath)
     N = len(timestamps)
 
-    # Forward-fill missing frames
     last_good = np.zeros((len(BODY_MARKER_NAMES), 3), dtype=np.float64)
     filled = []
     for m in frames_markers:
@@ -315,7 +254,6 @@ def write_mot(
             last_good = m.astype(np.float64)
         filled.append(last_good.copy())
 
-    # Compute angles for each frame
     angle_rows = [compute_joint_angles(m) for m in filled]
     col_names = list(angle_rows[0].keys())
 
@@ -359,8 +297,6 @@ def write_skeleton_glb(
     """Write an animated skeleton as a GLB file using GLTF2 skeletal skinning.
 
     Animation cost is O(N_frames × N_joints) — suitable for full-length videos.
-    Each landmark is a skinning "bone" whose translation is animated; the line-
-    segment mesh rigidly follows its corresponding bone.
 
     Parameters
     ----------
@@ -370,9 +306,10 @@ def write_skeleton_glb(
     links : list of (i, j) index pairs defining bone segments
     """
     filepath = Path(filepath)
-    N_joints = len(BODY_MARKER_NAMES)
+    # Infer N_joints from actual data (not hardcoded BODY_MARKER_NAMES)
+    first_valid = next((m for m in frames_markers if m is not None), None)
+    N_joints = first_valid.shape[0] if first_valid is not None else len(BODY_MARKER_NAMES)
 
-    # ── Forward-fill missing frames ───────────────────────────────────────────
     last_good = np.zeros((N_joints, 3), dtype=np.float32)
     filled = []
     for m in frames_markers:
@@ -381,35 +318,28 @@ def write_skeleton_glb(
         filled.append(last_good.copy())
 
     N_frames = len(filled)
-    bind_pos  = filled[0].copy()   # [N_joints, 3] bind-pose world positions
+    bind_pos  = filled[0].copy()
 
-    # ── Skeleton line-mesh ────────────────────────────────────────────────────
     bone_indices = np.array(
         [[a, b] for (a, b) in links], dtype=np.uint16
     ).flatten()
 
-    # Each vertex i is weighted 100 % to joint i
     joints_attr = np.zeros((N_joints, 4), dtype=np.uint8)
     for i in range(N_joints):
         joints_attr[i, 0] = i
     weights_attr = np.zeros((N_joints, 4), dtype=np.float32)
     weights_attr[:, 0] = 1.0
 
-    # Inverse bind matrices: 24 × 4×4 column-major float32
-    # Vertex i starts at bind_pos[i]; IBM = translation(-bind_pos[i])
     ibm = np.zeros((N_joints, 16), dtype=np.float32)
     for i, p in enumerate(bind_pos):
         ibm[i] = [1,0,0,0, 0,1,0,0, 0,0,1,0, -p[0],-p[1],-p[2],1]
 
-    # Per-joint translation animation: delta from bind pose so that
-    #   skinned_pos = joint_current - bind_pos + bind_pos = joint_current
     all_translations = np.stack(
         [(f - bind_pos) for f in filled], axis=1
     ).astype(np.float32)   # [N_joints, N_frames, 3]
 
     anim_times = np.array([float(t) for t in timestamps], dtype=np.float32)
 
-    # ── Build binary buffer ───────────────────────────────────────────────────
     chunks = []
     byte_offset = 0
 
@@ -437,7 +367,6 @@ def write_skeleton_glb(
 
     bin_data = b''.join(chunks)
 
-    # ── GLTF JSON ─────────────────────────────────────────────────────────────
     def _b3(a): m, M = a.min(axis=0).tolist(), a.max(axis=0).tolist(); return m, M
     def _b1(a): return [float(a.min())], [float(a.max())]
 
@@ -455,22 +384,16 @@ def write_skeleton_glb(
     t_min, t_max = _b1(anim_times)
 
     accessors = [
-        # 0: vertex positions (bind)
         {"bufferView": BV_POS, "byteOffset": 0, "componentType": 5126,
          "count": N_joints, "type": "VEC3", "min": p_min, "max": p_max},
-        # 1: line indices
         {"bufferView": BV_IDX, "byteOffset": 0, "componentType": 5123,
          "count": len(bone_indices), "type": "SCALAR"},
-        # 2: JOINTS_0
         {"bufferView": BV_JNT, "byteOffset": 0, "componentType": 5121,
          "count": N_joints, "type": "VEC4"},
-        # 3: WEIGHTS_0
         {"bufferView": BV_WGT, "byteOffset": 0, "componentType": 5126,
          "count": N_joints, "type": "VEC4"},
-        # 4: inverse bind matrices
         {"bufferView": BV_IBM, "byteOffset": 0, "componentType": 5126,
          "count": N_joints, "type": "MAT4"},
-        # 5: animation timestamps
         {"bufferView": BV_T, "byteOffset": 0, "componentType": 5126,
          "count": N_frames, "type": "SCALAR", "min": t_min, "max": t_max},
     ]
@@ -514,7 +437,7 @@ def write_skeleton_glb(
             "primitives": [{
                 "attributes": {"POSITION": 0, "JOINTS_0": 2, "WEIGHTS_0": 3},
                 "indices": 1,
-                "mode": 1,  # LINES
+                "mode": 1,
             }],
         }],
         "skins": [{
@@ -536,7 +459,7 @@ def write_skeleton_glb(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mesh GLB writer (full body mesh animation using trimesh + pygltflib)
+# Mesh GLB writer (full body mesh animation using morph targets)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def write_mesh_glb(
@@ -547,19 +470,15 @@ def write_mesh_glb(
 ) -> None:
     """Write animated full body mesh as GLB using morph targets.
 
-    For long sequences, set --max_frames or use --skip_mesh to keep file sizes
-    manageable (18 439 verts × 4 bytes × 3 × N_frames).
-
     Parameters
     ----------
     filepath : output .glb
     timestamps : frame timestamps in seconds
-    frames_verts : per-frame [18439, 3] vertex arrays in Y-up metres (or None)
+    frames_verts : per-frame [18439, 3] vertex arrays in camera space (or None)
     faces : [N_faces, 3] int triangle indices (from estimator.faces)
     """
     filepath = Path(filepath)
 
-    # Forward-fill
     last_good = None
     filled = []
     for v in frames_verts:
@@ -575,7 +494,6 @@ def write_mesh_glb(
     if not any(f is not None for f in filled):
         return
 
-    # Replace None with zeros
     N_verts = faces.max() + 1
     zero_v = np.zeros((N_verts, 3), dtype=np.float32)
     filled = [f if f is not None else zero_v for f in filled]

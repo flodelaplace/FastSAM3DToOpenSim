@@ -14,34 +14,67 @@ python demo_video_opensim.py \
     --video_path ./videos/your_video.mp4 \
     --detector yolo_pose \
     --detector_model checkpoints/yolo/yolo11m-pose.engine \
-    --inference_type body \
+    --inference_type full \
     --fx 1371
 ```
 
-This runs at ~14-15fps on RTX 5090 Laptop and writes four output files to `./output_opensim/`.
+`--inference_type full` includes hand tracking (required for full 73-marker IK).
+Use `--inference_type body` for faster runs (~14 fps) without hand markers.
+
+Measured on RTX 5090 Laptop, 848×480 video:
+
+| Mode | Inference FPS |
+|------|--------------|
+| `body` — no hands | **~14 fps** |
+| `full` — body + hands | **~5.3 fps** |
 
 ---
 
 ## Output files
 
-All files land in `--output_dir` (default `./output_opensim/`).
+Each run creates a timestamped folder: `output_YYYYMMDD_HHMMSS_<videoname>/`
 
 | File | Description |
 |------|-------------|
-| `<video_name>_skeleton.mp4` | Annotated video with 2D skeleton overlay |
-| `<video_name>.trc` | OpenSim Track Row Column marker file — 24 body landmarks in metres, Y-up |
-| `<video_name>.mot` | OpenSim motion file — 15 anatomical joint angles in degrees (geometric estimate) |
-| `<video_name>_skeleton.glb` | Animated skeleton for Blender / three.js (skeletal skinning, ~340 KB for 1136 frames) |
-| `<video_name>_mesh.glb` | Animated full body mesh (optional, only with `--mesh_glb`, large file) |
+| `markers_<name>_skeleton.mp4` | Annotated video with 2D skeleton overlay |
+| `markers_<name>.trc` | OpenSim TRC marker file — 73 landmarks in mm, Y-up |
+| `markers_<name>_ik.mot` | OpenSim IK-solved joint angles — 40 DOF, degrees |
+| `markers_<name>_model.osim` | Pose2Sim_Simple body model (used by IK solver) |
+| `markers_<name>.glb` | Animated rigged skeleton GLB (Blender / three.js) |
+| `markers_<name>_mesh.glb` | Animated full-body mesh GLB (~185 MB, skip with `--no_mesh_glb`) |
+| `_ik_marker_errors.sto` | OpenSim IK marker tracking errors per frame |
+| `inference_meta.json` | Video metadata (fps, resolution, frame count) |
+| `video_outputs.json` | Per-frame raw 3D keypoints |
+| `processing_report.json` | Pipeline summary: timings, marker count, IK/GLB status |
 
 ---
 
 ## OpenSim workflow after running
 
-1. **Scale model**: `Tools → Scale → load your .osim model` — use the TRC from a static standing pose
-2. **Inverse Kinematics**: `Tools → Inverse Kinematics → load TRC` — produces a properly solved MOT
-3. The MOT written by this script uses geometric angle estimation (no SMPL). It is useful for preview and sanity-checking but IK output will be more accurate.
-4. GLB files: `File → Import → glTF 2.0` in Blender, or drag into three.js / model-viewer.
+The IK MOT is written automatically — OpenSim does not need to be opened to run IK.
+The files are already in the correct format to load directly in OpenSim 4.5+:
+
+1. **Load model**: `File → Open Model` → select `markers_<name>_model.osim`
+2. **Preview motion**: `File → Load Motion` → select `markers_<name>_ik.mot`
+3. **Inspect markers**: `File → Open Motion Capture Data` → select `markers_<name>.trc`
+
+For custom scaling or re-running IK with different settings:
+- Scale Tool: load `markers_<name>_model.osim`, use a static standing TRC
+- IK Tool: load the TRC; the body model already has the correct MarkerSet
+
+---
+
+## Dependencies for the full pipeline
+
+| Component | Used for | Setup |
+|-----------|----------|-------|
+| `fast_sam_3d_body` conda env | 3D pose inference | See [SETUP.md](SETUP.md) |
+| `opensim` conda env | IK solver | `conda create -n opensim && conda install -c opensim-org opensim` |
+| Blender | Rigged GLB export | `sudo apt install blender && pip3.12 install numpy --break-system-packages` |
+
+The pipeline detects missing dependencies and falls back gracefully:
+- No `opensim` env → IK skipped, TRC still written
+- No Blender → falls back to built-in skeleton GLB writer
 
 ---
 
@@ -52,20 +85,20 @@ All files land in `--output_dir` (default `./output_opensim/`).
 | Flag | Description |
 |------|-------------|
 | `--video_path` | Path to input video |
-| `--fx` | Camera focal length in pixels. **Strongly recommended.** Skips MoGe depth estimation and uses a pinhole model directly. For a typical phone or webcam, fx ≈ image_width × 1.0 to 1.5. If omitted, MoGe estimates it (adds ~15ms/frame, less accurate). |
+| `--fx` | Camera focal length in pixels. **Strongly recommended.** Skips MoGe depth estimation and uses a pinhole model directly. For a typical phone or webcam, fx ≈ image_width × 1.0 to 1.5. If omitted, MoGe estimates it (adds ~15 ms/frame, less accurate). |
 
 ### Optional flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--output_dir` | `./output_opensim` | Where to write all output files |
+| `--output_dir` | auto | Output directory. Default: `output_YYYYMMDD_HHMMSS_<videoname>/` in the working directory. |
 | `--detector` | `yolo_pose` | Person detector backend |
 | `--detector_model` | `./checkpoints/yolo/yolo11m-pose.engine` | Path to YOLO model (`.engine` for TRT, `.pt` for PyTorch) |
-| `--hands` | off | Include hand and finger tracking. Measured: **5.2 fps** vs **14.7 fps** body-only — nearly 3× slower. |
-| `--inference_type` | `body` | Power-user override: `full` = hands, `body` = no hands. Superseded by `--hands` if both given. |
+| `--inference_type` | `full` | `full` = body + hands (73 markers, IK-ready) · `body` = faster, fewer markers |
+| `--person_height` | `1.75` | Known subject height in metres. Scales 3D output to match. |
 | `--target_fps` | `0` | Process at this FPS by skipping frames (0 = every frame) |
 | `--max_frames` | `0` | Stop after this many input frames (0 = full video) |
-| `--mesh_glb` | off | Also write a full body mesh GLB (large: ~185 MB for 1136 frames) |
+| `--no_mesh_glb` | off | Skip full body mesh GLB export (saves ~185 MB for long videos) |
 | `--fy` | same as `--fx` | Focal length y if different from fx |
 | `--cx`, `--cy` | frame centre | Principal point in pixels. Defaults to width/2, height/2. |
 | `--local_checkpoint` | `./checkpoints/sam-3d-body-dinov3` | Path to SAM-3D-Body checkpoint directory |
@@ -104,7 +137,7 @@ This writes only the annotated MP4 to `./output_video/`.
 ## Processing a subset of frames (fast test)
 
 ```bash
-# Process only the first 60 frames at 5fps
+# Process only the first 60 frames at 5 fps
 python demo_video_opensim.py \
     --video_path ./videos/your_video.mp4 \
     --inference_type body \
@@ -117,6 +150,6 @@ python demo_video_opensim.py \
 
 ## Notes on the first run (warm-up)
 
-When `USE_COMPILE=1` or `DECODER_COMPILE=1` is set, `torch.compile` triggers a JIT compilation on the first few frames. This takes 30-60 seconds and shows slower per-frame times. Subsequent frames run at full speed. The compiled kernels are cached by PyTorch and reused across runs as long as the environment has not changed.
+When `USE_COMPILE=1` or `DECODER_COMPILE=1` is set, `torch.compile` triggers a JIT compilation on the first few frames. This takes 30–60 seconds and shows slower per-frame times. Subsequent frames run at full speed. The compiled kernels are cached by PyTorch and reused across runs as long as the environment has not changed.
 
 When `USE_TRT_BACKBONE=1` is set, the TRT engine is loaded from disk (~1.6 GB). This takes ~5 seconds at startup but inference is faster.
