@@ -258,6 +258,7 @@ def main(args):
     all_kpts_raw    = []   # [N_frames] of [70, 3] camera-space kpts, or None
     all_cam_t       = []   # [N_frames] of [3], or None
     all_verts       = []   # [N_frames] of [18439, 3] or None  (for mesh GLB)
+    all_joint_coords = []  # [N_frames] of [127, 3] camera-space joint coords, or None
     all_raw_outputs = []   # for video_outputs.json
     inference_times = []
 
@@ -296,6 +297,7 @@ def main(args):
             all_kpts_raw.append(None)
             all_cam_t.append(None)
             all_verts.append(None)
+            all_joint_coords.append(None)
             all_raw_outputs.append({"frame": f"frame_{frame_idx:06d}.jpg", "outputs": []})
             frame_idx += 1
             processed += 1
@@ -307,7 +309,7 @@ def main(args):
         # Pick the largest person (most confident detection)
         person = outputs[0] if outputs else None
 
-        # Collect raw keypoints and camera translation for this frame
+        # Collect raw keypoints, camera translation, and joint coords for this frame
         if person is not None:
             kpts  = person.get("pred_keypoints_3d")   # [70, 3] camera space
             cam_t = person.get("pred_cam_t")           # [3]
@@ -317,9 +319,15 @@ def main(args):
             else:
                 all_kpts_raw.append(None)
                 all_cam_t.append(None)
+            jc = person.get("pred_joint_coords")       # [127, 3] camera space
+            if jc is not None and not np.any(np.isnan(jc)):
+                all_joint_coords.append(jc.copy())
+            else:
+                all_joint_coords.append(None)
         else:
             all_kpts_raw.append(None)
             all_cam_t.append(None)
+            all_joint_coords.append(None)
 
         timestamps.append(frame_idx / fps)
 
@@ -472,6 +480,7 @@ def main(args):
         print(f"  Writing mesh GLB  → {mesh_glb}")
         write_mesh_glb(mesh_glb, timestamps, all_verts, estimator.faces,
                        frames_kpts=all_kpts_raw, frames_cam_t=all_cam_t,
+                       frames_joint_coords=all_joint_coords,
                        body_only=body_only)
         # gltfpack disabled: incompatible with viewer (KHR_mesh_quantization breaks morph targets)
         # _compress_glb(mesh_glb)

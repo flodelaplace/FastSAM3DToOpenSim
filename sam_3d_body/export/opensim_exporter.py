@@ -512,11 +512,15 @@ _MESH_JOINT_MARKERS = [
     (4,  'R', 0.010),   # right ear
     (1,  'L', 0.008),   # left eye
     (2,  'R', 0.008),   # right eye
-    # Virtual spine + head points (derived in write_mesh_glb)
-    (70, 'C', 0.014),   # pelvis center
-    (71, 'C', 0.012),   # spine mid
-    (72, 'C', 0.012),   # thorax
-    (73, 'C', 0.012),   # head center (midpoint of ears)
+    # Spine + head points (indices 70–76, appended in write_mesh_glb)
+    # Real joints from pred_joint_coords; geometric fallback if unavailable
+    (70, 'C', 0.014),   # pelvis center (geometric)
+    (71, 'C', 0.011),   # c_spine0 / lower lumbar
+    (72, 'C', 0.011),   # c_spine1 / upper lumbar
+    (73, 'C', 0.011),   # c_spine2 / lower thoracic
+    (74, 'C', 0.011),   # c_spine3 / upper thoracic
+    (75, 'C', 0.012),   # c_neck
+    (76, 'C', 0.012),   # c_head
 ]
 _MESH_BONE_PAIRS = [
     # Arms
@@ -536,22 +540,24 @@ _MESH_BONE_PAIRS = [
     (14, 18),   # R ankle → big_toe
     (14, 19),   # R ankle → small_toe
     (14, 20),   # R ankle → heel
-    # Torso / spine  (virtual: 70=PelvisCenter, 71=SpineMid, 72=Thorax)
+    # Torso / spine  (70=PelvisCenter, 71=c_spine0, 72=c_spine1, 73=c_spine2, 74=c_spine3)
     (5,  6),    # shoulders across
     (9,  10),   # hips across
     (9,  70),   # L hip → pelvis center
     (10, 70),   # R hip → pelvis center
-    (70, 71),   # pelvis center → spine mid
-    (71, 72),   # spine mid → thorax
-    (72, 5),    # thorax → L shoulder
-    (72, 6),    # thorax → R shoulder
-    (69, 72),   # neck → thorax
-    (69, 5),    # neck → L shoulder
-    (69, 6),    # neck → R shoulder
-    # Head  (virtual: 73=HeadCenter)
-    (69, 73),   # neck → head center
-    (73, 1),    # head center → L eye
-    (73, 2),    # head center → R eye
+    (70, 71),   # pelvis center → c_spine0
+    (71, 72),   # c_spine0 → c_spine1
+    (72, 73),   # c_spine1 → c_spine2
+    (73, 74),   # c_spine2 → c_spine3
+    (74, 5),    # c_spine3 → L shoulder
+    (74, 6),    # c_spine3 → R shoulder
+    # Neck  (75=c_neck)
+    (75, 74),   # c_neck → c_spine3
+    (69, 75),   # surface neck → c_neck
+    # Head  (76=c_head)
+    (76, 75),   # c_head → c_neck
+    (76, 1),    # c_head → L eye
+    (76, 2),    # c_head → R eye
     # Right hand fingers
     (41, 24),   # wrist → thumb_knuckle
     (24, 23), (23, 22), (22, 21),        # thumb
@@ -663,6 +669,7 @@ def write_mesh_glb(
     faces: np.ndarray,
     frames_kpts: List[np.ndarray | None] | None = None,
     frames_cam_t: List[np.ndarray | None] | None = None,
+    frames_joint_coords: List[np.ndarray | None] | None = None,
     body_only: bool = False,
 ) -> None:
     """Write animated full body mesh as GLB using morph targets.
@@ -675,6 +682,7 @@ def write_mesh_glb(
     faces : [N_faces, 3] int triangle indices (from estimator.faces)
     frames_kpts : per-frame [70, 3] camera-space keypoints (no cam_t), or None
     frames_cam_t : per-frame [3] camera translation, or None
+    frames_joint_coords : per-frame [127, 3] camera-space MHR joint coords (no cam_t), or None
     body_only : if True, skip all hand/wrist joint markers and bone sticks
     """
     filepath = Path(filepath)
@@ -714,6 +722,19 @@ def write_mesh_glb(
                 last_kpts = w
             kpts_world[i] = last_kpts.copy() if last_kpts is not None else None
 
+    # ── Build per-frame world-space joint coords (127-joint MHR armature) ─────
+    has_jcoords = (frames_joint_coords is not None and frames_cam_t is not None)
+    jcoords_world: List[np.ndarray | None] = [None] * N_frames
+    if has_jcoords:
+        last_jc: np.ndarray | None = None
+        for i, (jc, ct) in enumerate(zip(frames_joint_coords, frames_cam_t)):
+            if jc is not None and ct is not None and not np.any(np.isnan(jc)):
+                w = (jc + ct[None, :]).astype(np.float32)
+                w[:, 1] = -w[:, 1]   # Y-up
+                w[:, 0] = -w[:, 0]   # fix mirror
+                last_jc = w
+            jcoords_world[i] = last_jc.copy() if last_jc is not None else None
+
     # ── Center at pelvis each frame (remove global translation) ───────────────
     if has_kpts:
         last_pelvis = np.zeros(3, dtype=np.float32)
@@ -724,6 +745,8 @@ def write_mesh_glb(
             filled[i] = filled[i] - last_pelvis[None, :]
             if kpts_world[i] is not None:
                 kpts_world[i] = kpts_world[i] - last_pelvis[None, :]
+            if has_jcoords and jcoords_world[i] is not None:
+                jcoords_world[i] = jcoords_world[i] - last_pelvis[None, :]
 
     # ── Smooth mesh vertices + keypoints (Butterworth 6 Hz, same as PostProcessor) ──
     _fps_est = float(N_frames - 1) / max(float(timestamps[-1] - timestamps[0]), 1e-3)
@@ -743,17 +766,45 @@ def write_mesh_glb(
                 _kw_smooth[i].reshape(-1, 3) if kpts_world[i] is not None else None
                 for i in range(N_frames)
             ]
+        if has_jcoords:
+            _jc_non_none = [jc for jc in jcoords_world if jc is not None]
+            if _jc_non_none:
+                _jc_ref = _jc_non_none[0]
+                _jc_fill = [jc if jc is not None else _jc_ref for jc in jcoords_world]
+                _jc_arr = np.stack(_jc_fill, axis=0).reshape(N_frames, -1)
+                _jc_smooth = filtfilt(_b, _a, _jc_arr, axis=0).astype(np.float32)
+                jcoords_world = [
+                    _jc_smooth[i].reshape(-1, 3) if jcoords_world[i] is not None else None
+                    for i in range(N_frames)
+                ]
 
-    # ── Append virtual keypoints (70=PelvisCenter, 71=SpineMid, 72=Thorax, 73=HeadCenter) ──
+    # ── Append spine/head points at indices 70–76 ─────────────────────────────
+    # 70=PelvisCenter(geometric), 71=c_spine0, 72=c_spine1, 73=c_spine2,
+    # 74=c_spine3, 75=c_neck, 76=c_head
+    # Uses real pred_joint_coords joints; falls back to geometric interpolation.
     if has_kpts:
         for i in range(N_frames):
             kw = kpts_world[i]
             if kw is not None:
-                pelvis_c  = (kw[9]  + kw[10]) / 2.0
-                thorax    = (kw[5]  + kw[6])  / 2.0
-                spine_mid = (pelvis_c + thorax) / 2.0
-                head_c    = (kw[3]  + kw[4])  / 2.0   # midpoint of ears
-                kpts_world[i] = np.vstack([kw, pelvis_c, spine_mid, thorax, head_c])
+                pelvis_c = ((kw[9] + kw[10]) / 2.0).astype(np.float32)  # idx 70
+                if has_jcoords and jcoords_world[i] is not None:
+                    jc = jcoords_world[i]
+                    spine0 = jc[34]    # c_spine0 (lower lumbar)   idx 71
+                    spine1 = jc[35]    # c_spine1 (upper lumbar)   idx 72
+                    spine2 = jc[36]    # c_spine2 (lower thoracic) idx 73
+                    spine3 = jc[37]    # c_spine3 (upper thoracic) idx 74
+                    neck   = jc[110]   # c_neck                    idx 75
+                    head   = jc[113]   # c_head                    idx 76
+                else:
+                    # Geometric fallback (no joint_coords available)
+                    thorax = ((kw[5] + kw[6]) / 2.0).astype(np.float32)
+                    spine0 = (pelvis_c * 0.75 + thorax * 0.25).astype(np.float32)
+                    spine1 = (pelvis_c * 0.50 + thorax * 0.50).astype(np.float32)
+                    spine2 = (pelvis_c * 0.25 + thorax * 0.75).astype(np.float32)
+                    spine3 = thorax
+                    neck   = kw[69].astype(np.float32)   # surface neck kpt
+                    head   = ((kw[3] + kw[4]) / 2.0).astype(np.float32)  # ear midpoint
+                kpts_world[i] = np.vstack([kw, pelvis_c, spine0, spine1, spine2, spine3, neck, head])
 
     base_pos = filled[0]
 
