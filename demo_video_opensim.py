@@ -50,6 +50,7 @@ import argparse
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -65,10 +66,7 @@ sys.path.insert(0, parent_dir)
 from notebook.utils import setup_sam_3d_body
 from sam_3d_body.visualization.skeleton_visualizer import SkeletonVisualizer
 from sam_3d_body.metadata.mhr70 import pose_info as mhr70_pose_info
-from sam_3d_body.export.opensim_exporter import (
-    write_skeleton_glb,
-    write_mesh_glb,
-)
+from sam_3d_body.export.opensim_exporter import write_mesh_glb
 from sam_3d_body.export.post_processing import PostProcessor
 from sam_3d_body.export.coordinate_transform import CoordinateTransformer
 from sam_3d_body.export.keypoint_converter import KeypointConverter
@@ -78,51 +76,93 @@ from sam_3d_body.export.opensim_ik_runner import run_ik
 # Pose2Sim model template bundled with the repo
 _MODEL_TEMPLATE = os.path.join(parent_dir, "assets", "pose2sim_simple_model.osim")
 
-# Blender rig and export script for GLB generation
-_BLEND_RIG    = os.path.join(parent_dir, "assets", "Import_OS4_Patreon_Aitor_Skely.blend")
-_GLB_SCRIPT   = os.path.join(parent_dir, "export_glb_skely.py")
 
 
-def _run_blender_glb(mot_path: str, output_path: str, trc_path: str | None, fps: float) -> bool:
-    """Run Blender headless to export a GLB from an IK MOT file.
+_GLTFPACK = "/home/linuxaitor/.npm/_npx/5dd372e23156e673/node_modules/.bin/gltfpack"
 
-    Returns True on success, False if Blender or the rig file is unavailable.
+def _fix_morph_weights(data: bytes) -> bytes:
+    """Fix gltfpack's illegal quantization of morph weight animation outputs.
+
+    gltfpack converts morph weight outputs to UNSIGNED_BYTE/normalized, which violates
+    the glTF spec (weights must be FLOAT). This re-encodes them back to float32.
     """
-    blender = shutil.which("blender")
-    if blender is None:
-        print("  [GLB] blender not found in PATH — skipping Blender GLB export")
-        return False
-    if not os.path.isfile(_BLEND_RIG):
-        print(f"  [GLB] rig file not found: {_BLEND_RIG}")
-        return False
-    if not os.path.isfile(_GLB_SCRIPT):
-        print(f"  [GLB] export script not found: {_GLB_SCRIPT}")
-        return False
+    import json as _json
+    json_len = struct.unpack_from('<I', data, 12)[0]
+    gltf = _json.loads(data[20:20+json_len])
+    bin_data = bytearray(data[20+json_len+8:])
 
-    cmd = [
-        blender, "--background", _BLEND_RIG,
-        "--python", _GLB_SCRIPT,
-        "--",
-        "--mot", mot_path,
-        "--output", output_path,
-        "--fps", str(int(round(fps))),
-    ]
-    if trc_path and os.path.isfile(trc_path):
-        cmd += ["--trc", trc_path]
+    anim = gltf.get('animations', [{}])[0]
+    weights_channels = [c for c in anim.get('channels', []) if c['target']['path'] == 'weights']
+    fixed = False
+    for ch in weights_channels:
+        sampler = anim['samplers'][ch['sampler']]
+        acc = gltf['accessors'][sampler['output']]
+        if acc['componentType'] == 5126:   # already float32
+            continue
+        # Decode from quantized type → float32
+        bv = gltf['bufferViews'][acc['bufferView']]
+        offset = bv.get('byteOffset', 0) + acc.get('byteOffset', 0)
+        count = acc['count']
+        ct = acc['componentType']
+        normalized = acc.get('normalized', False)
+        dtype_map = {5120: np.int8, 5121: np.uint8, 5122: np.int16, 5123: np.uint16}
+        raw = np.frombuffer(bytes(bin_data[offset:offset + count * np.dtype(dtype_map[ct]).itemsize]),
+                            dtype=dtype_map[ct])
+        if normalized:
+            scale = {5120: 1/127, 5121: 1/255, 5122: 1/32767, 5123: 1/65535}[ct]
+            values = raw.astype(np.float32) * scale
+        else:
+            values = raw.astype(np.float32)
+        float_bytes = values.tobytes()
+        # Append float32 data to end of binary buffer and add a new bufferView
+        new_bv_offset = len(bin_data)
+        bin_data.extend(float_bytes)
+        pad = (4 - len(float_bytes) % 4) % 4
+        bin_data.extend(b'\x00' * pad)
+        new_bv_idx = len(gltf['bufferViews'])
+        gltf['bufferViews'].append({'buffer': 0, 'byteOffset': new_bv_offset, 'byteLength': len(float_bytes)})
+        acc['bufferView'] = new_bv_idx
+        acc['byteOffset'] = 0
+        acc['componentType'] = 5126
+        acc.pop('normalized', None)
+        fixed = True
 
-    print(f"  [GLB] Running Blender GLB export...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  [GLB] Blender exited with code {result.returncode}")
-        print(result.stderr[-2000:] if result.stderr else "")
-        return False
+    if not fixed:
+        return data
 
-    if not os.path.isfile(output_path):
-        print(f"  [GLB] Blender ran but output file not created: {output_path}")
-        return False
+    gltf['buffers'][0]['byteLength'] = len(bin_data)
+    json_bytes = _json.dumps(gltf, separators=(',', ':')).encode('utf-8')
+    pad_j = (4 - len(json_bytes) % 4) % 4
+    json_bytes += b' ' * pad_j
+    bin_bytes = bytes(bin_data)
+    pad_b = (4 - len(bin_bytes) % 4) % 4
+    bin_bytes += b'\x00' * pad_b
+    json_chunk = struct.pack('<II', len(json_bytes), 0x4E4F534A) + json_bytes
+    bin_chunk  = struct.pack('<II', len(bin_bytes),  0x004E4942) + bin_bytes
+    header = struct.pack('<III', 0x46546C67, 2, 12 + len(json_chunk) + len(bin_chunk))
+    return header + json_chunk + bin_chunk
 
-    print(f"  [GLB] Blender GLB written: {output_path}")
-    return True
+
+def _compress_glb(path: str) -> None:
+    """Run gltfpack -c on a GLB, fix illegal weight quantization, replace in-place."""
+    if not os.path.isfile(_GLTFPACK):
+        return
+    tmp = path + ".tmp.glb"
+    result = subprocess.run(
+        [_GLTFPACK, "-c", "-i", path, "-o", tmp],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0 and os.path.isfile(tmp):
+        orig_mb = os.path.getsize(path) / 1e6
+        fixed = _fix_morph_weights(open(tmp, 'rb').read())
+        open(tmp, 'wb').write(fixed)
+        comp_mb = os.path.getsize(tmp) / 1e6
+        os.replace(tmp, path)
+        print(f"  [gltfpack] {orig_mb:.1f} MB → {comp_mb:.1f} MB ({100*comp_mb/orig_mb:.0f}%)")
+    else:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+        print(f"  [gltfpack] compression failed: {result.stderr[-200:]}")
 
 
 def draw_results_on_frame(img_bgr, outputs, visualizer):
@@ -198,7 +238,6 @@ def main(args):
     ik_mot_path    = os.path.join(args.output_dir, f"{prefix}_ik.mot")
     errors_path    = os.path.join(args.output_dir, "_ik_marker_errors.sto")
     osim_path      = os.path.join(args.output_dir, f"{prefix}_model.osim")
-    skel_glb       = os.path.join(args.output_dir, f"{prefix}.glb")
     mesh_glb       = os.path.join(args.output_dir, f"{prefix}_mesh.glb")
     meta_path      = os.path.join(args.output_dir, "inference_meta.json")
     outputs_path   = os.path.join(args.output_dir, "video_outputs.json")
@@ -429,23 +468,13 @@ def main(args):
     if not ik_ok:
         print("  WARNING: OpenSim IK failed or opensim env not found.")
 
-    print(f"  Writing skeleton GLB → {skel_glb}")
-    blender_glb_ok = False
-    if ik_ok:
-        blender_glb_ok = _run_blender_glb(
-            mot_path=ik_mot_path,
-            output_path=skel_glb,
-            trc_path=trc_path,
-            fps=out_fps,
-        )
-    if not blender_glb_ok:
-        print("  [GLB] Falling back to built-in skeleton GLB writer")
-        write_skeleton_glb(skel_glb, timestamps, frames_markers_body)
-
     if not args.no_mesh_glb:
         print(f"  Writing mesh GLB  → {mesh_glb}")
         write_mesh_glb(mesh_glb, timestamps, all_verts, estimator.faces,
-                       frames_kpts=all_kpts_raw, frames_cam_t=all_cam_t)
+                       frames_kpts=all_kpts_raw, frames_cam_t=all_cam_t,
+                       body_only=body_only)
+        # gltfpack disabled: incompatible with viewer (KHR_mesh_quantization breaks morph targets)
+        # _compress_glb(mesh_glb)
 
     # Write processing report (matches SAM3D-OpenSim convention)
     report_path = os.path.join(args.output_dir, "processing_report.json")
@@ -460,7 +489,6 @@ def main(args):
             "num_frames": processed,
             "num_markers": len(marker_names),
             "ik_success": ik_ok,
-            "glb_blender": blender_glb_ok,
         },
         "timings": {"total": total_time},
         "outputs": {
@@ -468,7 +496,7 @@ def main(args):
             "trc": trc_path,
             "mot": ik_mot_path if ik_ok else None,
             "model": osim_path,
-            "glb": skel_glb,
+            "mesh_glb": mesh_glb,
         },
     }
     with open(report_path, "w") as f:
@@ -480,8 +508,6 @@ def main(args):
     print(f"  TRC (73 markers/mm): {os.path.basename(trc_path)}")
     print(f"  IK MOT (40 DOF):     {os.path.basename(ik_mot_path)}" + (" ✓" if ik_ok else " (skipped)"))
     print(f"  Body model:          {os.path.basename(osim_path)}")
-    glb_note = " (Blender)" if blender_glb_ok else " (built-in)"
-    print(f"  Skeleton GLB:        {os.path.basename(skel_glb)}{glb_note}")
     if not args.no_mesh_glb:
         print(f"  Mesh GLB:            {os.path.basename(mesh_glb)}")
     print(f"  Processing report:   {os.path.basename(report_path)}")
@@ -509,11 +535,11 @@ if __name__ == "__main__":
     parser.add_argument("--local_checkpoint", default="./checkpoints/sam-3d-body-dinov3")
     parser.add_argument("--hands", action="store_true",
                         help="(legacy) Equivalent to --inference_type full")
-    parser.add_argument("--inference_type", default=None, choices=["full", "body"],
-                        help="'full' includes hands (default, needed for IK), "
-                             "'body' skips hands (faster but IK hand markers missing).")
-    parser.add_argument("--target_fps", type=float, default=0,
-                        help="Process at this FPS (0=all frames)")
+    parser.add_argument("--inference_type", default="body", choices=["full", "body"],
+                        help="'body' (default) skips hands for speed; "
+                             "'full' adds hand markers for IK and GLB.")
+    parser.add_argument("--target_fps", type=float, default=30,
+                        help="Process at this FPS (0=all frames, default=30)")
     parser.add_argument("--max_frames", type=int, default=0,
                         help="Stop after this many input frames (0=all)")
     parser.add_argument("--no_mesh_glb", action="store_true",
@@ -530,8 +556,4 @@ if __name__ == "__main__":
                         help="Principal point x (pixels). Defaults to frame_width/2.")
     parser.add_argument("--cy", type=float, default=None)
     args = parser.parse_args()
-    # Resolve inference_type: explicit --inference_type wins;
-    # default is 'full' (hands needed for IK hand markers LIndex3/RIndex3/etc.)
-    if args.inference_type is None:
-        args.inference_type = "full" if args.hands else "full"
     main(args)

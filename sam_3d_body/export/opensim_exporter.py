@@ -635,6 +635,8 @@ def _quat_y_to_dir(d: np.ndarray) -> np.ndarray:
                     dtype=np.float32)
 
 
+_HAND_KPT_INDICES = set(range(21, 63))   # finger joints + wrists (21-40 R, 41 R-wrist, 42-61 L, 62 L-wrist)
+
 def write_mesh_glb(
     filepath: str | Path,
     timestamps: List[float],
@@ -642,6 +644,7 @@ def write_mesh_glb(
     faces: np.ndarray,
     frames_kpts: List[np.ndarray | None] | None = None,
     frames_cam_t: List[np.ndarray | None] | None = None,
+    body_only: bool = False,
 ) -> None:
     """Write animated full body mesh as GLB using morph targets.
 
@@ -653,6 +656,7 @@ def write_mesh_glb(
     faces : [N_faces, 3] int triangle indices (from estimator.faces)
     frames_kpts : per-frame [70, 3] camera-space keypoints (no cam_t), or None
     frames_cam_t : per-frame [3] camera translation, or None
+    body_only : if True, skip all hand/wrist joint markers and bone sticks
     """
     filepath = Path(filepath)
 
@@ -700,11 +704,37 @@ def write_mesh_glb(
             if kpts_world[i] is not None:
                 kpts_world[i] = kpts_world[i] - last_pelvis[None, :]
 
+    # ── Smooth mesh vertices + keypoints (Butterworth 6 Hz, same as PostProcessor) ──
+    _fps_est = float(N_frames - 1) / max(float(timestamps[-1] - timestamps[0]), 1e-3)
+    _nyq = _fps_est / 2.0
+    _cut = 6.0
+    if _cut < _nyq and N_frames >= 13:
+        from scipy.signal import butter, filtfilt
+        _b, _a = butter(4, _cut / _nyq, btype='low')
+        _flat = np.stack(filled, axis=0).reshape(N_frames, -1)
+        filled = [r.reshape(-1, 3) for r in filtfilt(_b, _a, _flat, axis=0).astype(np.float32)]
+        if has_kpts:
+            _kw_ref = next(kw for kw in kpts_world if kw is not None)
+            _kw_fill = [kw if kw is not None else _kw_ref for kw in kpts_world]
+            _kw_arr = np.stack(_kw_fill, axis=0).reshape(N_frames, -1)
+            _kw_smooth = filtfilt(_b, _a, _kw_arr, axis=0).astype(np.float32)
+            kpts_world = [
+                _kw_smooth[i].reshape(-1, 3) if kpts_world[i] is not None else None
+                for i in range(N_frames)
+            ]
+
     base_pos = filled[0]
 
     # ── Binary buffer helpers ─────────────────────────────────────────────────
     def _pack_f32(a): return np.asarray(a, dtype=np.float32).tobytes()
+    def _pack_f16(a): return np.asarray(a, dtype=np.float16).tobytes()
     def _pack_u32(a): return np.asarray(a, dtype=np.uint32).tobytes()
+    def _pack_i16_delta(delta):
+        """Quantize (N,3) float32 delta to INT16 normalized, return (bytes, min, max)."""
+        dmin = delta.min(axis=0); dmax = delta.max(axis=0)
+        scale = np.maximum(np.maximum(np.abs(dmin), np.abs(dmax)), 1e-9)
+        raw = np.clip(np.round(delta / scale * 32767), -32767, 32767).astype(np.int16)
+        return raw.tobytes(), dmin.tolist(), dmax.tolist()
 
     byte_offset = 0
     chunks: list[bytes] = []
@@ -728,8 +758,9 @@ def write_mesh_glb(
     morph_deltas, morph_offsets, morph_lens = [], [], []
     for f in filled[1:]:
         delta = (f - base_pos).astype(np.float32)
-        o, l_ = _add(_pack_f32(delta))
-        morph_offsets.append(o); morph_lens.append(l_); morph_deltas.append(delta)
+        packed, dmin, dmax = _pack_i16_delta(delta)
+        o, l_ = _add(packed)
+        morph_offsets.append(o); morph_lens.append(l_); morph_deltas.append((dmin, dmax))
 
     # ── Shared timestamp accessor ─────────────────────────────────────────────
     anim_times = np.array([float(t) for t in timestamps], dtype=np.float32)
@@ -750,9 +781,13 @@ def write_mesh_glb(
     off_cf, len_cf = _add(_pack_u32(cyl_f))
 
     # ── Per-joint translation data ────────────────────────────────────────────
+    joint_markers = [
+        (idx, side, r) for idx, side, r in _MESH_JOINT_MARKERS
+        if not (body_only and idx in _HAND_KPT_INDICES)
+    ]
     joint_trans_data: list[tuple[int, np.ndarray]] = []   # (kpt_idx, [N,3])
     if has_kpts:
-        for kpt_idx, side, radius in _MESH_JOINT_MARKERS:
+        for kpt_idx, side, radius in joint_markers:
             trans = np.zeros((N_frames, 3), dtype=np.float32)
             for fi, kw in enumerate(kpts_world):
                 if kw is not None and kpt_idx < kw.shape[0]:
@@ -762,11 +797,14 @@ def write_mesh_glb(
             joint_trans_data.append((kpt_idx, trans))
 
     # ── Per-bone translation / rotation / scale data ──────────────────────────
-    # Finger keypoints start at index 21 (right hand) and 42 (left hand)
     _FINGER_INDICES = set(range(21, 62))
+    bone_pairs = [
+        (a, b) for a, b in _MESH_BONE_PAIRS
+        if not (body_only and (_HAND_KPT_INDICES.intersection({a, b})))
+    ]
     bone_trs_data: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     if has_kpts:
-        for a_idx, b_idx in _MESH_BONE_PAIRS:
+        for a_idx, b_idx in bone_pairs:
             stick_r = 0.004 if (a_idx in _FINGER_INDICES or b_idx in _FINGER_INDICES) else 0.007
             tr = np.zeros((N_frames, 3), dtype=np.float32)
             ro = np.zeros((N_frames, 4), dtype=np.float32)
@@ -820,14 +858,14 @@ def write_mesh_glb(
     ]
 
     morph_targets = []
-    for delta, o, l_ in zip(morph_deltas, morph_offsets, morph_lens):
+    for (dmin, dmax), o, l_ in zip(morph_deltas, morph_offsets, morph_lens):
         bv_idx = len(bufferViews)
         bufferViews.append({"buffer": 0, "byteOffset": o, "byteLength": l_, "target": 34962})
         acc_idx = len(accessors)
         accessors.append({
-            "bufferView": bv_idx, "byteOffset": 0, "componentType": 5126,
-            "count": len(base_pos), "type": "VEC3",
-            **dict(zip(["min", "max"], _bounds(delta))),
+            "bufferView": bv_idx, "byteOffset": 0, "componentType": 5122,
+            "normalized": True, "count": len(base_pos), "type": "VEC3",
+            "min": dmin, "max": dmax,
         })
         morph_targets.append({"POSITION": acc_idx})
 
@@ -945,7 +983,7 @@ def write_mesh_glb(
     scene_nodes = [0]
 
     joint_node_indices: list[int] = []
-    for i, (kpt_idx, side, radius) in enumerate(_MESH_JOINT_MARKERS):
+    for i, (kpt_idx, side, radius) in enumerate(joint_markers):
         if not has_kpts:
             break
         node_idx = len(nodes_list)
@@ -957,7 +995,7 @@ def write_mesh_glb(
         joint_node_indices.append(node_idx)
 
     bone_node_indices: list[int] = []
-    for i in range(len(_MESH_BONE_PAIRS)):
+    for i in range(len(bone_pairs)):
         if not has_kpts:
             break
         node_idx = len(nodes_list)

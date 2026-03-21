@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FastSAM3D Body Viewer</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #0f0f1a; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+
+#drop { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+        justify-content: center; gap: 16px; z-index: 10; background: #0f0f1a; }
+#drop.hidden { display: none; }
+#drop h1 { font-size: 26px; color: #7ab8f5; }
+#drop p { color: #888; }
+#drop button { padding: 10px 28px; background: #3a78c9; border: none; border-radius: 6px;
+               color: white; font-size: 15px; cursor: pointer; }
+#drop button:hover { background: #4a90d9; }
+
+#loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+           justify-content: center; gap: 12px; background: rgba(10,10,20,.92); z-index: 20; }
+#loading.hidden { display: none; }
+#loading p { color: #7ab8f5; font-size: 16px; }
+#progress { width: 280px; height: 6px; background: #222; border-radius: 3px; overflow: hidden; }
+#progressBar { height: 100%; background: #3a78c9; transition: width .1s; }
+
+#ui { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      display: flex; align-items: center; gap: 12px; background: rgba(0,0,0,.75);
+      padding: 10px 20px; border-radius: 30px; backdrop-filter: blur(6px); z-index: 5; }
+#ui.hidden { display: none; }
+#playBtn { background: none; border: none; color: #eee; font-size: 20px; cursor: pointer;
+           line-height: 1; }
+#scrubber { width: 300px; cursor: pointer; accent-color: #3a78c9; }
+#timeLabel { font-size: 12px; color: #888; min-width: 80px; text-align: right; }
+
+#info { position: fixed; top: 12px; right: 14px; font-size: 11px; color: #555;
+        text-align: right; line-height: 1.8; pointer-events: none; }
+</style>
+</head>
+<body>
+
+<div id="drop">
+  <h1>FastSAM3D Body Viewer</h1>
+  <p>Drop a <code>*_mesh.glb</code> file or click to browse</p>
+  <button id="browseBtn">Browse file…</button>
+  <input id="fileInput" type="file" accept=".glb" style="display:none">
+</div>
+
+<div id="loading" class="hidden">
+  <p id="loadMsg">Loading…</p>
+  <div id="progress"><div id="progressBar" style="width:0%"></div></div>
+</div>
+
+<div id="ui" class="hidden">
+  <button id="playBtn" title="Play / Pause">⏸</button>
+  <input id="scrubber" type="range" min="0" max="1000" value="0">
+  <span id="timeLabel">0.0 / 0.0 s</span>
+</div>
+
+<div id="info"></div>
+
+<script type="importmap">
+{"imports":{
+  "three":          "https://cdn.jsdelivr.net/npm/three@0.165.0/build/three.module.js",
+  "three/addons/":  "https://cdn.jsdelivr.net/npm/three@0.165.0/examples/jsm/"
+}}</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+
+// ── Renderer / scene ──────────────────────────────────────────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+window.addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+});
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0f0f1a);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 1.4));
+const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+sun.position.set(3, 6, 4);
+scene.add(sun);
+
+// Ground grid
+const grid = new THREE.GridHelper(6, 12, 0x222233, 0x1a1a2e);
+scene.add(grid);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.01, 200);
+camera.position.set(0, 1.2, 3.5);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.9, 0);
+controls.update();
+
+// ── GLB utilities ─────────────────────────────────────────────────────────────
+const CTYPES = {
+    5120: Int8Array, 5121: Uint8Array, 5122: Int16Array,
+    5123: Uint16Array, 5125: Uint32Array, 5126: Float32Array,
+};
+const TSIZES = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT4: 16 };
+
+function parseGLB(buf) {
+    const v = new DataView(buf);
+    if (v.getUint32(0, true) !== 0x46546C67) throw new Error('Not a GLB file');
+    const jsonLen = v.getUint32(12, true);
+    const gltf = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 20, jsonLen)));
+    const binData = buf.slice(20 + jsonLen + 8);
+    return { gltf, binData };
+}
+
+// Decompress EXT_meshopt_compression bufferViews into a flat decompressed buffer.
+// Mutates gltf.bufferViews to point into the new buffer; returns the new ArrayBuffer.
+async function decompressBufferViews(gltf, binData) {
+    if (!gltf.extensionsUsed?.includes('EXT_meshopt_compression')) return binData;
+
+    await MeshoptDecoder.ready;
+
+    const views = gltf.bufferViews;
+
+    // First pass: compute decompressed sizes and offsets
+    const decompSizes = views.map(bv => {
+        const ext = bv.extensions?.EXT_meshopt_compression;
+        return ext ? ext.count * ext.byteStride : bv.byteLength;
+    });
+    const decompOffsets = decompSizes.reduce((acc, sz) => {
+        acc.push(acc[acc.length - 1] + sz); return acc;
+    }, [0]);
+    const totalSize = decompOffsets[views.length];
+
+    const newBuf = new ArrayBuffer(totalSize);
+    const newU8  = new Uint8Array(newBuf);
+
+    for (let i = 0; i < views.length; i++) {
+        const bv  = views[i];
+        const ext = bv.extensions?.EXT_meshopt_compression;
+        if (ext) {
+            const srcOff = ext.byteOffset ?? 0;
+            const src    = new Uint8Array(binData, srcOff, ext.byteLength);
+            const dst    = new Uint8Array(ext.count * ext.byteStride);
+            if (ext.mode === 'TRIANGLES') {
+                MeshoptDecoder.decodeIndexBuffer(dst, ext.count, ext.byteStride, src);
+            } else if (ext.mode === 'INDICES') {
+                MeshoptDecoder.decodeIndexSequence(dst, ext.count, ext.byteStride, src);
+            } else {
+                // ATTRIBUTES (positions, deltas, animation data)
+                MeshoptDecoder.decodeVertexBuffer(dst, ext.count, ext.byteStride, src);
+                // Apply post-decode filter if specified
+                if (ext.filter === 'EXPONENTIAL') MeshoptDecoder.decodeFilterExp(dst, ext.count, ext.byteStride);
+                else if (ext.filter === 'OCTAHEDRAL') MeshoptDecoder.decodeFilterOct(dst, ext.count, ext.byteStride);
+                else if (ext.filter === 'QUATERNION') MeshoptDecoder.decodeFilterQuat(dst, ext.count, ext.byteStride);
+            }
+            newU8.set(dst, decompOffsets[i]);
+            bv.byteOffset = decompOffsets[i];
+            bv.byteLength = ext.count * ext.byteStride;
+            bv.byteStride = ext.byteStride > 0 ? ext.byteStride : undefined;
+            delete bv.extensions;
+        } else {
+            const srcOff = bv.byteOffset ?? 0;
+            newU8.set(new Uint8Array(binData, srcOff, bv.byteLength), decompOffsets[i]);
+            bv.byteOffset = decompOffsets[i];
+        }
+    }
+
+    return newBuf;
+}
+
+function readAccessorAsF32(gltf, binData, idx) {
+    const acc  = gltf.accessors[idx];
+    const bv   = gltf.bufferViews[acc.bufferView];
+    const Type = CTYPES[acc.componentType];
+    const nc   = TSIZES[acc.type];
+    const off  = (bv.byteOffset ?? 0) + (acc.byteOffset ?? 0);
+    const byteLen = acc.count * nc * Type.BYTES_PER_ELEMENT;
+    // Copy to ensure alignment
+    const tmp = new Uint8Array(byteLen);
+    tmp.set(new Uint8Array(binData, off, byteLen));
+    const raw = new Type(tmp.buffer);
+    if (Type === Float32Array) return raw;
+    const normScale = acc.normalized
+        ? { 5120: 1/127, 5121: 1/255, 5122: 1/32767, 5123: 1/65535 }[acc.componentType] ?? 1
+        : 1;
+    const out = new Float32Array(acc.count * nc);
+    for (let i = 0; i < out.length; i++) out[i] = raw[i] * normScale;
+    // Dequantize using accessor min/max (for INT16 morph deltas)
+    if (acc.normalized && acc.min && acc.max) {
+        for (let j = 0; j < nc; j++) {
+            const s = Math.max(Math.abs(acc.min[j]), Math.abs(acc.max[j]));
+            if (s > 0) for (let i = 0; i < acc.count; i++) out[i * nc + j] *= s;
+        }
+    }
+    return out;
+}
+
+function readAccessorRaw(gltf, binData, idx) {
+    const acc  = gltf.accessors[idx];
+    const bv   = gltf.bufferViews[acc.bufferView];
+    const Type = CTYPES[acc.componentType];
+    const nc   = TSIZES[acc.type];
+    const off  = (bv.byteOffset ?? 0) + (acc.byteOffset ?? 0);
+    const byteLen = acc.count * nc * Type.BYTES_PER_ELEMENT;
+    const tmp = new Uint8Array(byteLen);
+    tmp.set(new Uint8Array(binData, off, byteLen));
+    return new Type(tmp.buffer);
+}
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let anim      = null;
+let bodyMesh  = null;
+let posAttr   = null;
+let overlayMeshes = [];    // {mesh, trans?, rot?, scl?}
+let playing   = true;
+let animTime  = 0;
+let lastT     = null;
+
+// ── Frame update ──────────────────────────────────────────────────────────────
+function getFrame(timestamps, t) {
+    const n = timestamps.length;
+    if (t <= timestamps[0])   return 0;
+    if (t >= timestamps[n-1]) return n - 1;
+    let lo = 0, hi = n - 1;
+    while (lo < hi - 1) {
+        const mid = (lo + hi) >> 1;
+        if (timestamps[mid] <= t) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+
+const _q = new THREE.Quaternion();
+
+function updateFrame(frame) {
+    if (!anim) return;
+    const { nVerts3, basePos, morphDeltas } = anim;
+
+    // Swap body mesh vertex positions (CPU frame-swap — no Three.js morph limit)
+    if (frame === 0) {
+        posAttr.array.set(basePos);
+    } else {
+        const dOff = (frame - 1) * nVerts3;
+        const dst  = posAttr.array;
+        const del  = morphDeltas;
+        for (let i = 0; i < nVerts3; i++) dst[i] = basePos[i] + del[dOff + i];
+    }
+    posAttr.needsUpdate = true;
+
+    // Update overlay nodes (joints + bones)
+    for (const o of overlayMeshes) {
+        if (o.trans) {
+            const i3 = frame * 3;
+            o.mesh.position.set(o.trans[i3], o.trans[i3+1], o.trans[i3+2]);
+        }
+        if (o.rot) {
+            const i4 = frame * 4;
+            _q.set(o.rot[i4], o.rot[i4+1], o.rot[i4+2], o.rot[i4+3]);
+            o.mesh.quaternion.copy(_q);
+        }
+        if (o.scl) {
+            const i3 = frame * 3;
+            o.mesh.scale.set(o.scl[i3], o.scl[i3+1], o.scl[i3+2]);
+        }
+    }
+}
+
+// ── Load GLB ──────────────────────────────────────────────────────────────────
+async function loadGLB(buffer) {
+    const loadEl  = document.getElementById('loading');
+    const loadMsg = document.getElementById('loadMsg');
+    const progBar = document.getElementById('progressBar');
+    loadEl.classList.remove('hidden');
+
+    const tick = (msg, pct) => {
+        loadMsg.textContent = msg;
+        progBar.style.width = pct + '%';
+        return new Promise(r => setTimeout(r, 20));
+    };
+
+    await tick('Parsing GLB…', 5);
+    const { gltf, binData: rawBin } = parseGLB(buffer);
+
+    await tick('Decompressing buffers…', 8);
+    const binData = await decompressBufferViews(gltf, rawBin);
+
+    const prim    = gltf.meshes[0].primitives[0];
+    const targets = prim.targets ?? [];
+    const nMorphs = targets.length;
+    const nFrames = nMorphs + 1;
+
+    await tick('Reading base mesh…', 12);
+    const basePos = new Float32Array(readAccessorAsF32(gltf, binData, prim.attributes.POSITION));
+    const rawIdx  = readAccessorRaw(gltf, binData, prim.indices);
+    const indices = rawIdx instanceof Uint32Array ? rawIdx : new Uint32Array(rawIdx);
+    const nVerts3 = basePos.length;
+
+    // Flat morph delta buffer  [nMorphs × nVerts3]
+    await tick(`Loading ${nMorphs} morph targets…`, 15);
+    const morphDeltas = new Float32Array(nMorphs * nVerts3);
+    for (let m = 0; m < nMorphs; m++) {
+        const d = readAccessorAsF32(gltf, binData, targets[m].POSITION);
+        morphDeltas.set(d, m * nVerts3);
+        if (m % 100 === 0) {
+            await tick(`Loading morph targets… ${m}/${nMorphs}`, 15 + 70 * m / nMorphs);
+        }
+    }
+
+    await tick('Building scene…', 88);
+
+    // ── Body mesh ─────────────────────────────────────────────────────────────
+    const geo = new THREE.BufferGeometry();
+    posAttr = new THREE.BufferAttribute(new Float32Array(basePos), 3);
+    geo.setAttribute('position', posAttr);
+    geo.setIndex(new THREE.BufferAttribute(indices, 1));
+    geo.computeVertexNormals();
+
+    const matDef = gltf.materials?.[prim.material];
+    const pbr    = matDef?.pbrMetallicRoughness ?? {};
+    const [r, g, b, a] = pbr.baseColorFactor ?? [0.45, 0.62, 0.82, 0.38];
+    const bodyMat = new THREE.MeshPhongMaterial({
+        color: new THREE.Color(r, g, b), transparent: true, opacity: a,
+        side: THREE.DoubleSide, depthWrite: false,
+    });
+
+    if (bodyMesh) scene.remove(bodyMesh);
+    bodyMesh = new THREE.Mesh(geo, bodyMat);
+    scene.add(bodyMesh);
+
+    // ── Animation channels ────────────────────────────────────────────────────
+    const animDef = gltf.animations?.[0];
+    let timestamps = null;
+
+    if (animDef) {
+        const wCh = animDef.channels.find(c => c.target.path === 'weights');
+        if (wCh) {
+            timestamps = Array.from(readAccessorAsF32(gltf, binData, animDef.samplers[wCh.sampler].input));
+        }
+    }
+    if (!timestamps || timestamps.length !== nFrames) {
+        timestamps = Array.from({ length: nFrames }, (_, i) => i / 30);
+    }
+
+    // Group non-mesh channels by node
+    const nodeData = {};
+    if (animDef) {
+        for (const ch of animDef.channels) {
+            if (ch.target.node === 0) continue;
+            const n = ch.target.node;
+            if (!nodeData[n]) nodeData[n] = {};
+            nodeData[n][ch.target.path] = readAccessorAsF32(gltf, binData, animDef.samplers[ch.sampler].output);
+        }
+    }
+
+    // ── Overlay nodes ─────────────────────────────────────────────────────────
+    for (const o of overlayMeshes) scene.remove(o.mesh);
+    overlayMeshes = [];
+
+    const sphGeo = new THREE.SphereGeometry(1, 8, 5);
+    const cylGeo = new THREE.CylinderGeometry(1, 1, 1, 6);
+
+    for (const [nIdxStr, ch] of Object.entries(nodeData)) {
+        const nIdx  = +nIdxStr;
+        const node  = gltf.nodes?.[nIdx];
+        const mIdx  = node?.mesh;
+        const mPrim = mIdx != null ? gltf.meshes?.[mIdx]?.primitives?.[0] : null;
+        const npbr  = gltf.materials?.[mPrim?.material]?.pbrMetallicRoughness ?? {};
+        const [nr, ng, nb] = npbr.baseColorFactor ?? [1, 1, 1, 1];
+        const mat = new THREE.MeshPhongMaterial({ color: new THREE.Color(nr, ng, nb) });
+
+        const isBone = ch.translation && ch.rotation && ch.scale;
+        const geo3 = isBone ? cylGeo : sphGeo;
+        const mesh = new THREE.Mesh(geo3, mat);
+
+        if (!isBone) {
+            // Joint sphere: fixed scale from node definition
+            const s = node?.scale ?? [0.012, 0.012, 0.012];
+            mesh.scale.set(s[0], s[1], s[2]);
+        }
+
+        scene.add(mesh);
+        overlayMeshes.push({ mesh, trans: ch.translation, rot: ch.rotation, scl: ch.scale });
+    }
+
+    // ── Finalise ──────────────────────────────────────────────────────────────
+    anim     = { nFrames, nVerts3, basePos, morphDeltas, timestamps };
+    animTime = 0;
+    playing  = true;
+    lastT    = null;
+    updateFrame(0);
+
+    const dur = timestamps[timestamps.length - 1].toFixed(1);
+    document.getElementById('info').textContent =
+        `${nFrames} frames · ${dur}s · ${(buffer.byteLength/1e6).toFixed(1)} MB`;
+    document.getElementById('drop').classList.add('hidden');
+    document.getElementById('ui').classList.remove('hidden');
+    document.getElementById('playBtn').textContent = '⏸';
+    await tick('Done', 100);
+    loadEl.classList.add('hidden');
+}
+
+// ── Render loop ───────────────────────────────────────────────────────────────
+const scrubber  = document.getElementById('scrubber');
+const timeLabel = document.getElementById('timeLabel');
+
+renderer.setAnimationLoop(t => {
+    if (!anim) { renderer.render(scene, camera); return; }
+
+    const dt = lastT == null ? 0 : (t - lastT) / 1000;
+    lastT = t;
+    const dur = anim.timestamps[anim.timestamps.length - 1];
+
+    if (playing) {
+        animTime = (animTime + dt) % dur;
+        scrubber.value = Math.round(animTime / dur * 1000);
+    }
+
+    const frame = getFrame(anim.timestamps, animTime);
+    updateFrame(frame);
+    timeLabel.textContent = `${animTime.toFixed(1)} / ${dur.toFixed(1)} s`;
+    controls.update();
+    renderer.render(scene, camera);
+});
+
+// ── UI ────────────────────────────────────────────────────────────────────────
+document.getElementById('playBtn').addEventListener('click', () => {
+    playing = !playing;
+    document.getElementById('playBtn').textContent = playing ? '⏸' : '▶';
+    if (playing) lastT = null;
+});
+
+scrubber.addEventListener('input', () => {
+    if (!anim) return;
+    animTime = (scrubber.value / 1000) * anim.timestamps[anim.timestamps.length - 1];
+    if (!playing) updateFrame(getFrame(anim.timestamps, animTime));
+});
+
+document.getElementById('browseBtn').addEventListener('click', () =>
+    document.getElementById('fileInput').click());
+
+document.getElementById('fileInput').addEventListener('change', e => {
+    const f = e.target.files[0];
+    if (f) f.arrayBuffer().then(loadGLB);
+});
+
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => {
+    e.preventDefault();
+    const f = e.dataTransfer.files[0];
+    if (f?.name.endsWith('.glb')) f.arrayBuffer().then(loadGLB);
+});
+</script>
+</body>
+</html>
