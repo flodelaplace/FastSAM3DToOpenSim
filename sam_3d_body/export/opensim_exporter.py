@@ -507,6 +507,16 @@ _MESH_JOINT_MARKERS = [
     (53, 'L', 0.007),   # left_middle_knuckle
     (57, 'L', 0.007),   # left_ring_knuckle
     (61, 'L', 0.007),   # left_pinky_knuckle
+    # Head
+    (3,  'L', 0.010),   # left ear
+    (4,  'R', 0.010),   # right ear
+    (1,  'L', 0.008),   # left eye
+    (2,  'R', 0.008),   # right eye
+    # Virtual spine + head points (derived in write_mesh_glb)
+    (70, 'C', 0.014),   # pelvis center
+    (71, 'C', 0.012),   # spine mid
+    (72, 'C', 0.012),   # thorax
+    (73, 'C', 0.012),   # head center (midpoint of ears)
 ]
 _MESH_BONE_PAIRS = [
     # Arms
@@ -526,13 +536,22 @@ _MESH_BONE_PAIRS = [
     (14, 18),   # R ankle → big_toe
     (14, 19),   # R ankle → small_toe
     (14, 20),   # R ankle → heel
-    # Torso
+    # Torso / spine  (virtual: 70=PelvisCenter, 71=SpineMid, 72=Thorax)
     (5,  6),    # shoulders across
     (9,  10),   # hips across
-    (5,  9),    # L trunk
-    (6,  10),   # R trunk
+    (9,  70),   # L hip → pelvis center
+    (10, 70),   # R hip → pelvis center
+    (70, 71),   # pelvis center → spine mid
+    (71, 72),   # spine mid → thorax
+    (72, 5),    # thorax → L shoulder
+    (72, 6),    # thorax → R shoulder
+    (69, 72),   # neck → thorax
     (69, 5),    # neck → L shoulder
     (69, 6),    # neck → R shoulder
+    # Head  (virtual: 73=HeadCenter)
+    (69, 73),   # neck → head center
+    (73, 1),    # head center → L eye
+    (73, 2),    # head center → R eye
     # Right hand fingers
     (41, 24),   # wrist → thumb_knuckle
     (24, 23), (23, 22), (22, 21),        # thumb
@@ -667,6 +686,7 @@ def write_mesh_glb(
         if v is not None and not np.any(np.isnan(v)):
             verts_yup = v.copy().astype(np.float32)
             verts_yup[:, 1] = -verts_yup[:, 1]   # Y-up
+            verts_yup[:, 0] = -verts_yup[:, 0]   # fix mirror (camera X = subject's left)
             last_good = verts_yup
         filled.append(last_good.copy() if last_good is not None else None)
 
@@ -690,6 +710,7 @@ def write_mesh_glb(
             if k is not None and ct is not None and not np.any(np.isnan(k)):
                 w = (k + ct[None, :]).astype(np.float32)
                 w[:, 1] = -w[:, 1]   # Y-up
+                w[:, 0] = -w[:, 0]   # fix mirror
                 last_kpts = w
             kpts_world[i] = last_kpts.copy() if last_kpts is not None else None
 
@@ -722,6 +743,17 @@ def write_mesh_glb(
                 _kw_smooth[i].reshape(-1, 3) if kpts_world[i] is not None else None
                 for i in range(N_frames)
             ]
+
+    # ── Append virtual keypoints (70=PelvisCenter, 71=SpineMid, 72=Thorax, 73=HeadCenter) ──
+    if has_kpts:
+        for i in range(N_frames):
+            kw = kpts_world[i]
+            if kw is not None:
+                pelvis_c  = (kw[9]  + kw[10]) / 2.0
+                thorax    = (kw[5]  + kw[6])  / 2.0
+                spine_mid = (pelvis_c + thorax) / 2.0
+                head_c    = (kw[3]  + kw[4])  / 2.0   # midpoint of ears
+                kpts_world[i] = np.vstack([kw, pelvis_c, spine_mid, thorax, head_c])
 
     base_pos = filled[0]
 
@@ -781,10 +813,8 @@ def write_mesh_glb(
     off_cf, len_cf = _add(_pack_u32(cyl_f))
 
     # ── Per-joint translation data ────────────────────────────────────────────
-    joint_markers = [
-        (idx, side, r) for idx, side, r in _MESH_JOINT_MARKERS
-        if not (body_only and idx in _HAND_KPT_INDICES)
-    ]
+    # Body decoder predicts all hand/wrist keypoints even in body-only mode — show them all
+    joint_markers = list(_MESH_JOINT_MARKERS)
     joint_trans_data: list[tuple[int, np.ndarray]] = []   # (kpt_idx, [N,3])
     if has_kpts:
         for kpt_idx, side, radius in joint_markers:
@@ -798,10 +828,7 @@ def write_mesh_glb(
 
     # ── Per-bone translation / rotation / scale data ──────────────────────────
     _FINGER_INDICES = set(range(21, 62))
-    bone_pairs = [
-        (a, b) for a, b in _MESH_BONE_PAIRS
-        if not (body_only and (_HAND_KPT_INDICES.intersection({a, b})))
-    ]
+    bone_pairs = list(_MESH_BONE_PAIRS)
     bone_trs_data: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     if has_kpts:
         for a_idx, b_idx in bone_pairs:
