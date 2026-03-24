@@ -87,12 +87,9 @@ const sun = new THREE.DirectionalLight(0xffffff, 1.0);
 sun.position.set(3, 6, 4);
 scene.add(sun);
 
-// Ground grid
-const grid = new THREE.GridHelper(6, 12, 0x222233, 0x1a1a2e);
-scene.add(grid);
 
 const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.01, 200);
-camera.position.set(0, 1.2, 3.5);
+camera.position.set(0, 1.2, -3.5);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, 0.9, 0);
 controls.update();

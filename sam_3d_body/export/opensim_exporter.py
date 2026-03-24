@@ -466,7 +466,7 @@ def write_skeleton_glb(
 # (keypoint_index, side)  side: 'R'=orange, 'L'=green, 'C'=blue
 _MESH_JOINT_MARKERS = [
     # Body
-    (0,  'C', 0.018),   # nose/head
+    (0,  'C', 0.008),   # nose
     (5,  'L', 0.020),   # left_shoulder
     (6,  'R', 0.020),   # right_shoulder
     (7,  'L', 0.017),   # left_elbow
