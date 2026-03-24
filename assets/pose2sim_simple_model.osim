@@ -4291,6 +4291,21 @@
 					<!--The fixed location of the station expressed in its parent frame.-->
 					<location>-0.00028600000000000001 -0.40805000000000002 0.014959999999999999</location>
 				</Marker>
+			<!--
+				Spine/neck/head markers from MHR 127-joint armature.
+				These are in the TRC output but NOT attached to the model bodies here
+				because Pose2Sim_Simple has a single rigid torso — the local positions
+				cannot correctly represent c_spine0 (which falls below the L5-S1 joint,
+				in the pelvis region) and the inter-vertebral joints cannot be driven.
+				When a multi-segment spine model is adopted, insert these markers with
+				the computed local positions below (derived from the walking TRC data):
+				  c_spine0 → pelvis body,  local Y = -0.112m
+				  c_spine1 → torso body,   local Y =  0.025m
+				  c_spine2 → torso body,   local Y =  0.164m
+				  c_spine3 → torso body,   local Y =  0.380m
+				  c_neck   → torso body,   local Y =  0.473m  (below head-torso joint at 0.541m)
+				  c_head   → head  body,   local Y =  0.078m  (above head origin at 0.030m offset)
+			-->
 			</objects>
 			<groups />
 		</MarkerSet>

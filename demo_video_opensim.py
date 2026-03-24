@@ -35,12 +35,14 @@ Coordinate system (TRC)
 
 Post-processing pipeline
 -------------------------
-  1. PostProcessor        — missing-frame interpolation, bone normalisation,
-                             Butterworth 6 Hz low-pass filter
-  2. CoordinateTransformer — camera → OpenSim Y-up axes, height scaling,
-                              per-frame ground alignment
-  3. KeypointConverter    — MHR70 → 73 OpenSim marker names
-                             (body + hands + derived PelvisCenter/Thorax/SpineMid)
+  1. PostProcessor        — missing-frame interpolation, Butterworth 6 Hz low-pass filter
+  2. CoordinateTransformer — camera → OpenSim Y-up axes, uniform height scaling
+                              (c_head from jcoords[113] as exact top reference,
+                               user-provided --person_height as ground truth),
+                              pelvis centering, per-frame ground alignment
+  3. KeypointConverter    — MHR70 → OpenSim marker names
+                             (body + hands + derived PelvisCenter/Thorax
+                              + real spine joints c_spine0–3/c_neck/c_head from jcoords)
   4. TRCExporter          — writes .trc in mm
   5. OpenSim IK           — runs InverseKinematicsTool via opensim conda env
                              → produces _ik.mot (40 DOF) and _ik_marker_errors.sto
@@ -71,10 +73,12 @@ from sam_3d_body.export.post_processing import PostProcessor
 from sam_3d_body.export.coordinate_transform import CoordinateTransformer
 from sam_3d_body.export.keypoint_converter import KeypointConverter
 from sam_3d_body.export.trc_exporter import TRCExporter
-from sam_3d_body.export.opensim_ik_runner import run_ik
+from sam_3d_body.export.opensim_ik_runner import run_ik, run_scale_tool
 
-# Pose2Sim model template bundled with the repo
-_MODEL_TEMPLATE = os.path.join(parent_dir, "assets", "pose2sim_simple_model.osim")
+# Pose2Sim Wholebody model — has explicit lumbar5–lumbar1 spine segments
+# so that MHR armature spine joints (c_spine0–3, c_neck, c_head) actually
+# drive individual intervertebral DOFs in OpenSim IK.
+_MODEL_TEMPLATE = os.path.join(parent_dir, "assets", "pose2sim_wholebody_model.osim")
 
 
 
@@ -378,14 +382,18 @@ def main(args):
         avg = sum(inference_times) / len(inference_times)
         print(f"Avg inference: {avg:.2f}s/frame ({1/avg:.2f} fps)")
 
-    # ── Build raw keypoint array (NaN for missing frames) ─────────────────────
+    # ── Build raw keypoint and jcoords arrays (NaN for missing frames) ─────────
     N = len(timestamps)
-    kpts_stack  = np.full((N, 70, 3), np.nan, dtype=np.float64)
-    cam_t_stack = np.full((N, 3),     np.nan, dtype=np.float64)
+    kpts_stack    = np.full((N, 70,  3), np.nan, dtype=np.float64)
+    cam_t_stack   = np.full((N, 3),      np.nan, dtype=np.float64)
+    jcoords_stack = np.full((N, 127, 3), np.nan, dtype=np.float64)
     for i, (k, t_) in enumerate(zip(all_kpts_raw, all_cam_t)):
         if k is not None and t_ is not None:
             kpts_stack[i]  = k
             cam_t_stack[i] = t_
+    for i, jc in enumerate(all_joint_coords):
+        if jc is not None:
+            jcoords_stack[i] = jc
 
     good = int(np.sum(~np.any(np.isnan(kpts_stack), axis=(1, 2))))
     print(f"\n  Frames with detected person: {good}/{processed}")
@@ -399,31 +407,46 @@ def main(args):
 
     print("\nPost-processing keypoints...")
 
-    # 1. Interpolate missing frames, normalise bone lengths, Butterworth filter
+    # 1. Interpolate missing frames and Butterworth-filter (no manual bone scaling —
+    #    the estimator's proportions are used directly; height is set from user input)
     post_proc = PostProcessor()
-    kpts_processed = post_proc.process(kpts_stack, fps=out_fps, subject_height=subject_height)
+    kpts_processed    = post_proc.process(kpts_stack, fps=out_fps)
+    jcoords_processed = post_proc.process_jcoords(jcoords_stack, fps=out_fps)
+    # Interpolate + smooth cam_t for global walking trajectory in TRC.
+    # Reshape to (N,1,3) so PostProcessor's per-keypoint logic handles it,
+    # then squeeze back to (N,3).
+    cam_t_processed = post_proc.process_jcoords(
+        cam_t_stack[:, np.newaxis, :], fps=out_fps
+    )[:, 0, :]
 
-    # 2. Rotate axes (camera → OpenSim Y-up), scale to subject height,
-    #    center pelvis horizontally, align feet to Y=0 each frame
+    # 2. Rotate axes (camera → OpenSim Y-up), scale to subject_height using
+    #    c_head (jcoords[113]) as the exact top reference — no magic constants.
+    #    Global XZ trajectory comes from cam_t (only XZ is applied, not Y).
     transformer = CoordinateTransformer(subject_height=subject_height)
-    kpts_opensim = transformer.transform(
+    kpts_opensim, jcoords_opensim = transformer.transform(
         kpts_processed,
+        jcoords_3d=jcoords_processed,
+        camera_translation=cam_t_processed,
         center_pelvis=True,
         align_to_ground=True,
-        apply_global_translation=False,
+        apply_global_translation=True,
     )
 
     # 2b. Correct systematic forward lean (matches SAM3D-OpenSim default)
-    kpts_opensim = transformer.correct_forward_lean(kpts_opensim)
+    if not args.no_lean_fix:
+        kpts_opensim, jcoords_opensim = transformer.correct_forward_lean(
+            kpts_opensim, jcoords=jcoords_opensim
+        )
 
-    # 3. Map MHR70 → 73 OpenSim marker names (body + hands + derived)
+    # 3. Map MHR70 → OpenSim marker names; append real spine/neck/head joints
     body_only = (args.inference_type == "body")
     converter = KeypointConverter()
     markers_array, marker_names = converter.convert(
-        kpts_opensim, include_derived=True, body_only=body_only
+        kpts_opensim, jcoords_3d=jcoords_opensim, include_derived=True, body_only=body_only
     )
 
-    # Body-only markers for GLB skeleton visualisation (27 markers, fixed links)
+    # Body-only markers for GLB skeleton visualisation (no spine appended here —
+    # the GLB path builds its own spine overlay from frames_joint_coords)
     markers_body, _ = converter.convert(
         kpts_opensim, include_derived=True, body_only=True
     )
@@ -456,10 +479,21 @@ def main(args):
     exporter = TRCExporter(fps=out_fps, units="mm")
     exporter.export(markers_array, marker_names, trc_path)
 
-    # Copy the Pose2Sim body model (needed by OpenSim IK)
+    # Scale the generic model to the subject's proportions, then run IK
     if os.path.isfile(_MODEL_TEMPLATE):
         shutil.copy(_MODEL_TEMPLATE, osim_path)
         print(f"  Writing model     → {osim_path}")
+        subject_mass = args.subject_mass
+        print(f"  Scaling model     → {osim_path}  (mass={subject_mass:.1f} kg, height={subject_height:.2f} m)")
+        scale_ok = run_scale_tool(
+            model_path=osim_path,
+            trc_path=trc_path,
+            scaled_model_path=osim_path,
+            subject_mass=subject_mass,
+            subject_height=subject_height,
+        )
+        if not scale_ok:
+            print("  WARNING: Scale Tool failed – running IK on unscaled model.")
     else:
         print(f"  WARNING: model template not found at {_MODEL_TEMPLATE}")
 
@@ -553,9 +587,14 @@ if __name__ == "__main__":
                         help="Stop after this many input frames (0=all)")
     parser.add_argument("--no_mesh_glb", action="store_true",
                         help="Skip full body mesh GLB export (saves ~185 MB for long videos)")
+    parser.add_argument("--no_lean_fix", action="store_true",
+                        help="Skip automatic forward-lean correction")
     parser.add_argument("--person_height", type=float, default=None,
                         help="Known person height in metres (e.g. 1.69). Scales all 3D output "
                              "so the skeleton height matches this value.")
+    parser.add_argument("--subject_mass", type=float, default=70.0,
+                        help="Subject mass in kg (default 70.0). Used for model scaling only; "
+                             "does not affect kinematics.")
     parser.add_argument("--floor_level", action="store_true",
                         help="(Legacy flag) Per-frame ground alignment is always applied.")
     parser.add_argument("--fx", type=float, default=None,

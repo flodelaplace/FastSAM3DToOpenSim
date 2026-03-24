@@ -6,30 +6,28 @@ import numpy as np
 
 
 class PostProcessor:
-    STANDARD_PROPORTIONS = {
-        "upper_leg": 0.245,
-        "lower_leg": 0.246,
-        "upper_arm": 0.186,
-        "forearm":   0.146,
-    }
 
     def __init__(
         self,
         smooth_filter: bool = True,
         filter_cutoff: float = 6.0,
         filter_order: int = 4,
-        normalize_bones: bool = True,
     ):
         self.smooth_filter = smooth_filter
         self.filter_cutoff = filter_cutoff
         self.filter_order = filter_order
-        self.normalize_bones = normalize_bones
 
     def process(self, keypoints: np.ndarray, fps: float = 30.0, subject_height: float = 1.75) -> np.ndarray:
         processed = keypoints.copy().astype(np.float64)
         processed = self._interpolate_missing(processed)
-        if self.normalize_bones:
-            processed = self._normalize_bones(processed, subject_height)
+        if self.smooth_filter:
+            processed = self._apply_butterworth(processed, fps)
+        return processed
+
+    def process_jcoords(self, jcoords: np.ndarray, fps: float = 30.0) -> np.ndarray:
+        """Interpolate missing frames and Butterworth-filter jcoords [N, 127, 3]."""
+        processed = jcoords.copy().astype(np.float64)
+        processed = self._interpolate_missing(processed)
         if self.smooth_filter:
             processed = self._apply_butterworth(processed, fps)
         return processed
@@ -49,31 +47,6 @@ class PostProcessor:
                     result[invalid_indices, k, dim] = np.interp(
                         invalid_indices, valid_indices, values[valid_indices]
                     )
-        return result
-
-    def _normalize_bones(self, keypoints, subject_height):
-        result = keypoints.copy()
-        expected_lengths = {
-            (9,  11): subject_height * self.STANDARD_PROPORTIONS["upper_leg"],
-            (11, 13): subject_height * self.STANDARD_PROPORTIONS["lower_leg"],
-            (10, 12): subject_height * self.STANDARD_PROPORTIONS["upper_leg"],
-            (12, 14): subject_height * self.STANDARD_PROPORTIONS["lower_leg"],
-            (5,   7): subject_height * self.STANDARD_PROPORTIONS["upper_arm"],
-            (7,  62): subject_height * self.STANDARD_PROPORTIONS["forearm"],
-            (6,   8): subject_height * self.STANDARD_PROPORTIONS["upper_arm"],
-            (8,  41): subject_height * self.STANDARD_PROPORTIONS["forearm"],
-        }
-        for t in range(result.shape[0]):
-            for (parent_idx, child_idx), expected_len in expected_lengths.items():
-                parent = result[t, parent_idx]
-                child  = result[t, child_idx]
-                vec = child - parent
-                length = np.linalg.norm(vec)
-                if length > 0.01:
-                    scale = expected_len / length
-                    if abs(scale - 1.0) > 0.2:
-                        scale = np.clip(scale, 0.8, 1.2)
-                        result[t, child_idx] = parent + vec * scale
         return result
 
     def _apply_butterworth(self, keypoints, fps):
@@ -110,5 +83,7 @@ class PostProcessor:
                     break
             if swap_detected:
                 for left_idx, right_idx in lr_pairs:
-                    result[t, [left_idx, right_idx]] = result[t, [right_idx, left_idx]]
+                    result[t, left_idx], result[t, right_idx] = (
+                        result[t, right_idx].copy(), result[t, left_idx].copy()
+                    )
         return result
