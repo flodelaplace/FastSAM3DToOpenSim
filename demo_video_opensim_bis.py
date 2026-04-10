@@ -1,0 +1,802 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+"""
+Fast SAM 3D Body – OpenSim Export (video or photo)
+====================================================
+Accepts a video file OR a single photo.  Format is detected automatically
+from the file extension.  Writes to <output_dir>/:
+
+  markers_<name>_skeleton.mp4/.jpg — annotated frame(s) with 2D skeleton overlay
+  markers_<name>.trc            — 73 markers in mm (Y-up, OpenSim coords)
+  markers_<name>_ik.mot         — joint angles from OpenSim IK solver (40 DOF)
+  markers_<name>_model.osim     — Pose2Sim_Simple body model for IK
+  markers_<name>.glb            — animated skeleton GLB (Blender/rigify)
+  markers_<name>_mesh.glb       — full body mesh GLB (--no_mesh_glb to skip)
+  inference_meta.json           — input metadata
+  video_outputs.json            — per-frame raw 3D keypoints
+  processing_report.json        — pipeline summary and timings
+
+Usage:
+    conda activate fast_sam_3d_body
+
+    # Video
+    SKIP_KEYPOINT_PROMPT=1 FOV_TRT=1 FOV_FAST=1 FOV_MODEL=s FOV_LEVEL=0 \\
+    USE_TRT_BACKBONE=1 USE_COMPILE=1 DECODER_COMPILE=1 COMPILE_MODE=reduce-overhead \\
+    MHR_NO_CORRECTIVES=1 GPU_HAND_PREP=1 BODY_INTERM_PRED_LAYERS=0,2 \\
+    DEBUG_NAN=0 PARALLEL_DECODERS=0 COMPILE_WARMUP_BATCH_SIZES=1 \\
+    python demo_video_opensim.py \\
+        --input ./videos/aitor_garden_walk.mp4 \\
+        --detector yolo_pose \\
+        --detector_model checkpoints/yolo/yolo11m-pose.engine \\
+        --fx 1371
+
+    # Photo
+    python demo_video_opensim.py \\
+        --input ./photos/pose.jpg \\
+        --detector yolo_pose \\
+        --detector_model checkpoints/yolo/yolo11m-pose.engine \\
+        --person_height 1.75
+
+Coordinate system (TRC)
+------------------------
+  OpenSim Y-up:  X = forward (anterior), Y = up, Z = right (lateral)
+  Units: mm (millimetres) — matches SAM3D-OpenSim convention.
+
+Post-processing pipeline
+-------------------------
+  1. PostProcessor        — missing-frame interpolation, Butterworth 6 Hz low-pass filter
+  2. CoordinateTransformer — camera → OpenSim Y-up axes, uniform height scaling
+                              (c_head from jcoords[113] as exact top reference,
+                               user-provided --person_height as ground truth),
+                              pelvis centering, per-frame ground alignment
+  3. KeypointConverter    — MHR70 → OpenSim marker names
+                             (body + hands + derived PelvisCenter/Thorax
+                              + real spine joints c_spine0–3/c_neck/c_head from jcoords)
+  4. TRCExporter          — writes .trc in mm
+  5. OpenSim IK           — runs InverseKinematicsTool via opensim conda env
+                             → produces _ik.mot (40 DOF) and _ik_marker_errors.sto
+"""
+
+import argparse
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+import cv2
+import numpy as np
+import torch
+
+parent_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, parent_dir)
+
+from notebook.utils import setup_sam_3d_body
+from sam_3d_body.visualization.skeleton_visualizer import SkeletonVisualizer
+from sam_3d_body.metadata.mhr70 import pose_info as mhr70_pose_info
+from sam_3d_body.export.opensim_exporter import write_mesh_glb
+from sam_3d_body.export.post_processing import PostProcessor
+from sam_3d_body.export.coordinate_transform import CoordinateTransformer
+from sam_3d_body.export.keypoint_converter import KeypointConverter
+from sam_3d_body.export.trc_exporter import TRCExporter
+from sam_3d_body.export.opensim_ik_runner import run_ik, run_scale_tool
+
+# Pose2Sim Wholebody model — has explicit lumbar5–lumbar1 spine segments
+# so that MHR armature spine joints (c_spine0–3, c_neck, c_head) actually
+# drive individual intervertebral DOFs in OpenSim IK.
+_MODEL_TEMPLATE = os.path.join(parent_dir, "assets", "pose2sim_wholebody_model.osim")
+
+_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif', '.webp'}
+# Number of duplicate frames used when processing a single photo.
+# 30 frames @ 30 fps = 1 s — enough for the Butterworth low-pass filter.
+_PHOTO_N_FRAMES = 30
+_PHOTO_FPS = 30.0
+
+def _is_image(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in _IMAGE_EXTENSIONS
+
+
+
+_GLTFPACK = os.environ.get("GLTFPACK_PATH") or shutil.which("gltfpack") or ""
+
+def _fix_morph_weights(data: bytes) -> bytes:
+    """Fix gltfpack's illegal quantization of morph weight animation outputs.
+
+    gltfpack converts morph weight outputs to UNSIGNED_BYTE/normalized, which violates
+    the glTF spec (weights must be FLOAT). This re-encodes them back to float32.
+    """
+    import json as _json
+    json_len = struct.unpack_from('<I', data, 12)[0]
+    gltf = _json.loads(data[20:20+json_len])
+    bin_data = bytearray(data[20+json_len+8:])
+
+    anim = gltf.get('animations', [{}])[0]
+    weights_channels = [c for c in anim.get('channels', []) if c['target']['path'] == 'weights']
+    fixed = False
+    for ch in weights_channels:
+        sampler = anim['samplers'][ch['sampler']]
+        acc = gltf['accessors'][sampler['output']]
+        if acc['componentType'] == 5126:   # already float32
+            continue
+        # Decode from quantized type → float32
+        bv = gltf['bufferViews'][acc['bufferView']]
+        offset = bv.get('byteOffset', 0) + acc.get('byteOffset', 0)
+        count = acc['count']
+        ct = acc['componentType']
+        normalized = acc.get('normalized', False)
+        dtype_map = {5120: np.int8, 5121: np.uint8, 5122: np.int16, 5123: np.uint16}
+        raw = np.frombuffer(bytes(bin_data[offset:offset + count * np.dtype(dtype_map[ct]).itemsize]),
+                            dtype=dtype_map[ct])
+        if normalized:
+            scale = {5120: 1/127, 5121: 1/255, 5122: 1/32767, 5123: 1/65535}[ct]
+            values = raw.astype(np.float32) * scale
+        else:
+            values = raw.astype(np.float32)
+        float_bytes = values.tobytes()
+        # Append float32 data to end of binary buffer and add a new bufferView
+        new_bv_offset = len(bin_data)
+        bin_data.extend(float_bytes)
+        pad = (4 - len(float_bytes) % 4) % 4
+        bin_data.extend(b'\x00' * pad)
+        new_bv_idx = len(gltf['bufferViews'])
+        gltf['bufferViews'].append({'buffer': 0, 'byteOffset': new_bv_offset, 'byteLength': len(float_bytes)})
+        acc['bufferView'] = new_bv_idx
+        acc['byteOffset'] = 0
+        acc['componentType'] = 5126
+        acc.pop('normalized', None)
+        fixed = True
+
+    if not fixed:
+        return data
+
+    gltf['buffers'][0]['byteLength'] = len(bin_data)
+    json_bytes = _json.dumps(gltf, separators=(',', ':')).encode('utf-8')
+    pad_j = (4 - len(json_bytes) % 4) % 4
+    json_bytes += b' ' * pad_j
+    bin_bytes = bytes(bin_data)
+    pad_b = (4 - len(bin_bytes) % 4) % 4
+    bin_bytes += b'\x00' * pad_b
+    json_chunk = struct.pack('<II', len(json_bytes), 0x4E4F534A) + json_bytes
+    bin_chunk  = struct.pack('<II', len(bin_bytes),  0x004E4942) + bin_bytes
+    header = struct.pack('<III', 0x46546C67, 2, 12 + len(json_chunk) + len(bin_chunk))
+    return header + json_chunk + bin_chunk
+
+
+def _compress_glb(path: str) -> None:
+    """Run gltfpack -c on a GLB, fix illegal weight quantization, replace in-place."""
+    if not os.path.isfile(_GLTFPACK):
+        return
+    tmp = path + ".tmp.glb"
+    result = subprocess.run(
+        [_GLTFPACK, "-c", "-i", path, "-o", tmp],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0 and os.path.isfile(tmp):
+        orig_mb = os.path.getsize(path) / 1e6
+        fixed = _fix_morph_weights(open(tmp, 'rb').read())
+        open(tmp, 'wb').write(fixed)
+        comp_mb = os.path.getsize(tmp) / 1e6
+        os.replace(tmp, path)
+        print(f"  [gltfpack] {orig_mb:.1f} MB → {comp_mb:.1f} MB ({100*comp_mb/orig_mb:.0f}%)")
+    else:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+        print(f"  [gltfpack] compression failed: {result.stderr[-200:]}")
+
+
+def draw_results_on_frame(img_bgr, outputs, visualizer):
+    out = img_bgr.copy()
+    for person in outputs:
+        if "bbox" in person:
+            b = person["bbox"]
+            cv2.rectangle(out, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), (0, 255, 0), 2)
+        if "pred_keypoints_2d" in person and visualizer is not None:
+            kpts = person["pred_keypoints_2d"]
+            kpts_with_score = np.concatenate([kpts, np.ones((kpts.shape[0], 1))], axis=-1)
+            out_rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+            out_rgb = visualizer.draw_skeleton(out_rgb, kpts_with_score)
+            out = cv2.cvtColor(out_rgb, cv2.COLOR_RGB2BGR)
+    return out
+
+
+def _read_first_frame(input_path: str, is_image: bool):
+    """Read the first BGR frame from a video or image file."""
+    if is_image:
+        return cv2.imread(input_path)
+    cap = cv2.VideoCapture(input_path)
+    ret, frame = cap.read()
+    cap.release()
+    return frame if ret else None
+
+
+def _get_first_frame_bbox(estimator, frame_bgr, args):
+    """Run YOLO on first frame and return largest person bbox, or None."""
+    try:
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        outputs = estimator.process_one_image(
+            rgb,
+            hand_box_source=args.hand_box_source,
+            inference_type=args.inference_type,
+        )
+        if outputs and "bbox" in outputs[0]:
+            return tuple(outputs[0]["bbox"])
+    except Exception:
+        pass
+    return None
+
+
+def main(args):
+    input_path = args.input
+    input_is_image = _is_image(input_path)
+
+    # Auto-generate timestamped output directory (matches SAM3D-OpenSim convention)
+    if args.output_dir is None:
+        input_name_raw = os.path.splitext(os.path.basename(input_path))[0]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.output_dir = f"output_{timestamp}_{input_name_raw}"
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # ── Camera intrinsics ─────────────────────────────────────────────────────
+    cam_int = None
+    if args.fx is not None:
+        fx = args.fx
+        fy = args.fy if args.fy is not None else fx
+        cx = args.cx if args.cx is not None else 0.0
+        cy = args.cy if args.cy is not None else 0.0
+        _K = torch.tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]],
+                           dtype=torch.float32).unsqueeze(0).cuda()
+        cam_int = _K
+        print(f"Using fixed intrinsics: fx={fx:.1f} fy={fy:.1f}")
+
+    # ── Model loading ─────────────────────────────────────────────────────────
+    print("Loading SAM 3D Body model...")
+    t_load = time.time()
+    estimator = setup_sam_3d_body(
+        detector_name=args.detector,
+        detector_model=args.detector_model,
+        local_checkpoint_path=args.local_checkpoint,
+    )
+    visualizer = SkeletonVisualizer(line_width=2, radius=5)
+    visualizer.set_pose_meta(mhr70_pose_info)
+    print(f"Model loaded in {time.time() - t_load:.1f}s")
+
+    # ── Input I/O ─────────────────────────────────────────────────────────────
+    input_name = os.path.splitext(os.path.basename(input_path))[0]
+    prefix = f"markers_{input_name}"
+
+    # Output paths — mirror SAM3D-OpenSim naming convention
+    trc_path       = os.path.join(args.output_dir, f"{prefix}.trc")
+    ik_mot_path    = os.path.join(args.output_dir, f"{prefix}_ik.mot")
+    errors_path    = os.path.join(args.output_dir, "_ik_marker_errors.sto")
+    osim_path      = os.path.join(args.output_dir, f"{prefix}_model.osim")
+    mesh_glb       = os.path.join(args.output_dir, f"{prefix}_mesh.glb")
+    meta_path      = os.path.join(args.output_dir, "inference_meta.json")
+    outputs_path   = os.path.join(args.output_dir, "video_outputs.json")
+
+    # ── MoGe floor-plane estimation (once, before frame loop) ─────────────────
+    moge_floor_angle = None
+    if args.floor_moge and not args.no_lean_fix:
+        fov_est = getattr(estimator, "fov_estimator", None)
+        if fov_est is not None:
+            print("\nEstimating floor plane from MoGe depth (frame 0)...")
+            t_moge = time.time()
+            _first_frame = _read_first_frame(input_path, input_is_image)
+            if _first_frame is not None:
+                _pts, _mask = fov_est.get_depth_points(
+                    cv2.cvtColor(_first_frame, cv2.COLOR_BGR2RGB)
+                )
+                _bbox = _get_first_frame_bbox(estimator, _first_frame, args)
+                _orig_hw = (_first_frame.shape[0], _first_frame.shape[1])
+                moge_floor_angle = CoordinateTransformer.floor_angle_from_moge_points(
+                    _pts, _mask, person_bbox=_bbox, orig_hw=_orig_hw
+                )
+                print(f"  MoGe floor tilt: {moge_floor_angle:+.2f}° "
+                      f"(took {time.time() - t_moge:.2f}s)")
+            else:
+                print("  [floor_moge] Could not read first frame — skipping.")
+        else:
+            print("  [floor_moge] No FOV estimator available — skipping.")
+
+    timestamps      = []
+    all_kpts_raw    = []   # [N_frames] of [70, 3] camera-space kpts, or None
+    all_cam_t       = []   # [N_frames] of [3], or None
+    all_verts       = []   # [N_frames] of [18439, 3] or None  (for mesh GLB)
+    all_joint_coords = []  # [N_frames] of [127, 3] camera-space joint coords, or None
+    all_raw_outputs = []   # for video_outputs.json
+    inference_times = []
+
+    t_start = time.time()
+
+    if input_is_image:
+        # ── Single photo ──────────────────────────────────────────────────────
+        img_bgr = cv2.imread(input_path)
+        if img_bgr is None:
+            print(f"Error: cannot open image {input_path}")
+            return
+        height, width = img_bgr.shape[:2]
+        fps     = _PHOTO_FPS
+        out_fps = _PHOTO_FPS
+        total   = _PHOTO_N_FRAMES
+        processed = 1
+
+        vid_path = os.path.join(args.output_dir, f"{prefix}_skeleton.jpg")
+
+        print(f"\nPhoto: {width}x{height} | Output: {args.output_dir}\n")
+
+        frame_cam_int = None
+        if cam_int is not None:
+            frame_cam_int = cam_int.clone()
+            if args.cx is None:
+                frame_cam_int[0, 0, 2] = width / 2.0
+            if args.cy is None:
+                frame_cam_int[0, 1, 2] = height / 2.0
+
+        t0 = time.time()
+        try:
+            frame_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            outputs = estimator.process_one_image(
+                frame_rgb,
+                hand_box_source=args.hand_box_source,
+                inference_type=args.inference_type,
+                cam_int=frame_cam_int,
+            )
+        except Exception as e:
+            print(f"  Inference error — {e}")
+            outputs = []
+
+        inf_t = time.time() - t0
+        inference_times.append(inf_t)
+        print(f"  Inference: {inf_t:.2f}s | {len(outputs)} person(s)", flush=True)
+
+        # Save annotated image
+        vis_frame = draw_results_on_frame(img_bgr, outputs, visualizer)
+        cv2.imwrite(vid_path, vis_frame)
+
+        person = outputs[0] if outputs else None
+
+        kpts_val  = None
+        cam_t_val = None
+        jc_val    = None
+        verts_val = None
+
+        if person is not None:
+            k = person.get("pred_keypoints_3d")
+            t_ = person.get("pred_cam_t")
+            if k is not None and t_ is not None and not np.any(np.isnan(k)):
+                kpts_val  = k.copy()
+                cam_t_val = t_.copy()
+            jc = person.get("pred_joint_coords")
+            if jc is not None and not np.any(np.isnan(jc)):
+                jc_val = jc.copy()
+            if not args.no_mesh_glb:
+                v = person.get("pred_vertices")
+                t_ = person.get("pred_cam_t")
+                if v is not None and t_ is not None and not np.any(np.isnan(v)):
+                    verts_val = (v + t_[None, :]).astype(np.float32)
+
+        # Build raw outputs entry (single frame)
+        frame_out = {"frame": "frame_000000.jpg", "outputs": []}
+        for p in outputs:
+            entry: dict = {}
+            if "bbox" in p:
+                entry["bbox"] = [float(x) for x in p["bbox"]]
+            if "pred_cam_t" in p and p["pred_cam_t"] is not None:
+                entry["focal_length"] = float(p.get("focal_length", 0.0))
+            if "pred_keypoints_3d" in p and p["pred_keypoints_3d"] is not None:
+                entry["pred_keypoints_3d"] = p["pred_keypoints_3d"].tolist()
+            frame_out["outputs"].append(entry)
+
+        # Duplicate the single frame _PHOTO_N_FRAMES times so post-processing
+        # (interpolation + Butterworth filter) has enough samples to operate on.
+        for i in range(_PHOTO_N_FRAMES):
+            timestamps.append(i / fps)
+            all_kpts_raw.append(kpts_val)
+            all_cam_t.append(cam_t_val)
+            all_joint_coords.append(jc_val)
+            all_verts.append(verts_val)
+        all_raw_outputs.append(frame_out)
+
+        print(f"\nDone! 1 photo processed.")
+        print(f"Inference: {inf_t:.2f}s")
+
+    else:
+        # ── Video ─────────────────────────────────────────────────────────────
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            print(f"Error: cannot open {input_path}")
+            return
+
+        fps    = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        if args.max_frames > 0:
+            total = min(total, args.max_frames)
+
+        frame_step = max(1, round(fps / args.target_fps)) if args.target_fps > 0 else 1
+        out_fps    = fps / frame_step
+
+        vid_path = os.path.join(args.output_dir, f"{prefix}_skeleton.mp4")
+
+        writer = cv2.VideoWriter(
+            vid_path, cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (width, height)
+        )
+
+        print(f"\nVideo: {width}x{height} @ {fps:.1f}fps | {total} frames")
+        print(f"Frame step: {frame_step} | Output: {args.output_dir}\n")
+
+        # ── Per-frame processing ──────────────────────────────────────────────
+        frame_idx = 0
+        processed = 0
+
+        while cap.isOpened():
+            ret, frame_bgr = cap.read()
+            if not ret:
+                break
+            if args.max_frames > 0 and frame_idx >= args.max_frames:
+                break
+            if frame_idx % frame_step != 0:
+                frame_idx += 1
+                continue
+
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+            frame_cam_int = None
+            if cam_int is not None:
+                frame_cam_int = cam_int.clone()
+                if args.cx is None:
+                    frame_cam_int[0, 0, 2] = width / 2.0
+                if args.cy is None:
+                    frame_cam_int[0, 1, 2] = height / 2.0
+
+            t0 = time.time()
+            try:
+                outputs = estimator.process_one_image(
+                    frame_rgb,
+                    hand_box_source=args.hand_box_source,
+                    inference_type=args.inference_type,
+                    cam_int=frame_cam_int,
+                )
+            except Exception as e:
+                print(f"  Frame {frame_idx}: inference error — {e}")
+                writer.write(frame_bgr)
+                timestamps.append(frame_idx / fps)
+                all_kpts_raw.append(None)
+                all_cam_t.append(None)
+                all_verts.append(None)
+                all_joint_coords.append(None)
+                all_raw_outputs.append({"frame": f"frame_{frame_idx:06d}.jpg", "outputs": []})
+                frame_idx += 1
+                processed += 1
+                continue
+
+            inf_t = time.time() - t0
+            inference_times.append(inf_t)
+
+            # Pick the largest person (most confident detection)
+            person = outputs[0] if outputs else None
+
+            # Collect raw keypoints, camera translation, and joint coords for this frame
+            if person is not None:
+                kpts  = person.get("pred_keypoints_3d")   # [70, 3] camera space
+                cam_t = person.get("pred_cam_t")           # [3]
+                if kpts is not None and cam_t is not None and not np.any(np.isnan(kpts)):
+                    all_kpts_raw.append(kpts.copy())
+                    all_cam_t.append(cam_t.copy())
+                else:
+                    all_kpts_raw.append(None)
+                    all_cam_t.append(None)
+                jc = person.get("pred_joint_coords")       # [127, 3] camera space
+                if jc is not None and not np.any(np.isnan(jc)):
+                    all_joint_coords.append(jc.copy())
+                else:
+                    all_joint_coords.append(None)
+            else:
+                all_kpts_raw.append(None)
+                all_cam_t.append(None)
+                all_joint_coords.append(None)
+
+            timestamps.append(frame_idx / fps)
+
+            # Collect raw outputs for video_outputs.json
+            frame_out = {"frame": f"frame_{frame_idx:06d}.jpg", "outputs": []}
+            for p in outputs:
+                entry: dict = {}
+                if "bbox" in p:
+                    entry["bbox"] = [float(x) for x in p["bbox"]]
+                if "pred_cam_t" in p and p["pred_cam_t"] is not None:
+                    entry["focal_length"] = float(p.get("focal_length", 0.0))
+                if "pred_keypoints_3d" in p and p["pred_keypoints_3d"] is not None:
+                    entry["pred_keypoints_3d"] = p["pred_keypoints_3d"].tolist()
+                frame_out["outputs"].append(entry)
+            all_raw_outputs.append(frame_out)
+
+            # Collect mesh vertices for mesh GLB
+            if not args.no_mesh_glb and person is not None:
+                verts = person.get("pred_vertices")
+                cam_t = person.get("pred_cam_t")
+                if verts is not None and cam_t is not None and not np.any(np.isnan(verts)):
+                    v_world = verts + cam_t[None, :]
+                    all_verts.append(v_world.astype(np.float32))
+                else:
+                    all_verts.append(None)
+            else:
+                all_verts.append(None)
+
+            vis_frame = draw_results_on_frame(frame_bgr, outputs, visualizer)
+            writer.write(vis_frame)
+
+            processed += 1
+            avg_fps = 1.0 / (sum(inference_times) / len(inference_times))
+            detected = len(outputs)
+            print(
+                f"  [{processed}/{total // frame_step}] frame {frame_idx:5d} | "
+                f"{inf_t:.2f}s | {detected} person(s) | avg {avg_fps:.2f} fps",
+                flush=True,
+            )
+
+            frame_idx += 1
+
+        cap.release()
+        writer.release()
+
+        print(f"\nDone! {processed} frames processed.")
+        if inference_times:
+            avg = sum(inference_times) / len(inference_times)
+            print(f"Avg inference: {avg:.2f}s/frame ({1/avg:.2f} fps)")
+
+    # ── Build raw keypoint and jcoords arrays (NaN for missing frames) ─────────
+    N = len(timestamps)
+    kpts_stack    = np.full((N, 70,  3), np.nan, dtype=np.float64)
+    cam_t_stack   = np.full((N, 3),      np.nan, dtype=np.float64)
+    jcoords_stack = np.full((N, 127, 3), np.nan, dtype=np.float64)
+    for i, (k, t_) in enumerate(zip(all_kpts_raw, all_cam_t)):
+        if k is not None and t_ is not None:
+            kpts_stack[i]  = k
+            cam_t_stack[i] = t_
+    for i, jc in enumerate(all_joint_coords):
+        if jc is not None:
+            jcoords_stack[i] = jc
+
+    good = int(np.sum(~np.any(np.isnan(kpts_stack), axis=(1, 2))))
+    print(f"\n  Frames with detected person: {good}/{processed}")
+
+    if good == 0:
+        print("  No valid frames — skipping OpenSim export.")
+        return
+
+    # ── Post-processing pipeline ───────────────────────────────────────────────
+    subject_height = args.person_height if args.person_height is not None else 1.75
+
+    print("\nPost-processing keypoints...")
+
+    # 1. Interpolate missing frames and Butterworth-filter (no manual bone scaling —
+    #    the estimator's proportions are used directly; height is set from user input)
+    post_proc = PostProcessor()
+    kpts_processed    = post_proc.process(kpts_stack, fps=out_fps)
+    jcoords_processed = post_proc.process_jcoords(jcoords_stack, fps=out_fps)
+    # Interpolate + smooth cam_t for global walking trajectory in TRC.
+    # Reshape to (N,1,3) so PostProcessor's per-keypoint logic handles it,
+    # then squeeze back to (N,3).
+    cam_t_processed = post_proc.process_jcoords(
+        cam_t_stack[:, np.newaxis, :], fps=out_fps
+    )[:, 0, :]
+
+    # 2. Rotate axes (camera → OpenSim Y-up), scale to subject_height using
+    #    c_head (jcoords[113]) as the exact top reference — no magic constants.
+    #    Global XZ trajectory comes from cam_t (only XZ is applied, not Y).
+    transformer = CoordinateTransformer(subject_height=subject_height)
+    kpts_opensim, jcoords_opensim = transformer.transform(
+        kpts_processed,
+        jcoords_3d=jcoords_processed,
+        camera_translation=cam_t_processed,
+        center_pelvis=True,
+        align_to_ground=True,
+        apply_global_translation=True,
+        correct_floor_lean=not args.no_lean_fix,
+        floor_angle=moge_floor_angle,
+    )
+
+    # 2b. Spine-based forward-lean correction (runs after floor-plane rotation above)
+    # Skip when --floor_moge is active: MoGe already handles the camera-pitch component;
+    # adding the spine correction on top causes overcorrection.
+    if not args.no_lean_fix and moge_floor_angle is None:
+        lean_angle = transformer._estimate_lean_angle(kpts_opensim)
+        print(f"  [spine lean] estimated spine lean {lean_angle:+.2f}°")
+        kpts_opensim, jcoords_opensim = transformer.correct_forward_lean(
+            kpts_opensim, jcoords=jcoords_opensim
+        )
+
+    # 2c. Camera-pitch-based lean correction (experimental, opt-in)
+    if args.lean_cam_pitch_fix:
+        pitch_angle = transformer._estimate_pitch_angle(cam_t_processed)
+        print(f"  Camera pitch correction: {pitch_angle:.2f}°")
+        kpts_opensim, jcoords_opensim = transformer.correct_lean_cam_pitch(
+            kpts_opensim, jcoords=jcoords_opensim, cam_t=cam_t_processed
+        )
+
+    # 3. Map MHR70 → OpenSim marker names; append real spine/neck/head joints
+    body_only = (args.inference_type == "body")
+    converter = KeypointConverter()
+    markers_array, marker_names = converter.convert(
+        kpts_opensim, jcoords_3d=jcoords_opensim, include_derived=True, body_only=body_only
+    )
+
+    # Body-only markers for GLB skeleton visualisation (no spine appended here —
+    # the GLB path builds its own spine overlay from frames_joint_coords)
+    markers_body, _ = converter.convert(
+        kpts_opensim, include_derived=True, body_only=True
+    )
+
+    # ── Export OpenSim files ──────────────────────────────────────────────────
+    print("\nExporting OpenSim files...")
+
+    # Save metadata JSONs
+    inference_time = time.time() - t_start
+    meta = {
+        "input": os.path.abspath(input_path),
+        "input_type": "image" if input_is_image else "video",
+        "fps": fps,
+        "num_frames": total,
+        "input_info": {
+            "fps": fps,
+            "frame_count": total,
+            "width": width,
+            "height": height,
+            "duration": total / fps,
+        },
+        "inference_time": inference_time,
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    with open(outputs_path, "w") as f:
+        json.dump(all_raw_outputs, f)
+
+    print(f"  Writing TRC (mm)  → {trc_path}")
+    exporter = TRCExporter(fps=out_fps, units="mm")
+    exporter.export(markers_array, marker_names, trc_path)
+
+    # Scale the generic model to the subject's proportions, then run IK
+    if os.path.isfile(_MODEL_TEMPLATE):
+        shutil.copy(_MODEL_TEMPLATE, osim_path)
+        print(f"  Writing model     → {osim_path}")
+        subject_mass = args.subject_mass
+        print(f"  Scaling model     → {osim_path}  (mass={subject_mass:.1f} kg, height={subject_height:.2f} m)")
+        scale_ok = run_scale_tool(
+            model_path=osim_path,
+            trc_path=trc_path,
+            scaled_model_path=osim_path,
+            subject_mass=subject_mass,
+            subject_height=subject_height,
+        )
+        if not scale_ok:
+            print("  WARNING: Scale Tool failed – running IK on unscaled model.")
+    else:
+        print(f"  WARNING: model template not found at {_MODEL_TEMPLATE}")
+
+    frames_markers      = [markers_array[i] for i in range(N)]
+    frames_markers_body = [markers_body[i]  for i in range(N)]
+
+    print(f"  Running OpenSim IK → {ik_mot_path}")
+    ik_ok = run_ik(
+        model_path=osim_path,
+        trc_path=trc_path,
+        mot_path=ik_mot_path,
+        errors_path=errors_path,
+    )
+    if not ik_ok:
+        print("  WARNING: OpenSim IK failed or opensim env not found.")
+
+    if not args.no_mesh_glb:
+        print(f"  Writing mesh GLB  → {mesh_glb}")
+        write_mesh_glb(mesh_glb, timestamps, all_verts, estimator.faces,
+                       frames_kpts=all_kpts_raw, frames_cam_t=all_cam_t,
+                       frames_joint_coords=all_joint_coords,
+                       body_only=body_only)
+        # gltfpack disabled: incompatible with viewer (KHR_mesh_quantization breaks morph targets)
+        # _compress_glb(mesh_glb)
+
+    # Write processing report (matches SAM3D-OpenSim convention)
+    report_path = os.path.join(args.output_dir, "processing_report.json")
+    total_time = time.time() - t_start
+    report = {
+        "input": os.path.abspath(input_path),
+        "input_type": "image" if input_is_image else "video",
+        "output_dir": args.output_dir,
+        "subject": {"height": subject_height},
+        "input_info": {"fps": fps, "frame_count": total, "width": width, "height": height},
+        "processing": {
+            "fps": out_fps,
+            "num_frames": processed,
+            "num_markers": len(marker_names),
+            "ik_success": ik_ok,
+        },
+        "timings": {"total": total_time},
+        "outputs": {
+            "video": vid_path,
+            "trc": trc_path,
+            "mot": ik_mot_path if ik_ok else None,
+            "model": osim_path,
+            "mesh_glb": mesh_glb,
+        },
+    }
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    print(f"\nOutput folder: {args.output_dir}")
+    print("\nOutput files:")
+    print(f"  {'Photo' if input_is_image else 'Video'}:               {os.path.basename(vid_path)}")
+    print(f"  TRC (73 markers/mm): {os.path.basename(trc_path)}")
+    print(f"  IK MOT (40 DOF):     {os.path.basename(ik_mot_path)}" + (" ✓" if ik_ok else " (skipped)"))
+    print(f"  Body model:          {os.path.basename(osim_path)}")
+    if not args.no_mesh_glb:
+        print(f"  Mesh GLB:            {os.path.basename(mesh_glb)}")
+    print(f"  Processing report:   {os.path.basename(report_path)}")
+
+    print("""
+─────────────────────────────────────────────────────────────────
+OpenSim workflow:
+  1. Load markers_output_<name>_model.osim in OpenSim
+  2. Scale Tool → use TRC for static pose calibration
+  3. IK Tool → load TRC → IK MOT is already written if opensim env found
+  4. GLB files can be previewed in Blender (File → Import → glTF 2.0).
+─────────────────────────────────────────────────────────────────
+""")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Fast SAM 3D Body – OpenSim Export (video or photo)")
+    parser.add_argument("--input", default="./videos/aitor_garden_walk.mp4",
+                        help="Path to input video or photo (jpg/png/bmp/…). "
+                             "Format is detected automatically from the file extension.")
+    # Backwards-compatible alias
+    parser.add_argument("--video_path", dest="input", help=argparse.SUPPRESS)
+    parser.add_argument("--output_dir", default=None,
+                        help="Output directory. Default: auto-generated as "
+                             "output_YYYYMMDD_HHMMSS_<videoname> next to the video.")
+    parser.add_argument("--detector", default="yolo_pose")
+    parser.add_argument("--detector_model", default="./checkpoints/yolo/yolo11m-pose.engine")
+    parser.add_argument("--hand_box_source", default="yolo_pose")
+    parser.add_argument("--local_checkpoint", default="./checkpoints/sam-3d-body-dinov3")
+    parser.add_argument("--hands", action="store_true",
+                        help="(legacy) Equivalent to --inference_type full")
+    parser.add_argument("--inference_type", default="body", choices=["full", "body"],
+                        help="'body' (default) skips hands for speed; "
+                             "'full' adds hand markers for IK and GLB.")
+    parser.add_argument("--target_fps", type=float, default=30,
+                        help="Process at this FPS (0=all frames, default=30)")
+    parser.add_argument("--max_frames", type=int, default=0,
+                        help="Stop after this many input frames (0=all)")
+    parser.add_argument("--no_mesh_glb", action="store_true",
+                        help="Skip full body mesh GLB export (saves ~185 MB for long videos)")
+    parser.add_argument("--no_lean_fix", action="store_true",
+                        help="Skip automatic forward-lean correction")
+    parser.add_argument("--floor_moge", action="store_true",
+                        help="Estimate floor plane from MoGe depth on the first video frame "
+                             "and use its camera-pitch angle to correct forward lean. "
+                             "Zero per-frame FPS cost. Requires MoGe to be available.")
+    parser.add_argument("--lean_cam_pitch_fix", action="store_true",
+                        help="Experimental: correct residual forward lean by estimating "
+                             "camera pitch from the cam_t trajectory (linear regression). "
+                             "Applied after --no_lean_fix check.")
+    parser.add_argument("--person_height", type=float, default=None,
+                        help="Known person height in metres (e.g. 1.69). Scales all 3D output "
+                             "so the skeleton height matches this value.")
+    parser.add_argument("--subject_mass", type=float, default=70.0,
+                        help="Subject mass in kg (default 70.0). Used for model scaling only; "
+                             "does not affect kinematics.")
+    parser.add_argument("--floor_level", action="store_true",
+                        help="(Legacy flag) Per-frame ground alignment is always applied.")
+    parser.add_argument("--fx", type=float, default=None,
+                        help="Focal length x (pixels). Skips MoGe FOV estimation if set.")
+    parser.add_argument("--fy", type=float, default=None)
+    parser.add_argument("--cx", type=float, default=None,
+                        help="Principal point x (pixels). Defaults to frame_width/2.")
+    parser.add_argument("--cy", type=float, default=None)
+    args = parser.parse_args()
+    main(args)

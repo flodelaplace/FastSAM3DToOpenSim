@@ -82,7 +82,7 @@ _MODEL_TEMPLATE = os.path.join(parent_dir, "assets", "pose2sim_wholebody_model.o
 
 
 
-_GLTFPACK = "/home/linuxaitor/.npm/_npx/5dd372e23156e673/node_modules/.bin/gltfpack"
+_GLTFPACK = os.environ.get("GLTFPACK_PATH") or shutil.which("gltfpack") or ""
 
 def _fix_morph_weights(data: bytes) -> bytes:
     """Fix gltfpack's illegal quantization of morph weight animation outputs.
@@ -184,6 +184,50 @@ def draw_results_on_frame(img_bgr, outputs, visualizer):
     return out
 
 
+def _centroid_from_bbox(bbox):
+    x1, y1, x2, y2 = bbox
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+
+
+def _euclidean(a, b):
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+
+def _lean_angle_at_frame(keypoints, frame_idx):
+    """Measure pelvis→thorax lean angle (degrees) on a single frame.
+
+    Positive = forward lean, negative = backward lean.
+    """
+    kp = keypoints[frame_idx]
+    pelvis = (kp[9] + kp[10]) / 2
+    thorax = (kp[67] + kp[68]) / 2
+    spine_vec = thorax - pelvis
+    xz = np.array([spine_vec[0], spine_vec[1]])
+    if np.linalg.norm(xz) < 0.01:
+        return 0.0
+    cos_a = np.dot(xz, [0, 1]) / np.linalg.norm(xz)
+    a = np.degrees(np.arccos(np.clip(cos_a, -1, 1)))
+    return float(a if spine_vec[0] > 0 else -a)
+
+
+def _lean_angle_over_range(keypoints, center_frame, half_window=5):
+    """Average pelvis→thorax lean angle over a window of frames.
+
+    Averages over [center - half_window, center + half_window], skipping
+    frames outside array bounds.  Much more robust than a single frame.
+    """
+    N = keypoints.shape[0]
+    lo = max(0, center_frame - half_window)
+    hi = min(N, center_frame + half_window + 1)
+    angles = []
+    for i in range(lo, hi):
+        a = _lean_angle_at_frame(keypoints, i)
+        angles.append(a)
+    if not angles:
+        return 0.0
+    return float(np.median(angles))
+
+
 def main(args):
     # Auto-generate timestamped output directory (matches SAM3D-OpenSim convention)
     if args.output_dir is None:
@@ -215,6 +259,44 @@ def main(args):
     visualizer = SkeletonVisualizer(line_width=2, radius=5)
     visualizer.set_pose_meta(mhr70_pose_info)
     print(f"Model loaded in {time.time() - t_load:.1f}s")
+
+    # Optionally estimate floor tilt from MoGe on frame 0 and skip spine correction
+    # when MoGe estimation is active (avoids overcorrection).
+    moge_floor_angle = None
+    if getattr(args, "floor_moge", False) and not args.no_lean_fix:
+        fov_est = getattr(estimator, "fov_estimator", None)
+        if fov_est is not None:
+            print("\nEstimating floor plane from MoGe depth (frame 0)...")
+            t_moge = time.time()
+            # Read first frame from the video file
+            cap_m = cv2.VideoCapture(args.video_path)
+            ret_m, first_frame = cap_m.read()
+            cap_m.release()
+            if ret_m and first_frame is not None:
+                try:
+                    pts, mask = fov_est.get_depth_points(cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB))
+                    # Try to get a person bbox on the first frame to exclude from floor fit
+                    first_bbox = None
+                    try:
+                        outs = estimator.process_one_image(
+                            cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB),
+                            hand_box_source=args.hand_box_source,
+                            inference_type=args.inference_type,
+                            bbox_thr=getattr(args, 'bbox_thr', None),
+                            nms_thr=getattr(args, 'nms_thr', None),
+                        )
+                        if outs and "bbox" in outs[0]:
+                            first_bbox = tuple(outs[0]["bbox"])
+                    except Exception:
+                        first_bbox = None
+                    moge_floor_angle = CoordinateTransformer.floor_angle_from_moge_points(
+                        pts, mask, person_bbox=first_bbox, orig_hw=(first_frame.shape[0], first_frame.shape[1])
+                    )
+                    print(f"  MoGe floor tilt: {moge_floor_angle:+.2f}° (took {time.time() - t_moge:.2f}s)")
+                except Exception:
+                    print("  [floor_moge] MoGe floor estimation failed — skipping.")
+        else:
+            print("  [floor_moge] No FOV estimator available — skipping.")
 
     # ── Video I/O ─────────────────────────────────────────────────────────────
     cap = cv2.VideoCapture(args.video_path)
@@ -265,6 +347,25 @@ def main(args):
     all_joint_coords = []  # [N_frames] of [127, 3] camera-space joint coords, or None
     all_raw_outputs = []   # for video_outputs.json
     inference_times = []
+    # Multi-person track storage — keyed by track ID
+    tracks = {}  # {track_id: {'kpts': [...], 'cam_t': [...], 'jcoords': [...]}}
+
+    # Enable BoT-SORT tracking when multi_person is requested
+    use_botsort = (
+        getattr(args, 'multi_person', False)
+        and args.tracker != "none"
+        and getattr(estimator, 'detector', None) is not None
+    )
+    if use_botsort:
+        # Use our robust config (higher track_buffer, stricter new_track_thresh)
+        # to survive black/blank frames without creating spurious tracks.
+        tracker_cfg_path = os.path.join(parent_dir, "tools", f"{args.tracker}_robust.yaml")
+        if os.path.isfile(tracker_cfg_path):
+            tracker_cfg = tracker_cfg_path
+        else:
+            tracker_cfg = f"{args.tracker}.yaml"
+        estimator.detector.enable_tracking(tracker=tracker_cfg)
+    black_frame_count = 0
 
     while cap.isOpened():
         ret, frame_bgr = cap.read()
@@ -274,6 +375,29 @@ def main(args):
             break
         if frame_idx % frame_step != 0:
             frame_idx += 1
+            continue
+
+        # Skip black/saturated frames — sending them to the tracker would
+        # cause it to lose all tracks and create spurious new IDs.
+        mean_brightness = np.mean(frame_bgr)
+        if mean_brightness < 10:
+            black_frame_count += 1
+            print(f"  [{processed+1}] frame {frame_idx:5d} | SKIPPED (black frame, mean={mean_brightness:.0f})")
+            # Record as missing frame so arrays stay aligned
+            writer.write(frame_bgr)
+            timestamps.append(frame_idx / fps)
+            all_kpts_raw.append(None)
+            all_cam_t.append(None)
+            all_verts.append(None)
+            all_joint_coords.append(None)
+            all_raw_outputs.append({"frame": f"frame_{frame_idx:06d}.jpg", "outputs": []})
+            if getattr(args, 'multi_person', False):
+                for tr in tracks.values():
+                    tr['kpts'].append(None)
+                    tr['cam_t'].append(None)
+                    tr['jcoords'].append(None)
+            frame_idx += 1
+            processed += 1
             continue
 
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -287,25 +411,195 @@ def main(args):
                 frame_cam_int[0, 1, 2] = height / 2.0
 
         t0 = time.time()
-        try:
-            outputs = estimator.process_one_image(
-                frame_rgb,
-                hand_box_source=args.hand_box_source,
-                inference_type=args.inference_type,
-                cam_int=frame_cam_int,
-            )
-        except Exception as e:
-            print(f"  Frame {frame_idx}: inference error — {e}")
-            writer.write(frame_bgr)
-            timestamps.append(frame_idx / fps)
-            all_kpts_raw.append(None)
-            all_cam_t.append(None)
-            all_verts.append(None)
-            all_joint_coords.append(None)
-            all_raw_outputs.append({"frame": f"frame_{frame_idx:06d}.jpg", "outputs": []})
-            frame_idx += 1
-            processed += 1
-            continue
+
+        # Detect-then-infer / chunking logic to avoid TRT engine profile limits
+        outputs = None
+        frame_track_ids = None   # BoT-SORT IDs for this frame (if tracking)
+        use_detect_first = (
+            getattr(args, 'detect_then_infer', False)
+            or (getattr(args, 'inference_batch_cap', 0) and getattr(args, 'inference_batch_cap', 0) > 0)
+            or getattr(args, 'force_bboxes', False)
+            or use_botsort  # tracking requires detect-first to capture IDs
+        )
+
+        if use_detect_first and getattr(estimator, 'detector', None) is not None:
+            det_thr_use = getattr(args, 'bbox_thr', None) or 0.5
+            det_nms_use = getattr(args, 'nms_thr', None) or 0.3
+            try:
+                det_res = estimator.detector.run_human_detection(
+                    frame_bgr,
+                    det_cat_id=0,
+                    bbox_thr=det_thr_use,
+                    nms_thr=det_nms_use,
+                    default_to_full_image=False,
+                )
+            except Exception as _det_e:
+                det_res = None
+
+            boxes = None
+            if det_res is not None:
+                if isinstance(det_res, dict):
+                    boxes = det_res.get('boxes', None)
+                    frame_track_ids = det_res.get('track_ids', None)
+                else:
+                    boxes = det_res
+
+            if boxes is not None and len(boxes) > 0:
+                boxes = np.asarray(boxes)
+                # Sort by area (largest first) so we keep main subjects when limiting
+                areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+                order = np.argsort(-areas)
+                boxes = boxes[order]
+                if frame_track_ids is not None:
+                    frame_track_ids = np.asarray(frame_track_ids)[order]
+
+                max_p = getattr(args, 'max_persons', None)
+                if max_p is not None and max_p > 0:
+                    boxes = boxes[:max_p]
+                    if frame_track_ids is not None:
+                        frame_track_ids = frame_track_ids[:max_p]
+
+                batch_cap = getattr(args, 'inference_batch_cap', 0) or 0
+                # If force_bboxes and batch_cap==0, treat as single large batch
+                if getattr(args, 'force_bboxes', False) and batch_cap == 0:
+                    batch_cap = boxes.shape[0]
+
+                # Single-call if no chunking needed
+                if batch_cap <= 0 or batch_cap >= boxes.shape[0]:
+                    try:
+                        outputs = estimator.process_one_image(
+                            frame_rgb,
+                            bboxes=boxes,
+                            hand_box_source=args.hand_box_source,
+                            inference_type=args.inference_type,
+                            cam_int=frame_cam_int,
+                        )
+                        print(f"  [detect_then_infer] processed {len(boxes)} boxes in one batch")
+                    except Exception as e:
+                        print(f"  [detect_then_infer] inference failed: {e}")
+                        outputs = None
+                else:
+                    # Chunked inference to avoid exceeding TRT batch profiles
+                    outputs = []
+                    for i in range(0, len(boxes), batch_cap):
+                        chunk = boxes[i : i + batch_cap]
+                        try:
+                            outs_chunk = estimator.process_one_image(
+                                frame_rgb,
+                                bboxes=np.asarray(chunk),
+                                hand_box_source=args.hand_box_source,
+                                inference_type=args.inference_type,
+                                cam_int=frame_cam_int,
+                            )
+                            if outs_chunk:
+                                outputs.extend(outs_chunk)
+                            print(f"  [detect_then_infer] chunk {i//batch_cap+1} processed {len(chunk)} boxes")
+                        except Exception as e_chunk:
+                            print(f"  [detect_then_infer] chunk inference failed (size {len(chunk)}): {e_chunk}")
+                    if len(outputs) == 0:
+                        outputs = None
+
+        # If we still have no outputs, fall back to the original top-down call.
+        # Skip fallback when BoT-SORT tracking is active — calling the detector
+        # again would corrupt the tracker's internal state.
+        if outputs is None and not use_botsort:
+            try:
+                outputs = estimator.process_one_image(
+                    frame_rgb,
+                    hand_box_source=args.hand_box_source,
+                    inference_type=args.inference_type,
+                    cam_int=frame_cam_int,
+                    bbox_thr=getattr(args, 'bbox_thr', None) or 0.5,
+                    nms_thr=getattr(args, 'nms_thr', None) or 0.3,
+                )
+            except Exception as e:
+                print(f"  Frame {frame_idx}: inference error — {e}")
+                writer.write(frame_bgr)
+                timestamps.append(frame_idx / fps)
+                all_kpts_raw.append(None)
+                all_cam_t.append(None)
+                all_verts.append(None)
+                all_joint_coords.append(None)
+                all_raw_outputs.append({"frame": f"frame_{frame_idx:06d}.jpg", "outputs": []})
+                frame_idx += 1
+                processed += 1
+                continue
+
+        # If detector found bboxes but some outputs lack pose estimates, try a forced per-bbox pass.
+        # Skip when tracking is active — re-calling the detector would corrupt tracker state.
+        if not use_botsort:
+            try:
+                need_forced = False
+                if outputs:
+                    for p in outputs:
+                        if 'pred_keypoints_3d' not in p or p.get('pred_keypoints_3d') is None:
+                            need_forced = True
+                            break
+                if need_forced and getattr(estimator, 'detector', None) is not None:
+                    print("  [fallback] Some detections missing pose -> running detector + forced per-bbox inference...")
+                    for p in outputs:
+                        if 'bbox' in p and ('pred_keypoints_3d' not in p or p.get('pred_keypoints_3d') is None):
+                            b = p['bbox']
+                            w = max(0.0, b[2] - b[0])
+                            h = max(0.0, b[3] - b[1])
+                            area = w * h
+                            cx, cy = _centroid_from_bbox(b)
+                            print(f"    [missing] bbox={b} area={area:.1f} centroid=({cx:.1f},{cy:.1f})")
+
+                    det_thr = getattr(args, 'bbox_thr_force', 0.2)
+                    det_nms = getattr(args, 'nms_thr', 0.3)
+                    try:
+                        det_res = estimator.detector.run_human_detection(
+                            frame_bgr,
+                            det_cat_id=0,
+                            bbox_thr=det_thr,
+                            nms_thr=det_nms,
+                            default_to_full_image=False,
+                        )
+                    except Exception as _det_e:
+                        det_res = None
+                    if det_res is not None:
+                        if isinstance(det_res, dict):
+                            boxes = det_res.get('boxes', None)
+                        else:
+                            boxes = det_res
+                        if boxes is not None and len(boxes) > 0:
+                            try:
+                                forced_outs = estimator.process_one_image(
+                                    frame_rgb,
+                                    bboxes=np.asarray(boxes),
+                                    hand_box_source=args.hand_box_source,
+                                    inference_type=args.inference_type,
+                                    cam_int=frame_cam_int,
+                                )
+                                if forced_outs:
+                                    outputs = forced_outs
+                                    frame_out = {"frame": f"frame_{frame_idx:06d}.jpg", "outputs": []}
+                                    for p in outputs:
+                                        entry: dict = {}
+                                        if "bbox" in p:
+                                            entry["bbox"] = [float(x) for x in p["bbox"]]
+                                        if "pred_cam_t" in p and p["pred_cam_t"] is not None:
+                                            entry["focal_length"] = float(p.get("focal_length", 0.0))
+                                        if "pred_keypoints_3d" in p and p["pred_keypoints_3d"] is not None:
+                                            entry["pred_keypoints_3d"] = p["pred_keypoints_3d"].tolist()
+                                        frame_out["outputs"].append(entry)
+                                    all_raw_outputs[-1] = frame_out
+                                    print(f"  [fallback] forced per-bbox inference produced {len(outputs)} outputs")
+                            except Exception as e_forced:
+                                print(f"  [fallback] forced per-bbox inference failed: {e_forced}")
+            except Exception:
+                pass
+
+        # Handle no outputs (e.g. no person detected this frame)
+        if outputs is None:
+            outputs = []
+
+        # Attach BoT-SORT track IDs to each output person dict
+        if frame_track_ids is not None and len(outputs) > 0:
+            for pi, p in enumerate(outputs):
+                if pi < len(frame_track_ids):
+                    p['track_id'] = int(frame_track_ids[pi])
 
         inf_t = time.time() - t0
         inference_times.append(inf_t)
@@ -347,6 +641,56 @@ def main(args):
                 entry["pred_keypoints_3d"] = p["pred_keypoints_3d"].tolist()
             frame_out["outputs"].append(entry)
         all_raw_outputs.append(frame_out)
+
+        # --- Multi-person tracking ---
+        if getattr(args, 'multi_person', False):
+            # Advance all existing tracks with a placeholder for this frame
+            for tr in tracks.values():
+                tr['kpts'].append(None)
+                tr['cam_t'].append(None)
+                tr['jcoords'].append(None)
+
+            for p in outputs:
+                # Get track ID: from BoT-SORT when available, otherwise
+                # fall back to centroid-based matching (--tracker none).
+                tid = p.get('track_id', -1)
+                if tid < 0 and 'bbox' in p:
+                    # Centroid fallback for --tracker none
+                    centroid = _centroid_from_bbox(p['bbox'])
+                    best_tid, best_d = -1, 200.0
+                    for existing_tid, tr in tracks.items():
+                        if tr.get('_last_centroid') is None:
+                            continue
+                        d = _euclidean(centroid, tr['_last_centroid'])
+                        if d < best_d:
+                            best_d = d
+                            best_tid = existing_tid
+                    if best_tid >= 0:
+                        tid = best_tid
+                    else:
+                        tid = max(tracks.keys(), default=0) + 1
+                    p['track_id'] = tid
+
+                if tid < 0:
+                    continue
+                if tid not in tracks:
+                    tracks[tid] = {
+                        'id': tid,
+                        'kpts': [None] * processed + [None],
+                        'cam_t': [None] * processed + [None],
+                        'jcoords': [None] * processed + [None],
+                        'bbox_cx': [],  # image-space center X for left→right sorting
+                    }
+                kpts_p = p.get('pred_keypoints_3d')
+                cam_t_p = p.get('pred_cam_t')
+                jc_p = p.get('pred_joint_coords')
+                tracks[tid]['kpts'][-1] = kpts_p.copy() if kpts_p is not None else None
+                tracks[tid]['cam_t'][-1] = cam_t_p.copy() if cam_t_p is not None else None
+                tracks[tid]['jcoords'][-1] = jc_p.copy() if jc_p is not None else None
+                if 'bbox' in p:
+                    cx, _ = _centroid_from_bbox(p['bbox'])
+                    tracks[tid]['_last_centroid'] = (cx, _centroid_from_bbox(p['bbox'])[1])
+                    tracks[tid]['bbox_cx'].append(cx)
 
         # Collect mesh vertices for mesh GLB
         if not args.no_mesh_glb and person is not None:
@@ -430,12 +774,45 @@ def main(args):
         center_pelvis=True,
         align_to_ground=True,
         apply_global_translation=True,
+        # When MoGe floor angle is provided, pass it to the transformer so
+        # that floor rotation is applied using camera-pitch from MoGe. Also
+        # the transformer can optionally skip the spine-based lean correction
+        # when MoGe is active to avoid overcorrection.
+        correct_floor_lean=not args.no_lean_fix,
+        floor_angle=moge_floor_angle,
     )
 
-    # 2b. Correct systematic forward lean (matches SAM3D-OpenSim default)
-    if not args.no_lean_fix:
+    # 2b. Spine-based forward-lean correction (runs after floor-plane rotation above).
+    if args.lean_angle is not None:
+        # Manual override — use exactly this angle
+        print(f"  [lean] manual correction {args.lean_angle:+.2f}°")
         kpts_opensim, jcoords_opensim = transformer.correct_forward_lean(
-            kpts_opensim, jcoords=jcoords_opensim
+            kpts_opensim, jcoords=jcoords_opensim, angle=args.lean_angle
+        )
+    elif args.lean_ref_frame is not None and not args.no_lean_fix:
+        # Reference frame: measure spine lean over a ±5 frame window around
+        # the frame where the person is known to be standing upright.
+        # Averaging makes it robust to single-frame keypoint noise.
+        ref = min(args.lean_ref_frame, kpts_opensim.shape[0] - 1)
+        lean_angle = _lean_angle_over_range(kpts_opensim, ref)
+        print(f"  [spine lean] ref frame {ref} (±5 avg): measured {lean_angle:+.2f}° → correcting")
+        kpts_opensim, jcoords_opensim = transformer.correct_forward_lean(
+            kpts_opensim, jcoords=jcoords_opensim, angle=lean_angle
+        )
+    elif not args.no_lean_fix:
+        lean_angle = transformer._estimate_lean_angle(kpts_opensim)
+        src = " (after MoGe)" if moge_floor_angle is not None else ""
+        print(f"  [spine lean] estimated {lean_angle:+.2f}°{src} → correcting")
+        kpts_opensim, jcoords_opensim = transformer.correct_forward_lean(
+            kpts_opensim, jcoords=jcoords_opensim, angle=lean_angle
+        )
+
+    # 2c. Camera-pitch-based lean correction (experimental, opt-in)
+    if getattr(args, 'lean_cam_pitch_fix', False):
+        pitch_angle = transformer._estimate_pitch_angle(cam_t_processed)
+        print(f"  Camera pitch correction: {pitch_angle:.2f}°")
+        kpts_opensim, jcoords_opensim = transformer.correct_lean_cam_pitch(
+            kpts_opensim, jcoords=jcoords_opensim, cam_t=cam_t_processed
         )
 
     # 3. Map MHR70 → OpenSim marker names; append real spine/neck/head joints
@@ -450,6 +827,241 @@ def main(args):
     markers_body, _ = converter.convert(
         kpts_opensim, include_derived=True, body_only=True
     )
+
+    # ---------------------------------------------------------------------
+    # Multi-person per-track post-processing & export (if requested)
+    # ---------------------------------------------------------------------
+    per_person_trcs = []
+    per_person_ik_results = []
+    if getattr(args, 'multi_person', False) and len(tracks) > 0:
+        if black_frame_count > 0:
+            print(f"\n  Skipped {black_frame_count} black/saturated frame(s)")
+
+        # Convert tracks dict to list and compute stats
+        tracks_list = list(tracks.values())
+        for tr in tracks_list:
+            # Use bbox center X (image-space pixels) for left→right sorting.
+            # cam_t[0] is unreliable because it's relative to the person crop.
+            bbox_xs = tr.get('bbox_cx', [])
+            tr['_median_x'] = float(np.median(bbox_xs)) if bbox_xs else 0.0
+            tr['_valid_count'] = sum(1 for k in tr['kpts'] if k is not None)
+
+        # Merge duplicate tracks: if two tracks have similar median X position
+        # (same person re-tracked after a black frame), merge the shorter into
+        # the longer one.  This handles the case where BoT-SORT still loses a
+        # track despite the high track_buffer.
+        merge_x_thresh = 80.0  # pixels — same-person lateral tolerance
+        tracks_list.sort(key=lambda t: -t['_valid_count'])  # longest first
+        merged_ids = set()
+        for i, tr_a in enumerate(tracks_list):
+            if tr_a['id'] in merged_ids:
+                continue
+            for j in range(i + 1, len(tracks_list)):
+                tr_b = tracks_list[j]
+                if tr_b['id'] in merged_ids:
+                    continue
+                if abs(tr_a['_median_x'] - tr_b['_median_x']) > merge_x_thresh:
+                    continue
+                # Check they don't overlap in time (both have valid data
+                # on the same frame → different people, don't merge).
+                overlap = False
+                for fi in range(min(len(tr_a['kpts']), len(tr_b['kpts']))):
+                    if tr_a['kpts'][fi] is not None and tr_b['kpts'][fi] is not None:
+                        overlap = True
+                        break
+                if overlap:
+                    continue
+                # Merge tr_b into tr_a (fill gaps in tr_a with data from tr_b)
+                for fi in range(min(len(tr_a['kpts']), len(tr_b['kpts']))):
+                    if tr_a['kpts'][fi] is None and tr_b['kpts'][fi] is not None:
+                        tr_a['kpts'][fi] = tr_b['kpts'][fi]
+                        tr_a['cam_t'][fi] = tr_b['cam_t'][fi]
+                        tr_a['jcoords'][fi] = tr_b['jcoords'][fi]
+                merged_ids.add(tr_b['id'])
+                tr_a['_valid_count'] = sum(1 for k in tr_a['kpts'] if k is not None)
+                print(f"  [merge] track {tr_b['id']} → track {tr_a['id']} "
+                      f"(median_x diff={abs(tr_a['_median_x'] - tr_b['_median_x']):.0f}px)")
+        tracks_list = [tr for tr in tracks_list if tr['id'] not in merged_ids]
+
+        # Sort by median bbox center X (left→right in the image)
+        for tr in tracks_list:
+            bbox_xs = tr.get('bbox_cx', [])
+            tr['_median_x'] = float(np.median(bbox_xs)) if bbox_xs else 0.0
+        tracks_list.sort(key=lambda t: t['_median_x'])
+
+        # Filter out tracks with too few valid frames (noise)
+        min_valid = max(5, processed // 10)  # at least 10% of frames or 5
+        filtered = [tr for tr in tracks_list if tr['_valid_count'] >= min_valid]
+        if len(filtered) < len(tracks_list):
+            dropped = len(tracks_list) - len(filtered)
+            print(f"  [filter] dropped {dropped} track(s) with <{min_valid} valid frames")
+            tracks_list = filtered
+
+        # Parse per-person heights (left-to-right order matches sorted tracks)
+        per_person_height_list = None
+        if args.person_heights is not None:
+            per_person_height_list = [float(h.strip()) for h in args.person_heights.split(",")]
+
+        print(f"\nMulti-person mode: exporting {len(tracks_list)} tracked person(s) (sorted left→right)")
+        for ti, tr in enumerate(tracks_list):
+            print(f"  P{ti+1}: track_id={tr['id']}, median_x={tr['_median_x']:.0f}px, "
+                  f"valid_frames={tr['_valid_count']}/{processed}")
+        exporter_person = TRCExporter(fps=out_fps, units="mm")
+        per_person_ik_results = []
+        per_person_markers = []   # for combined TRC
+        per_person_names = []
+        per_person_origins = []   # world-space origins (metres, OpenSim axes)
+        # Process each track separately through the same pipeline
+        for ti, tr in enumerate(tracks_list):
+            # Build stacks for this track
+            k_stack = np.full((N, 70, 3), np.nan, dtype=np.float64)
+            cam_stack = np.full((N, 3), np.nan, dtype=np.float64)
+            j_stack = np.full((N, 127, 3), np.nan, dtype=np.float64)
+            for i in range(min(N, len(tr['kpts']))):
+                k = tr['kpts'][i]
+                if k is not None:
+                    k_stack[i] = k
+                ct = tr['cam_t'][i] if i < len(tr['cam_t']) else None
+                if ct is not None:
+                    cam_stack[i] = ct
+                jc = tr['jcoords'][i] if i < len(tr['jcoords']) else None
+                if jc is not None:
+                    j_stack[i] = jc
+
+            valid_frames = int(np.sum(~np.any(np.isnan(k_stack), axis=(1, 2))))
+            if valid_frames == 0:
+                print(f"  [person{ti+1:02d}] no valid frames — skipping")
+                continue
+
+            # Per-person height: use person_heights[ti] if available, else fallback
+            if per_person_height_list is not None and ti < len(per_person_height_list):
+                person_height_i = per_person_height_list[ti]
+            else:
+                person_height_i = subject_height
+
+            print(f"  [person{ti+1:02d}] frames with detections: {valid_frames}/{N}, height={person_height_i:.2f}m")
+
+            # Post-process per-person
+            k_proc = post_proc.process(k_stack, fps=out_fps)
+            j_proc = post_proc.process_jcoords(j_stack, fps=out_fps)
+            cam_proc = post_proc.process_jcoords(cam_stack[:, np.newaxis, :], fps=out_fps)[:, 0, :]
+
+            # Transform to OpenSim coords per-person
+            tr_transformer = CoordinateTransformer(subject_height=person_height_i)
+            k_open, j_open = tr_transformer.transform(
+                k_proc,
+                jcoords_3d=j_proc,
+                camera_translation=cam_proc,
+                center_pelvis=True,
+                align_to_ground=True,
+                apply_global_translation=True,
+                correct_floor_lean=not args.no_lean_fix,
+                floor_angle=moge_floor_angle,
+            )
+
+            # Spine lean correction
+            if args.lean_angle is not None:
+                print(f"    [person{ti+1:02d} lean] manual {args.lean_angle:+.2f}°")
+                k_open, j_open = tr_transformer.correct_forward_lean(
+                    k_open, jcoords=j_open, angle=args.lean_angle
+                )
+            elif args.lean_ref_frame is not None and not args.no_lean_fix:
+                ref = min(args.lean_ref_frame, k_open.shape[0] - 1)
+                la = _lean_angle_over_range(k_open, ref)
+                print(f"    [person{ti+1:02d} spine lean] ref frame {ref} (±5 avg): {la:+.2f}° → correcting")
+                k_open, j_open = tr_transformer.correct_forward_lean(
+                    k_open, jcoords=j_open, angle=la
+                )
+            elif not args.no_lean_fix:
+                la = tr_transformer._estimate_lean_angle(k_open)
+                src = " (after MoGe)" if moge_floor_angle is not None else ""
+                print(f"    [person{ti+1:02d} spine lean] {la:+.2f}°{src} → correcting")
+                k_open, j_open = tr_transformer.correct_forward_lean(k_open, jcoords=j_open, angle=la)
+
+            if getattr(args, 'lean_cam_pitch_fix', False):
+                pa = tr_transformer._estimate_pitch_angle(cam_proc)
+                print(f"    [person{ti+1:02d} camera pitch] {pa:.2f}°")
+                k_open, j_open = tr_transformer.correct_lean_cam_pitch(k_open, jcoords=j_open, cam_t=cam_proc)
+
+            # Convert to markers and export per-person TRC
+            markers_p, names_p = converter.convert(k_open, jcoords_3d=j_open, include_derived=True, body_only=body_only)
+            trc_person_path = os.path.join(args.output_dir, f"{prefix}_person{ti+1:02d}.trc")
+            exporter_person.export(markers_p, names_p, trc_person_path)
+            per_person_trcs.append(trc_person_path)
+            print(f"    Wrote per-person TRC → {trc_person_path}")
+            # Store for combined multi-person TRC with world-space offsets
+            _scale = tr_transformer._last_scale
+            _cam_os = cam_proc @ CoordinateTransformer.CAMERA_TO_OPENSIM.T * _scale
+            _cam_sm = tr_transformer._smooth_cam_t(_cam_os)
+            per_person_markers.append(markers_p)
+            per_person_names.append(names_p)
+            per_person_origins.append(_cam_sm[0].copy())
+            # Optionally run OpenSim scale + IK per-person
+            if getattr(args, 'run_ik_per_person', False):
+                person_osim = os.path.join(args.output_dir, f"{prefix}_person{ti+1:02d}_model.osim")
+                try:
+                    if os.path.isfile(_MODEL_TEMPLATE):
+                        shutil.copy(_MODEL_TEMPLATE, person_osim)
+                        print(f"    Writing person model → {person_osim}")
+                        scale_ok = run_scale_tool(
+                            model_path=person_osim,
+                            trc_path=trc_person_path,
+                            scaled_model_path=person_osim,
+                            subject_mass=args.subject_mass,
+                            subject_height=person_height_i,
+                        )
+                        if not scale_ok:
+                            print(f"    WARNING: Scale Tool failed for person {ti+1} – running IK on unscaled model.")
+                    else:
+                        print(f"    WARNING: model template not found at {_MODEL_TEMPLATE} — skipping scale for person {ti+1}")
+
+                    ik_person_mot = os.path.join(args.output_dir, f"{prefix}_person{ti+1:02d}_ik.mot")
+                    ik_person_errors = os.path.join(args.output_dir, f"{prefix}_person{ti+1:02d}_ik_marker_errors.sto")
+                    print(f"    Running OpenSim IK → {ik_person_mot}")
+                    ik_ok = run_ik(
+                        model_path=person_osim if os.path.isfile(person_osim) else person_osim,
+                        trc_path=trc_person_path,
+                        mot_path=ik_person_mot,
+                        errors_path=ik_person_errors,
+                    )
+                    per_person_ik_results.append({
+                        'trc': trc_person_path,
+                        'model': person_osim if os.path.isfile(person_osim) else None,
+                        'ik_mot': ik_person_mot if ik_ok else None,
+                        'ik_errors': ik_person_errors if ik_ok else None,
+                        'ik_success': bool(ik_ok),
+                    })
+                    if not ik_ok:
+                        print(f"    WARNING: OpenSim IK failed for person {ti+1}")
+                except Exception as _eik:
+                    print(f"    ERROR: per-person IK failed for person {ti+1}: {_eik}")
+
+        # ── Combined multi-person TRC with world-space positions ──────────
+        if len(per_person_markers) >= 2:
+            ref_origin = per_person_origins[0]
+            combined_names = []
+            combined_list = []
+            for pi, (mk, nm, org) in enumerate(
+                zip(per_person_markers, per_person_names, per_person_origins)
+            ):
+                offset = org - ref_origin          # (3,) in metres
+                shifted = mk.copy()
+                shifted[:, :, 0] += offset[0]      # X (forward / anterior)
+                shifted[:, :, 2] += offset[2]      # Z (lateral)
+                combined_list.append(shifted)
+                combined_names.extend([f"P{pi+1}_{n}" for n in nm])
+            combined_markers_all = np.concatenate(combined_list, axis=1)
+            combined_trc_path = os.path.join(
+                args.output_dir, f"{prefix}_combined.trc"
+            )
+            TRCExporter(fps=out_fps, units="mm").export(
+                combined_markers_all, combined_names, combined_trc_path
+            )
+            per_person_trcs.append(combined_trc_path)
+            print(
+                f"\n    Combined multi-person TRC ({len(per_person_markers)} persons)"
+                f" → {combined_trc_path}"
+            )
 
     # ── Export OpenSim files ──────────────────────────────────────────────────
     print("\nExporting OpenSim files...")
@@ -540,6 +1152,8 @@ def main(args):
             "mot": ik_mot_path if ik_ok else None,
             "model": osim_path,
             "mesh_glb": mesh_glb,
+            "per_person_trcs": per_person_trcs if len(per_person_trcs) > 0 else None,
+            "per_person_ik": per_person_ik_results if len(per_person_ik_results) > 0 else None,
         },
     }
     with open(report_path, "w") as f:
@@ -589,9 +1203,17 @@ if __name__ == "__main__":
                         help="Skip full body mesh GLB export (saves ~185 MB for long videos)")
     parser.add_argument("--no_lean_fix", action="store_true",
                         help="Skip automatic forward-lean correction")
+    parser.add_argument("--floor_moge", action="store_true",
+                        help="Estimate floor plane from MoGe depth on the first video frame and use its camera-pitch angle to correct forward lean. Requires MoGe to be available.")
     parser.add_argument("--person_height", type=float, default=None,
                         help="Known person height in metres (e.g. 1.69). Scales all 3D output "
-                             "so the skeleton height matches this value.")
+                             "so the skeleton height matches this value. Applied to all persons "
+                             "unless --person_heights is set.")
+    parser.add_argument("--person_heights", type=str, default=None,
+                        help="Comma-separated heights in metres for multi-person mode, "
+                             "assigned left-to-right as seen in the video. "
+                             "E.g. --person_heights 1.69,1.82  (person on the left=1.69m, "
+                             "person on the right=1.82m). Overrides --person_height.")
     parser.add_argument("--subject_mass", type=float, default=70.0,
                         help="Subject mass in kg (default 70.0). Used for model scaling only; "
                              "does not affect kinematics.")
@@ -603,5 +1225,52 @@ if __name__ == "__main__":
     parser.add_argument("--cx", type=float, default=None,
                         help="Principal point x (pixels). Defaults to frame_width/2.")
     parser.add_argument("--cy", type=float, default=None)
+    parser.add_argument("--lean_angle", type=float, default=None,
+                        help="Manual lean correction angle in degrees. Positive tilts the "
+                             "skeleton backward (corrects forward lean). Overrides both "
+                             "--floor_moge and automatic spine lean correction. "
+                             "Example: --lean_angle 5 corrects 5° of forward lean.")
+    parser.add_argument("--lean_ref_frame", type=int, default=None,
+                        help="Frame index (0-based among processed frames) where the person "
+                             "is known to be standing upright. The spine lean measured on "
+                             "this frame is used as the correction for ALL frames. "
+                             "Works with --floor_moge: MoGe corrects the floor, then the "
+                             "ref frame corrects the residual lean per person. "
+                             "Example: --lean_ref_frame 0 (use the first frame as reference)")
+    parser.add_argument("--lean_cam_pitch_fix", action="store_true",
+                        help="Enable experimental camera-pitch-based lean correction")
+    parser.add_argument("--multi_person", action="store_true",
+                        help="Enable multi-person export: track detections across frames and "
+                             "write per-person TRC files + a combined TRC.")
+    parser.add_argument("--tracker", default="botsort",
+                        choices=["botsort", "bytetrack", "none"],
+                        help="Multi-object tracker to use with --multi_person. "
+                             "'botsort' (default) handles re-identification after occlusion; "
+                             "'bytetrack' is lighter but no re-ID; "
+                             "'none' disables tracking (legacy centroid matching).")
+    parser.add_argument("--bbox_thr", type=float, default=0.5,
+                        help="Detection bbox confidence threshold passed to the estimator (default: 0.5).")
+    parser.add_argument("--nms_thr", type=float, default=0.3,
+                        help="NMS threshold passed to the estimator (default: 0.3).")
+    parser.add_argument("--bbox_thr_force", type=float, default=0.2,
+                        help="Force-detection threshold used by fallback detector when some detections miss pose estimates.")
+    parser.add_argument("--force_bboxes", action="store_true",
+                        help="Always run per-detection bbox inference (expensive) instead of the default top-down gating/fallback.")
+    parser.add_argument("--detect_then_infer", action="store_true",
+                        help="Run detector first, then send detected boxes to the pose estimator in chunks (avoids TRT batch-profile issues).")
+    parser.add_argument("--inference_batch_cap", type=int, default=4,
+                        help="Maximum number of person crops to send to the estimator in one chunk. Set 0 to disable chunking.")
+    parser.add_argument("--fallback_lower_bbox", type=float, default=0.05,
+                        help="Lower bbox confidence for fallback detector pass.")
+    parser.add_argument("--fallback_nms", type=float, default=0.9,
+                        help="NMS threshold for fallback detector pass.")
+    parser.add_argument("--fallback_iou_thresh", type=float, default=0.5,
+                        help="IoU threshold used when merging fallback boxes (not implemented: reserved).")
+    parser.add_argument("--max_persons", type=int, default=6,
+                        help="Maximum number of person detections to consider per frame (keeps top areas).")
+    parser.add_argument("--write_combined_trc", action="store_true",
+                        help="Also write the combined TRC used for IK in addition to per-person TRCs.")
+    parser.add_argument("--run_ik_per_person", action="store_true",
+                        help="Run OpenSim scale + IK for each per-person TRC (slow).")
     args = parser.parse_args()
     main(args)

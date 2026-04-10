@@ -195,7 +195,7 @@ def _write_scale_setup_xml(
 \t</ScaleTool>
 </OpenSimDocument>
 """
-    Path(xml_path).write_text(xml)
+    Path(xml_path).write_text(xml, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +212,7 @@ try:
     import opensim
     opensim.Logger.setLevelString('error')
 
-    # Snapshot marker positions BEFORE ScaleTool — these are the template (pre-scale)
+    # Snapshot marker positions BEFORE ScaleTool -- these are the template (pre-scale)
     # positions we use as the authoritative source for marker placement.
     _pre_model = opensim.Model(scaled_model_path)
     _pre_model.initSystem()
@@ -311,7 +311,7 @@ def run_scale_tool(
             trc_marker_names=trc_marker_names,
             xml_path=xml_path,
         )
-        Path(script_path).write_text(_SCALE_SCRIPT)
+        Path(script_path).write_text(_SCALE_SCRIPT, encoding="utf-8")
 
         result = subprocess.run(
             [opensim_python, script_path, xml_path, result_json,
@@ -339,14 +339,21 @@ def run_scale_tool(
     return os.path.isfile(scaled_model_path)
 
 
-# Absolute path to opensim conda Python (adjust if env is installed elsewhere)
+# Fallback paths when OPENSIM_PYTHON_PATH env var is not set
 _OPENSIM_PYTHON_CANDIDATES = [
-    "/home/linuxaitor/miniconda3/envs/opensim/bin/python",
-    "/opt/conda/envs/opensim/bin/python",
+    "/opt/conda/envs/opensim/bin/python",           # Docker
+    os.path.expanduser("~/miniconda3/envs/opensim/bin/python"),  # Local
 ]
 
 
 def _find_opensim_python() -> str | None:
+    """Find the opensim conda Python interpreter.
+
+    Checks OPENSIM_PYTHON_PATH env var first, then known fallback paths.
+    """
+    env_path = os.environ.get("OPENSIM_PYTHON_PATH")
+    if env_path and os.path.isfile(env_path):
+        return env_path
     for p in _OPENSIM_PYTHON_CANDIDATES:
         if os.path.isfile(p):
             return p
@@ -409,7 +416,7 @@ def _write_ik_setup_xml(
 \t</InverseKinematicsTool>
 </OpenSimDocument>
 """
-    Path(xml_path).write_text(xml)
+    Path(xml_path).write_text(xml, encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -474,7 +481,7 @@ def run_ik(
             trc_marker_names=trc_marker_names,
             xml_path=xml_path,
         )
-        Path(script_path).write_text(_IK_SCRIPT)
+        Path(script_path).write_text(_IK_SCRIPT, encoding="utf-8")
 
         result = subprocess.run(
             [opensim_python, script_path, xml_path, result_json, output_dir],
