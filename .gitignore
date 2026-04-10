@@ -4,6 +4,9 @@ __pycache__/
 *$py.class
 *.pyc
 
+# SSH/AWS keys — never commit
+*.pem
+
 # Ignore large model files but keep configs
 checkpoints/**/*.ckpt
 checkpoints/**/*.pt

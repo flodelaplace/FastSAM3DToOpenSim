@@ -1,0 +1,43 @@
+services:
+  fast-sam-opensim:
+    build: .
+    image: fast-sam-opensim:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics
+      # --- TensorRT engine generation ---
+      - GENERATE_TRT=1
+      - FORCE_GENERATE_TRT=0
+      # --- Inference parameters ---
+      - SKIP_KEYPOINT_PROMPT=1
+      - FOV_TRT=1
+      - FOV_FAST=1
+      - FOV_MODEL=s
+      - FOV_LEVEL=0
+      - USE_TRT_BACKBONE=1
+      - USE_COMPILE=1
+      - DECODER_COMPILE=1
+      - COMPILE_MODE=reduce-overhead
+      - MHR_NO_CORRECTIVES=1
+      - GPU_HAND_PREP=1
+      - BODY_INTERM_PRED_LAYERS=0,2
+      - DEBUG_NAN=0
+      - PARALLEL_DECODERS=0
+      - COMPILE_WARMUP_BATCH_SIZES=1
+    volumes:
+      - ./checkpoints:/app/checkpoints
+      - ./videos:/app/videos:ro
+      - ./outputs:/outputs
+    stdin_open: true
+    tty: true
+    # Default: runs the demo configured in docker/entrypoint.sh.
+    # Custom video:
+    #   docker compose run --rm fast-sam-opensim python demo_video_opensim.py \
+    #     --video_path ./videos/my_video.mp4 --output_dir /outputs/my_run --inference_type body

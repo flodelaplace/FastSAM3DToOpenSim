@@ -1,0 +1,17 @@
+checkpoints/
+videos/
+output/
+outputs/
+output_*/
+.git/
+*.engine
+*.pt
+*.ckpt
+*.onnx
+*.pem
+mhr2smpl/experiments/
+venv/
+.idea/
+.junie/
+__pycache__/
+*.pyc
