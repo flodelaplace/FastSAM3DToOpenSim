@@ -25,6 +25,11 @@ pip install pytorch-lightning pyrender opencv-python yacs scikit-image einops ti
     ffmpeg cython jsonlines pytest xtcocotools loguru optree fvcore black \
     pycocotools tensorboard huggingface_hub
 
+# Step 4b: Detectron2 transitive deps (we install detectron2 with --no-deps below,
+# so we must declare them explicitly to avoid ModuleNotFoundError at runtime)
+echo "=== Installing Detectron2 transitive deps ==="
+pip install cloudpickle iopath tabulate matplotlib packaging
+
 # Step 5: Install Detectron2
 echo "=== Installing Detectron2 ==="
 export CUDA_HOME=$CONDA_PREFIX

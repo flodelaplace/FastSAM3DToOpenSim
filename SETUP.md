@@ -266,6 +266,7 @@ Without these files, `demo_video_opensim.py` still works fully (TRC, MOT, GLB). 
 | Issue | Workaround |
 |-------|-----------|
 | `conda install` breaks the env | Use `pip install` for everything in `fast_sam_3d_body` |
+| `ModuleNotFoundError: cloudpickle` (or `iopath`, `tabulate`) | We install detectron2 with `--no-deps`, so its transitive deps must be installed explicitly: `pip install cloudpickle iopath tabulate matplotlib packaging hydra-core` |
 | `nvcc` not installed (no sudo) | detectron2 compiles CPU-only; not used in inference, so harmless |
 | `convert_moge_encoder_trt.py` fails on external weights | Change `parse(f.read())` to `parse_from_file(onnx_path)` |
 | `convert_backbone_tensorrt.py` export fails | Add `dynamo=False` to `torch.onnx.export()` |

@@ -35,27 +35,56 @@ SHELL ["/bin/bash", "-c"]
 
 # --------------------------------------------------------------------------- #
 # Env 1: fast_sam_3d_body (Python 3.11)                                         #
+# Split into multiple RUN layers so a transient network failure doesn't        #
+# wipe out hours of work, and Docker can cache each step independently.        #
 # --------------------------------------------------------------------------- #
-COPY docker/requirements_docker.txt /tmp/requirements_docker.txt
 
-# Prepare the conda env, install virtualenv and preinstall chumpy from conda-forge
+# Configure pip with retries to survive flaky network
+ENV PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=5 \
+    PIP_NO_CACHE_DIR=1
+
+# Step 1: Create env + base build tools (~30s)
 RUN conda create -y -n fast_sam_3d_body python=3.11 && \
-    source activate fast_sam_3d_body && \
-    pip install --no-cache-dir numpy cython setuptools virtualenv && \
-    conda install -y -n fast_sam_3d_body -c conda-forge chumpy && \
-    pip install --no-cache-dir \
+    /opt/conda/envs/fast_sam_3d_body/bin/pip install \
+        numpy cython setuptools virtualenv
+
+# Step 2: chumpy from conda-forge (cached separately) (~1 min)
+RUN conda install -y -n fast_sam_3d_body -c conda-forge chumpy && \
+    conda clean -afy
+
+# Step 3: PyTorch (~3-5 min, the big download ~3 GB)
+RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
         torch==2.5.1+cu124 \
         torchvision==0.20.1+cu124 \
-        --extra-index-url https://download.pytorch.org/whl/cu124 && \
-    pip install --no-cache-dir tensorrt-cu12 tensorrt-cu12-bindings tensorrt-cu12-libs && \
-    pip install --no-cache-dir -r /tmp/requirements_docker.txt && \
-    CUDA_HOME=/usr/local/cuda CUDA_VISIBLE_DEVICES="" pip install --no-cache-dir --no-build-isolation --no-deps \
-        "git+https://github.com/facebookresearch/detectron2.git@a1ce2f956a1d2212ad672e3c47d53405c2fe4312" && \
-    pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cu124
+
+# Step 4: TensorRT (~2 min)
+# Engines are GPU-specific AND TRT-version-specific. They are always regenerated
+# on first launch via docker/entrypoint.sh (GENERATE_TRT=1 by default).
+RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
+        tensorrt-cu12 tensorrt-cu12-bindings tensorrt-cu12-libs
+
+# Step 5: Application requirements (~5 min)
+COPY docker/requirements_docker.txt /tmp/requirements_docker.txt
+RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
+        -r /tmp/requirements_docker.txt
+
+# Step 6: detectron2 (compiles from source, ~5-8 min)
+RUN CUDA_HOME=/usr/local/cuda CUDA_VISIBLE_DEVICES="" \
+    /opt/conda/envs/fast_sam_3d_body/bin/pip install \
+        --no-build-isolation --no-deps \
+        "git+https://github.com/facebookresearch/detectron2.git@a1ce2f956a1d2212ad672e3c47d53405c2fe4312"
+
+# Step 7: MoGe + utility git deps (~2 min)
+RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
         "git+https://github.com/microsoft/MoGe.git@07444410f1e33f402353b99d6ccd26bd31e469e8" \
         "git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6" \
-        "git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183" && \
-    conda clean -afy && pip cache purge
+        "git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183"
+
+# Final cleanup
+RUN conda clean -afy && \
+    find /opt/conda -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
 # --------------------------------------------------------------------------- #
 # Env 2: opensim (Python 3.10, opensim-org channel)                            #

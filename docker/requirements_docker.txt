@@ -29,3 +29,10 @@ onnxruntime-gpu>=1.17.0
 omegaconf
 ultralytics
 networkx==3.2.1
+# detectron2 transitive deps (we install detectron2 with --no-deps)
+cloudpickle
+hydra-core
+iopath
+tabulate
+matplotlib
+packaging
