@@ -76,16 +76,12 @@ COPY . /app
 # Ensure output dir exists
 RUN mkdir -p /outputs
 
-# Configuration de l'entrypoint
-COPY docker/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# Make scripts executable (already copied by COPY . /app)
+RUN chmod +x /app/docker/entrypoint.sh /app/scripts/run_job.sh && \
+    ln -sf /app/docker/entrypoint.sh /entrypoint.sh
 
-# Exposition du dossier checkpoints comme volume pour S3/Local
+# Volumes for persistent data
 VOLUME ["/app/checkpoints", "/app/videos", "/outputs"]
-
-# AWS Batch job wrapper: pulls video from S3, processes, pushes results back
-COPY scripts/run_job.sh /app/run_job.sh
-RUN chmod +x /app/run_job.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["bash"]

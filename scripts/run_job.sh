@@ -50,6 +50,20 @@ python demo_video_opensim.py \
     --inference_type "$INFERENCE_TYPE" \
     ${EXTRA_ARGS:-}
 
+# ---- Optional: GLB export via Blender ---------------------------------------
+# Set EXPORT_GLB=1 to convert the .mot output to a rigged GLB
+if [ "${EXPORT_GLB:-0}" = "1" ]; then
+    MOT_FILE=$(find "$OUTPUT_DIR" -name "*.mot" | head -n 1)
+    TRC_FILE=$(find "$OUTPUT_DIR" -name "*.trc" | head -n 1)
+    if [ -n "$MOT_FILE" ]; then
+        echo ">>> Exporting GLB via Blender..."
+        blender --background --python export_glb_skely.py -- \
+            --mot "$MOT_FILE" \
+            --output "${OUTPUT_DIR}/${VIDEO_NAME}.glb" \
+            ${TRC_FILE:+--trc "$TRC_FILE"}
+    fi
+fi
+
 # ---- Push results to S3 -----------------------------------------------------
 echo ">>> Uploading results to S3..."
 aws s3 cp "$OUTPUT_DIR" "${S3_OUTPUT_URI}output_${TIMESTAMP}_${VIDEO_NAME}/" --recursive
