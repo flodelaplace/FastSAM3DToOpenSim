@@ -1,0 +1,17 @@
+# BoT-SORT config tuned for robustness against black/blank frames
+# and multi-person tracking with temporary occlusions.
+
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.05        # lower than default (0.1) to recover weak detections
+new_track_thresh: 0.4         # higher than default (0.25) to avoid spurious new tracks
+track_buffer: 90              # 3× default (30) — survive ~3s of lost frames at 30fps
+match_thresh: 0.85
+fuse_score: True
+
+# BoT-SORT specifics
+gmc_method: sparseOptFlow
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: False
+model: auto

@@ -124,6 +124,26 @@ class FOVEstimator:
                                         fixed_size=self.fixed_size,
                                         resolution_level=self.resolution_level, **kwargs)
 
+    def get_depth_points(self, img):
+        """
+        Run MoGe on img and return the 3D point cloud in camera space.
+        Called once (frame 0) for floor-plane lean estimation — zero per-frame overhead.
+
+        Returns
+        -------
+        points : np.ndarray (H, W, 3) float32 — 3-D point cloud in camera space
+        mask   : np.ndarray (H, W) bool       — valid depth pixels
+        """
+        result = self.fov_estimator_func(
+            self.fov_estimator, img, self.device,
+            fixed_size=self.fixed_size,
+            resolution_level=self.resolution_level,
+            return_points=True,
+        )
+        # result is (intrinsics, points, mask) when return_points=True
+        _, points, mask = result
+        return points, mask
+
 
 def load_moge(device, path="", half=True, use_trt=False):
     from moge.model.v2 import MoGeModel
@@ -156,7 +176,7 @@ def load_moge(device, path="", half=True, use_trt=False):
     return moge_model
 
 
-def run_moge(model, input_image, device, fixed_size=0, resolution_level=9):
+def run_moge(model, input_image, device, fixed_size=0, resolution_level=9, return_points=False):
     """
     Run MoGe2 inference.
 
@@ -164,6 +184,7 @@ def run_moge(model, input_image, device, fixed_size=0, resolution_level=9):
         fixed_size: If > 0, resize input image to this size before inference (reduces data transfer)
         resolution_level: 0-9, controls num_tokens. Lower = faster.
                           level=0 -> 1200 tokens, level=9 -> 3600 tokens
+        return_points: If True, return (cam_intrinsics, points_np, mask_np) instead of just cam_intrinsics
     """
     import torch.nn.functional as F
 
@@ -207,15 +228,22 @@ def run_moge(model, input_image, device, fixed_size=0, resolution_level=9):
     # add batch dim
     cam_intrinsics = intrinsics[None]
 
+    if return_points:
+        points_np = moge_data["points"].cpu().float().numpy()  # (H, W, 3) float32
+        mask_np = moge_data["mask"].cpu().numpy().astype(bool)  # (H, W) bool
+        return cam_intrinsics, points_np, mask_np
+
     return cam_intrinsics
 
 
-def run_moge_fast(model, input_image, device, fixed_size=0, resolution_level=9):
+def run_moge_fast(model, input_image, device, fixed_size=0, resolution_level=9, return_points=False):
     """
     Fast MoGe2 inference - patches normal_head to skip computation.
     Only skips: normal_head (saves ~2ms)
 
     Note: intrinsics requires points_head and mask_head to compute focal/shift.
+    Args:
+        return_points: If True, return (cam_intrinsics, points_np, mask_np) instead of just cam_intrinsics
     """
     import torch.nn.functional as F
 
@@ -259,6 +287,11 @@ def run_moge_fast(model, input_image, device, fixed_size=0, resolution_level=9):
     v_focal = intrinsics[1, 1]
     intrinsics[0, 0] = v_focal
     cam_intrinsics = intrinsics[None]
+
+    if return_points:
+        points_np = moge_data["points"].cpu().float().numpy()  # (H, W, 3) float32
+        mask_np = moge_data["mask"].cpu().numpy().astype(bool)  # (H, W) bool
+        return cam_intrinsics, points_np, mask_np
 
     return cam_intrinsics
 

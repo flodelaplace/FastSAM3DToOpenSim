@@ -11,6 +11,7 @@ class HumanDetector:
     def __init__(self, name="vitdet", device="cuda", **kwargs):
         self.device = device
         self.name = name
+        self._tracking_enabled = False
 
         if name == "vitdet":
             print("########### Using human detector: ViTDet...")
@@ -32,7 +33,32 @@ class HumanDetector:
         else:
             raise NotImplementedError(f"Detector '{name}' not supported. Use 'vitdet', 'yolo', or 'yolo_pose'.")
 
+    def enable_tracking(self, tracker="botsort.yaml"):
+        """Enable BoT-SORT / ByteTrack tracking for YOLO-Pose detectors.
+
+        Must be called before the first frame.  After this,
+        ``run_human_detection`` returns an extra ``"track_ids"`` key.
+        """
+        if "yolo" not in self.name:
+            print(f"  [tracker] tracking not supported for detector '{self.name}'")
+            return
+        self._tracking_enabled = True
+        self._tracker_cfg = tracker
+        print(f"  [tracker] enabled {tracker} tracking")
+
+    def reset_tracker(self):
+        """Reset the internal tracker state (call between videos)."""
+        if self._tracking_enabled and hasattr(self.detector, 'predictor'):
+            self.detector.predictor.trackers = []
+        # Reset YOLO's internal tracker state by clearing predictor
+        if hasattr(self.detector, 'predictor'):
+            del self.detector.predictor
+
     def run_human_detection(self, img, **kwargs):
+        if self._tracking_enabled and self.name == "yolo_pose":
+            return run_yolo_pose_tracked(
+                self.detector, img, tracker_cfg=self._tracker_cfg, **kwargs
+            )
         return self.detector_func(self.detector, img, **kwargs)
 
 
@@ -349,4 +375,115 @@ def run_yolo_pose(
     return {
         "boxes": boxes,
         "keypoints": keypoints,
+    }
+
+
+def run_yolo_pose_tracked(
+    detector,
+    img,
+    tracker_cfg: str = "botsort.yaml",
+    det_cat_id: int = 0,
+    bbox_thr: float = 0.5,
+    nms_thr: float = 0.3,
+    default_to_full_image: bool = True,
+    imgsz: int = 640,
+):
+    """
+    Run YOLO-Pose with BoT-SORT / ByteTrack tracking.
+
+    Same interface as ``run_yolo_pose`` but calls ``model.track()`` with
+    ``persist=True`` so that track IDs are maintained across frames.
+
+    Returns:
+        dict with keys:
+            - boxes:      numpy [N, 4]  xyxy
+            - keypoints:  numpy [N, 17, 3]  (x, y, conf)
+            - track_ids:  numpy [N]  int — stable IDs across frames
+    """
+    height, width = img.shape[:2]
+    device = getattr(detector, '_device', 'cuda')
+
+    model_path = ""
+    for attr in ('model_name', 'ckpt_path', 'model'):
+        val = getattr(detector, attr, None)
+        if val is not None:
+            model_path = str(val)
+            if '.engine' in model_path or '.onnx' in model_path:
+                break
+    is_engine = '.engine' in model_path or '.onnx' in model_path
+
+    inference_kwargs = {
+        'conf': bbox_thr,
+        'verbose': False,
+        'imgsz': imgsz,
+        'device': device,
+        'persist': True,
+        'tracker': tracker_cfg,
+    }
+    if not is_engine:
+        inference_kwargs['half'] = True
+        inference_kwargs['classes'] = [det_cat_id]
+
+    results = detector.track(img, **inference_kwargs)
+
+    boxes_list = []
+    keypoints_list = []
+    ids_list = []
+
+    for result in results:
+        if result.boxes is None or len(result.boxes) == 0:
+            continue
+
+        xyxy = result.boxes.xyxy.cpu().numpy()
+        confs = result.boxes.conf.cpu().numpy()
+
+        # Track IDs — may be None on the very first frame or if matching fails
+        if result.boxes.id is not None:
+            track_ids = result.boxes.id.cpu().numpy().astype(int)
+        else:
+            track_ids = np.full(len(xyxy), -1, dtype=int)
+
+        if hasattr(result.boxes, 'cls') and result.boxes.cls is not None:
+            cls_ids = result.boxes.cls.cpu().numpy().astype(int)
+        else:
+            cls_ids = np.zeros(len(xyxy), dtype=int)
+
+        if result.keypoints is not None:
+            kpts = result.keypoints.data.cpu().numpy()
+        else:
+            kpts = np.zeros((len(xyxy), 17, 3), dtype=np.float32)
+
+        valid_mask = (confs >= bbox_thr) & (cls_ids == det_cat_id)
+        boxes_list.extend(xyxy[valid_mask])
+        keypoints_list.extend(kpts[valid_mask])
+        ids_list.extend(track_ids[valid_mask])
+
+    if len(boxes_list) == 0:
+        if default_to_full_image:
+            boxes = np.array([[0, 0, width, height]], dtype=np.float32)
+            keypoints = np.zeros((1, 17, 3), dtype=np.float32)
+            track_ids = np.array([-1], dtype=int)
+        else:
+            boxes = np.array([], dtype=np.float32).reshape(0, 4)
+            keypoints = np.array([], dtype=np.float32).reshape(0, 17, 3)
+            track_ids = np.array([], dtype=int)
+    else:
+        boxes = np.array(boxes_list, dtype=np.float32)
+        keypoints = np.array(keypoints_list, dtype=np.float32)
+        track_ids = np.array(ids_list, dtype=int)
+
+    # Sort by area descending (largest first)
+    if len(boxes) > 0:
+        areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        sorted_indices = np.argsort(areas)[::-1]
+        boxes = boxes[sorted_indices]
+        keypoints = keypoints[sorted_indices]
+        track_ids = track_ids[sorted_indices]
+
+    print(f"          [DEBUG] YOLO-Pose tracked {len(boxes)} person(s), IDs: {track_ids.tolist()}")
+
+    return {
+        "boxes": boxes,
+        "keypoints": keypoints,
+        "track_ids": track_ids,
     }

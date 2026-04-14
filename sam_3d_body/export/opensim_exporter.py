@@ -662,6 +662,541 @@ def _quat_y_to_dir(d: np.ndarray) -> np.ndarray:
 
 _HAND_KPT_INDICES = set(range(21, 63))   # finger joints + wrists (21-40 R, 41 R-wrist, 42-61 L, 62 L-wrist)
 
+def _mat_to_quat_xyzw_np(R: np.ndarray) -> np.ndarray:
+    """Vectorized 3x3 → xyzw quaternion (J, 3, 3) → (J, 4)."""
+    out = np.zeros(R.shape[:-2] + (4,), dtype=np.float32)
+    tr = R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+    # Case 1: tr > 0
+    mask = tr > 0
+    s = np.zeros_like(tr)
+    s[mask] = 0.5 / np.sqrt(tr[mask] + 1.0)
+    out[mask, 3] = 0.25 / s[mask]
+    out[mask, 0] = (R[mask, 2, 1] - R[mask, 1, 2]) * s[mask]
+    out[mask, 1] = (R[mask, 0, 2] - R[mask, 2, 0]) * s[mask]
+    out[mask, 2] = (R[mask, 1, 0] - R[mask, 0, 1]) * s[mask]
+    # Case 2: R00 largest
+    rest = ~mask
+    m_xx = rest & (R[..., 0, 0] >= R[..., 1, 1]) & (R[..., 0, 0] >= R[..., 2, 2])
+    if m_xx.any():
+        s2 = 2.0 * np.sqrt(np.clip(1.0 + R[m_xx, 0, 0] - R[m_xx, 1, 1] - R[m_xx, 2, 2], 1e-12, None))
+        out[m_xx, 0] = 0.25 * s2
+        out[m_xx, 1] = (R[m_xx, 0, 1] + R[m_xx, 1, 0]) / s2
+        out[m_xx, 2] = (R[m_xx, 0, 2] + R[m_xx, 2, 0]) / s2
+        out[m_xx, 3] = (R[m_xx, 2, 1] - R[m_xx, 1, 2]) / s2
+    rest = rest & ~m_xx
+    m_yy = rest & (R[..., 1, 1] >= R[..., 2, 2])
+    if m_yy.any():
+        s2 = 2.0 * np.sqrt(np.clip(1.0 + R[m_yy, 1, 1] - R[m_yy, 0, 0] - R[m_yy, 2, 2], 1e-12, None))
+        out[m_yy, 0] = (R[m_yy, 0, 1] + R[m_yy, 1, 0]) / s2
+        out[m_yy, 1] = 0.25 * s2
+        out[m_yy, 2] = (R[m_yy, 1, 2] + R[m_yy, 2, 1]) / s2
+        out[m_yy, 3] = (R[m_yy, 0, 2] - R[m_yy, 2, 0]) / s2
+    m_zz = rest & ~m_yy
+    if m_zz.any():
+        s2 = 2.0 * np.sqrt(np.clip(1.0 + R[m_zz, 2, 2] - R[m_zz, 0, 0] - R[m_zz, 1, 1], 1e-12, None))
+        out[m_zz, 0] = (R[m_zz, 0, 2] + R[m_zz, 2, 0]) / s2
+        out[m_zz, 1] = (R[m_zz, 1, 2] + R[m_zz, 2, 1]) / s2
+        out[m_zz, 2] = 0.25 * s2
+        out[m_zz, 3] = (R[m_zz, 1, 0] - R[m_zz, 0, 1]) / s2
+    return out
+
+
+def write_skinned_mesh_glb(
+    filepath: str | Path,
+    mhr_pt_path: str | Path,
+    timestamps: List[float],
+    frames_joint_coords: List[np.ndarray | None],
+    frames_global_rots: List[np.ndarray | None],
+    frames_cam_t: List[np.ndarray | None] | None = None,
+) -> bool:
+    """Write a skinned glTF mesh: real LBS with the 127-joint MHR armature.
+
+    The mesh deforms via the skeleton, just like in Blender / Unity. This
+    means the mesh and skeleton are intrinsically aligned (no Procrustes
+    needed), the file is much smaller (animation = quaternions per joint
+    instead of vertex deltas), and the asset is reusable for retargeting.
+
+    Args:
+        filepath: output .glb
+        mhr_pt_path: path to assets/mhr_model.pt (TorchScript MHR character)
+        timestamps: per-frame seconds
+        frames_joint_coords: per-frame (127, 3) world joint positions (m), no cam_t
+        frames_global_rots: per-frame (127, 3, 3) world joint rotation matrices
+        frames_cam_t: per-frame (3,) camera translation (m), added to joint positions
+    """
+    from .mhr_skin_extractor import load_mhr_skin_data
+
+    skin = load_mhr_skin_data(str(mhr_pt_path))
+    if skin is None:
+        print(f"  [skinned] could not load MHR skin data from {mhr_pt_path}")
+        return False
+
+    J = skin.n_joints
+    V = skin.n_verts
+    F = len(timestamps)
+
+    # ── Build per-frame world transforms (with cam_t + Y-up + mirror) ────────
+    last_jc = None
+    last_R = None
+    last_ct = np.zeros(3, dtype=np.float32)
+    world_T = np.zeros((F, J, 4, 4), dtype=np.float32)  # joint world transforms
+    flip = np.diag([-1.0, -1.0, 1.0]).astype(np.float32)  # mirror+Y-up = X→-X, Y→-Y
+    for i in range(F):
+        jc = frames_joint_coords[i] if i < len(frames_joint_coords) else None
+        gr = frames_global_rots[i]  if i < len(frames_global_rots)  else None
+        ct = frames_cam_t[i] if (frames_cam_t is not None and i < len(frames_cam_t)) else None
+        if jc is not None and gr is not None and not np.any(np.isnan(jc)) and not np.any(np.isnan(gr)):
+            last_jc = np.asarray(jc, dtype=np.float32)
+            last_R  = np.asarray(gr, dtype=np.float32)
+            if ct is not None and not np.any(np.isnan(ct)):
+                last_ct = np.asarray(ct, dtype=np.float32)
+        if last_jc is None:
+            world_T[i] = np.eye(4, dtype=np.float32)[None].repeat(J, axis=0)
+            continue
+        t = (last_jc + last_ct[None, :]) @ flip.T            # (J, 3) flipped
+        R = flip @ last_R @ flip.T                            # (J, 3, 3) conjugate
+        world_T[i, :, :3, :3] = R
+        world_T[i, :, :3,  3] = t
+        world_T[i, :,  3,  3] = 1.0
+
+    # ── Compute per-frame LOCAL transforms (relative to parent) ──────────────
+    # Used to drive joint-node animation (translation + rotation per frame).
+    local_T = np.zeros_like(world_T)
+    parents = skin.parents
+    for i in range(F):
+        for j in range(J):
+            p = int(parents[j])
+            if p < 0:
+                local_T[i, j] = world_T[i, j]
+            else:
+                # local = inv(parent_world) @ child_world. Parent is rigid (R + t).
+                R_p = world_T[i, p, :3, :3]
+                t_p = world_T[i, p, :3,  3]
+                R_c = world_T[i, j, :3, :3]
+                t_c = world_T[i, j, :3,  3]
+                R_inv = R_p.T
+                local_T[i, j, :3, :3] = R_inv @ R_c
+                local_T[i, j, :3,  3] = R_inv @ (t_c - t_p)
+                local_T[i, j,  3,  3] = 1.0
+
+    anim_trans = local_T[..., :3, 3].astype(np.float32)        # (F, J, 3)
+    anim_rot   = _mat_to_quat_xyzw_np(local_T[..., :3, :3])    # (F, J, 4)
+
+    # ── Inverse bind matrices in flipped GLB world frame ─────────────────────
+    # The MHR ibm is in MHR native frame. In our GLB the joints live in the
+    # flipped frame (Y/X negated). For LBS to produce correctly-flipped vertices
+    # we conjugate ibm by the flip too: ibm_glb = M_flip4 @ ibm @ M_flip4
+    # where M_flip4 = diag(-1, -1, 1, 1). The mesh rest_vertices also need the
+    # flip applied so they live in the same reference.
+    flip4 = np.eye(4, dtype=np.float32)
+    flip4[0, 0] = -1.0
+    flip4[1, 1] = -1.0
+    ibm_glb = flip4 @ skin.inverse_bind_matrices @ flip4
+    rest_v = skin.rest_vertices.copy()
+    rest_v[:, 0] = -rest_v[:, 0]
+    rest_v[:, 1] = -rest_v[:, 1]
+
+    # ── Pack binary blob ─────────────────────────────────────────────────────
+    chunks: list[bytes] = []
+    byte_offset = 0
+
+    def _add(data: bytes) -> tuple[int, int]:
+        nonlocal byte_offset
+        pad = (4 - len(data) % 4) % 4
+        data += b'\x00' * pad
+        chunks.append(data)
+        start = byte_offset
+        byte_offset += len(data)
+        return start, len(data) - pad
+
+    def _f32(a): return np.asarray(a, dtype=np.float32).tobytes()
+    def _u32(a): return np.asarray(a, dtype=np.uint32).tobytes()
+    def _u16(a): return np.asarray(a, dtype=np.uint16).tobytes()
+
+    # Mesh attributes
+    off_pos, len_pos = _add(_f32(rest_v))
+    off_idx, len_idx = _add(_u32(skin.faces.flatten()))
+    off_jts, len_jts = _add(_u16(skin.skin_joint_indices))
+    off_wts, len_wts = _add(_f32(skin.skin_weights))
+
+    # Inverse bind matrices (column-major as glTF requires)
+    ibm_col_major = np.transpose(ibm_glb, (0, 2, 1)).astype(np.float32)
+    off_ibm, len_ibm = _add(_f32(ibm_col_major))
+
+    # Animation: timestamps + per-joint trans / rot
+    off_t, len_t = _add(_f32(np.asarray(timestamps, dtype=np.float32)))
+    joint_anim_offsets: list[tuple[int, int, int, int]] = []   # (off_T, len_T, off_R, len_R) per joint
+    for j in range(J):
+        ot, lt = _add(_f32(anim_trans[:, j, :]))
+        or_, lr_ = _add(_f32(anim_rot[:, j, :]))
+        joint_anim_offsets.append((ot, lt, or_, lr_))
+
+    bin_data = b''.join(chunks)
+
+    # ── glTF JSON ────────────────────────────────────────────────────────────
+    bufferViews: list[dict] = [
+        {"buffer": 0, "byteOffset": off_pos, "byteLength": len_pos, "target": 34962},
+        {"buffer": 0, "byteOffset": off_idx, "byteLength": len_idx, "target": 34963},
+        {"buffer": 0, "byteOffset": off_jts, "byteLength": len_jts, "target": 34962},
+        {"buffer": 0, "byteOffset": off_wts, "byteLength": len_wts, "target": 34962},
+        {"buffer": 0, "byteOffset": off_ibm, "byteLength": len_ibm},
+        {"buffer": 0, "byteOffset": off_t,   "byteLength": len_t},
+    ]
+    accessors: list[dict] = [
+        {  # 0: POSITION
+            "bufferView": 0, "byteOffset": 0, "componentType": 5126,
+            "count": V, "type": "VEC3",
+            "min": rest_v.min(axis=0).tolist(),
+            "max": rest_v.max(axis=0).tolist(),
+        },
+        {  # 1: indices
+            "bufferView": 1, "byteOffset": 0, "componentType": 5125,
+            "count": skin.faces.size, "type": "SCALAR",
+        },
+        {  # 2: JOINTS_0
+            "bufferView": 2, "byteOffset": 0, "componentType": 5123,
+            "count": V, "type": "VEC4",
+        },
+        {  # 3: WEIGHTS_0
+            "bufferView": 3, "byteOffset": 0, "componentType": 5126,
+            "count": V, "type": "VEC4",
+        },
+        {  # 4: inverseBindMatrices
+            "bufferView": 4, "byteOffset": 0, "componentType": 5126,
+            "count": J, "type": "MAT4",
+        },
+        {  # 5: timestamps
+            "bufferView": 5, "byteOffset": 0, "componentType": 5126,
+            "count": F, "type": "SCALAR",
+            "min": [float(min(timestamps))], "max": [float(max(timestamps))],
+        },
+    ]
+
+    # Per-joint translation/rotation accessors
+    joint_acc_T: list[int] = []
+    joint_acc_R: list[int] = []
+    for j, (ot, lt, or_, lr_) in enumerate(joint_anim_offsets):
+        bv_T = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": ot, "byteLength": lt})
+        bv_R = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": or_, "byteLength": lr_})
+        ac_T = len(accessors); accessors.append({
+            "bufferView": bv_T, "byteOffset": 0, "componentType": 5126,
+            "count": F, "type": "VEC3",
+        })
+        ac_R = len(accessors); accessors.append({
+            "bufferView": bv_R, "byteOffset": 0, "componentType": 5126,
+            "count": F, "type": "VEC4",
+        })
+        joint_acc_T.append(ac_T)
+        joint_acc_R.append(ac_R)
+
+    # Materials
+    materials = [{
+        "name": "skin",
+        "pbrMetallicRoughness": {
+            "baseColorFactor": [0.86, 0.74, 0.65, 0.95],
+            "roughnessFactor": 0.65, "metallicFactor": 0.0,
+        },
+        "alphaMode": "BLEND",
+        "doubleSided": True,
+    }]
+
+    # Mesh
+    meshes = [{
+        "name": "body_skinned",
+        "primitives": [{
+            "attributes": {"POSITION": 0, "JOINTS_0": 2, "WEIGHTS_0": 3},
+            "indices": 1, "mode": 4, "material": 0,
+        }],
+    }]
+
+    # Nodes:
+    # - First J nodes are joints (with bind-pose local TRS, but we'll override
+    #   per-frame via animation channels anyway). Children index = joint indices
+    #   whose parent is this joint.
+    children_of: dict[int, list[int]] = {j: [] for j in range(-1, J)}
+    for j in range(J):
+        children_of[int(parents[j])].append(j)
+
+    # Bind-pose local TRS = (joint_translation_offsets, joint_prerotations)
+    # Already in metres after extractor scaling.
+    nodes_list: list[dict] = []
+    for j in range(J):
+        node = {
+            "name": f"j{j}",
+            "translation": skin.bind_translation[j].tolist(),
+            "rotation": skin.bind_rotation_quat[j].tolist(),
+        }
+        ch = children_of[j]
+        if ch:
+            node["children"] = ch
+        nodes_list.append(node)
+
+    # Mesh node + skin
+    mesh_node_idx = len(nodes_list)
+    nodes_list.append({"name": "body", "mesh": 0, "skin": 0})
+
+    # Roots = joints with parent == -1, plus the mesh node
+    roots = [j for j in range(J) if int(parents[j]) < 0]
+    scene_nodes = roots + [mesh_node_idx]
+
+    skins = [{
+        "name": "MHR_skin",
+        "joints": list(range(J)),
+        "skeleton": roots[0] if roots else 0,
+        "inverseBindMatrices": 4,
+    }]
+
+    # Animations: 2 channels per joint (translation + rotation)
+    anim_samplers: list[dict] = []
+    anim_channels: list[dict] = []
+    for j in range(J):
+        s_T = len(anim_samplers)
+        anim_samplers.append({"input": 5, "output": joint_acc_T[j], "interpolation": "LINEAR"})
+        anim_channels.append({"sampler": s_T, "target": {"node": j, "path": "translation"}})
+        s_R = len(anim_samplers)
+        anim_samplers.append({"input": 5, "output": joint_acc_R[j], "interpolation": "LINEAR"})
+        anim_channels.append({"sampler": s_R, "target": {"node": j, "path": "rotation"}})
+
+    gltf = {
+        "asset": {"version": "2.0", "generator": "FastSAM3DBody Skinned Exporter"},
+        "scene": 0,
+        "scenes": [{"nodes": scene_nodes}],
+        "nodes": nodes_list,
+        "meshes": meshes,
+        "materials": materials,
+        "skins": skins,
+        "animations": [{"name": "take", "samplers": anim_samplers, "channels": anim_channels}],
+        "accessors": accessors,
+        "bufferViews": bufferViews,
+        "buffers": [{"byteLength": len(bin_data)}],
+    }
+
+    json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+    pad_j = (4 - len(json_bytes) % 4) % 4
+    json_bytes += b' ' * pad_j
+    pad_b = (4 - len(bin_data) % 4) % 4
+    bin_data += b'\x00' * pad_b
+
+    json_chunk = struct.pack("<II", len(json_bytes), 0x4E4F534A) + json_bytes
+    bin_chunk  = struct.pack("<II", len(bin_data),   0x004E4942) + bin_data
+    header = struct.pack("<III", 0x46546C67, 2, 12 + len(json_chunk) + len(bin_chunk))
+
+    Path(filepath).write_bytes(header + json_chunk + bin_chunk)
+    size_mb = (12 + len(json_chunk) + len(bin_chunk)) / 1e6
+    print(f"  Skinned mesh GLB: {J} joints, {V} verts, {F} frames, {size_mb:.1f} MB")
+    return True
+
+
+def write_anatomical_glb(
+    filepath: str | Path,
+    osim_path: str | Path,
+    mot_path: str | Path,
+    geometry_dir: str | Path | None = None,
+) -> bool:
+    """Write a standalone GLB with the OpenSim anatomical skeleton.
+
+    Loads the .vtp/.stl meshes referenced by the .osim model and animates each
+    body using the per-frame transform read from the IK .mot. Output is in
+    OpenSim native frame (X=anterior, Y=up, Z=lateral, meters).
+
+    Returns True on success, False otherwise (e.g. opensim env unavailable).
+    """
+    from .opensim_anatomical import compute_body_transforms, load_geometry_meshes
+
+    body_data = compute_body_transforms(osim_path, mot_path)
+    if body_data is None:
+        print("  [anatomical GLB] could not compute body transforms, skipping.")
+        return False
+    geom = load_geometry_meshes(
+        body_data["bodies"],
+        geometry_dir=str(geometry_dir) if geometry_dir else None,
+    )
+    if not geom:
+        print("  [anatomical GLB] no mesh files loaded, skipping.")
+        return False
+
+    times = np.asarray(body_data["times"], dtype=np.float32)
+    n_frames = int(body_data["n_frames"])
+
+    def _mat_to_quat_xyzw(R: np.ndarray) -> np.ndarray:
+        tr = R[0, 0] + R[1, 1] + R[2, 2]
+        if tr > 0:
+            s = 0.5 / np.sqrt(tr + 1.0)
+            return np.array([(R[2, 1] - R[1, 2]) * s,
+                             (R[0, 2] - R[2, 0]) * s,
+                             (R[1, 0] - R[0, 1]) * s,
+                             0.25 / s], dtype=np.float32)
+        if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = 2.0 * np.sqrt(max(1.0 + R[0, 0] - R[1, 1] - R[2, 2], 1e-12))
+            return np.array([0.25 * s, (R[0, 1] + R[1, 0]) / s,
+                             (R[0, 2] + R[2, 0]) / s, (R[2, 1] - R[1, 2]) / s], dtype=np.float32)
+        if R[1, 1] > R[2, 2]:
+            s = 2.0 * np.sqrt(max(1.0 + R[1, 1] - R[0, 0] - R[2, 2], 1e-12))
+            return np.array([(R[0, 1] + R[1, 0]) / s, 0.25 * s,
+                             (R[1, 2] + R[2, 1]) / s, (R[0, 2] - R[2, 0]) / s], dtype=np.float32)
+        s = 2.0 * np.sqrt(max(1.0 + R[2, 2] - R[0, 0] - R[1, 1], 1e-12))
+        return np.array([(R[0, 2] + R[2, 0]) / s, (R[1, 2] + R[2, 1]) / s,
+                         0.25 * s, (R[1, 0] - R[0, 1]) / s], dtype=np.float32)
+
+    chunks: list[bytes] = []
+    byte_offset = 0
+
+    def _add(data: bytes):
+        nonlocal byte_offset
+        pad = (4 - len(data) % 4) % 4
+        data += b'\x00' * pad
+        chunks.append(data)
+        start = byte_offset
+        byte_offset += len(data)
+        return start, len(data) - pad
+
+    bufferViews: list[dict] = []
+    accessors: list[dict] = []
+    meshes_list: list[dict] = []
+    nodes_list: list[dict] = []
+    scene_nodes: list[int] = []
+    anim_samplers: list[dict] = []
+    anim_channels: list[dict] = []
+
+    # Shared timestamps
+    off_t, len_t = _add(np.asarray(times, dtype=np.float32).tobytes())
+    bv_t = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": off_t, "byteLength": len_t})
+    acc_t = len(accessors)
+    accessors.append({
+        "bufferView": bv_t, "byteOffset": 0, "componentType": 5126,
+        "count": n_frames, "type": "SCALAR",
+        "min": [float(times.min())], "max": [float(times.max())],
+    })
+
+    materials = [{
+        "name": "bone_anatomical",
+        "pbrMetallicRoughness": {
+            "baseColorFactor": [0.95, 0.91, 0.83, 1.0],
+            "roughnessFactor": 0.65, "metallicFactor": 0.0,
+        },
+        "doubleSided": True,
+    }]
+
+    n_bones_out = 0
+    for body_name, body_data_b in body_data["bodies"].items():
+        meshes_for_body = geom.get(body_name)
+        if not meshes_for_body:
+            continue
+
+        # Combine all meshes for this body into one (concat verts + reindex faces)
+        v_offset = 0
+        vlist, flist = [], []
+        for v_arr, f_arr in meshes_for_body:
+            vlist.append(v_arr.astype(np.float32))
+            flist.append(f_arr.astype(np.uint32) + v_offset)
+            v_offset += v_arr.shape[0]
+        verts = np.concatenate(vlist, axis=0)
+        faces_arr = np.concatenate(flist, axis=0).flatten()
+
+        # Per-frame world transform (already in OpenSim native frame)
+        W = np.asarray(body_data_b["world_transforms"], dtype=np.float32)
+        trans = W[:, :3, 3].astype(np.float32)
+        rot = np.zeros((W.shape[0], 4), dtype=np.float32)
+        for i in range(W.shape[0]):
+            rot[i] = _mat_to_quat_xyzw(W[i, :3, :3])
+
+        # Pack
+        ov, lv = _add(np.asarray(verts, dtype=np.float32).tobytes())
+        of, lf = _add(np.asarray(faces_arr, dtype=np.uint32).tobytes())
+        ot, lt = _add(np.asarray(trans, dtype=np.float32).tobytes())
+        or_, lr_ = _add(np.asarray(rot, dtype=np.float32).tobytes())
+
+        bv_v = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": ov, "byteLength": lv, "target": 34962})
+        bv_f = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": of, "byteLength": lf, "target": 34963})
+        bv_tr = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": ot, "byteLength": lt})
+        bv_ro = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": or_, "byteLength": lr_})
+
+        acc_v = len(accessors); accessors.append({
+            "bufferView": bv_v, "byteOffset": 0, "componentType": 5126,
+            "count": len(verts), "type": "VEC3",
+            "min": verts.min(axis=0).tolist(), "max": verts.max(axis=0).tolist(),
+        })
+        acc_f = len(accessors); accessors.append({
+            "bufferView": bv_f, "byteOffset": 0, "componentType": 5125,
+            "count": len(faces_arr), "type": "SCALAR",
+        })
+        acc_tr = len(accessors); accessors.append({
+            "bufferView": bv_tr, "byteOffset": 0, "componentType": 5126,
+            "count": n_frames, "type": "VEC3",
+        })
+        acc_ro = len(accessors); accessors.append({
+            "bufferView": bv_ro, "byteOffset": 0, "componentType": 5126,
+            "count": n_frames, "type": "VEC4",
+        })
+
+        mesh_idx = len(meshes_list)
+        meshes_list.append({
+            "name": f"bone_{body_name}",
+            "primitives": [{"attributes": {"POSITION": acc_v}, "indices": acc_f, "mode": 4, "material": 0}],
+        })
+        node_idx = len(nodes_list)
+        nodes_list.append({"mesh": mesh_idx, "name": body_name})
+        scene_nodes.append(node_idx)
+
+        s_t = len(anim_samplers)
+        anim_samplers.append({"input": acc_t, "output": acc_tr, "interpolation": "LINEAR"})
+        anim_channels.append({"sampler": s_t, "target": {"node": node_idx, "path": "translation"}})
+        s_r = len(anim_samplers)
+        anim_samplers.append({"input": acc_t, "output": acc_ro, "interpolation": "LINEAR"})
+        anim_channels.append({"sampler": s_r, "target": {"node": node_idx, "path": "rotation"}})
+
+        n_bones_out += 1
+
+    bin_data = b''.join(chunks)
+    gltf = {
+        "asset": {"version": "2.0", "generator": "FastSAM3DBody Anatomical Exporter"},
+        "scene": 0,
+        "scenes": [{"nodes": scene_nodes}],
+        "nodes": nodes_list,
+        "meshes": meshes_list,
+        "materials": materials,
+        "animations": [{"name": "take", "samplers": anim_samplers, "channels": anim_channels}],
+        "accessors": accessors,
+        "bufferViews": bufferViews,
+        "buffers": [{"byteLength": len(bin_data)}],
+    }
+
+    json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+    pad_j = (4 - len(json_bytes) % 4) % 4
+    json_bytes += b' ' * pad_j
+    pad_b = (4 - len(bin_data) % 4) % 4
+    bin_data += b'\x00' * pad_b
+
+    json_chunk = struct.pack("<II", len(json_bytes), 0x4E4F534A) + json_bytes
+    bin_chunk = struct.pack("<II", len(bin_data), 0x004E4942) + bin_data
+    header = struct.pack("<III", 0x46546C67, 2, 12 + len(json_chunk) + len(bin_chunk))
+
+    Path(filepath).write_bytes(header + json_chunk + bin_chunk)
+    print(f"  Anatomical GLB: {n_bones_out} bones over {n_frames} frames")
+    return True
+
+
+def _umeyama(src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
+    """Optimal similarity transform mapping src → dst (Umeyama 1991).
+
+    Returns (R, s, t) such that dst ≈ s * src @ R.T + t.
+    src, dst : (N, 3) point sets in correspondence.
+    """
+    src_mean = src.mean(axis=0)
+    dst_mean = dst.mean(axis=0)
+    src_c = src - src_mean
+    dst_c = dst - dst_mean
+    H = src_c.T @ dst_c / src.shape[0]
+    U, S, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    D = np.diag([1.0, 1.0, d])
+    R = (Vt.T @ D @ U.T).astype(np.float32)
+    var_src = (src_c ** 2).sum() / src.shape[0]
+    s = float((S * np.diag(D)).sum() / max(var_src, 1e-12))
+    t = (dst_mean - s * R @ src_mean).astype(np.float32)
+    return R, s, t
+
+
 def write_mesh_glb(
     filepath: str | Path,
     timestamps: List[float],
@@ -671,6 +1206,11 @@ def write_mesh_glb(
     frames_cam_t: List[np.ndarray | None] | None = None,
     frames_joint_coords: List[np.ndarray | None] | None = None,
     body_only: bool = False,
+    osim_path: str | Path | None = None,
+    mot_path: str | Path | None = None,
+    geometry_dir: str | Path | None = None,
+    kpts_opensim: List[np.ndarray | None] | None = None,
+    jcoords_opensim: List[np.ndarray | None] | None = None,
 ) -> None:
     """Write animated full body mesh as GLB using morph targets.
 
@@ -684,19 +1224,53 @@ def write_mesh_glb(
     frames_cam_t : per-frame [3] camera translation, or None
     frames_joint_coords : per-frame [127, 3] camera-space MHR joint coords (no cam_t), or None
     body_only : if True, skip all hand/wrist joint markers and bone sticks
+    osim_path / mot_path : when both are provided, also embed the OpenSim
+        anatomical bones (.vtp/.stl meshes) animated by the IK motion.
+    geometry_dir : optional path to the OpenSim Geometry/ folder (auto-detected
+        from Pose2Sim install if None).
     """
     filepath = Path(filepath)
+
+    # When kpts_opensim is provided we put EVERYTHING (mesh, overlays, bones)
+    # in the OpenSim/TRC frame so that the embedded anatomical bones from
+    # `osim_path`/`mot_path` line up perfectly with the mesh.
+    use_opensim_frame = (
+        kpts_opensim is not None
+        and frames_kpts is not None
+        and frames_cam_t is not None
+    )
 
     # ── Fill mesh frames (forward-fill missing) ───────────────────────────────
     last_good = None
     filled = []
-    for v in frames_verts:
-        if v is not None and not np.any(np.isnan(v)):
-            verts_yup = v.copy().astype(np.float32)
-            verts_yup[:, 1] = -verts_yup[:, 1]   # Y-up
-            verts_yup[:, 0] = -verts_yup[:, 0]   # fix mirror (camera X = subject's left)
-            last_good = verts_yup
-        filled.append(last_good.copy() if last_good is not None else None)
+    if use_opensim_frame:
+        # Per-frame Procrustes: map (frames_verts, in camera-world) into
+        # OpenSim-world frame using the kpts pairs as ground-truth correspondence.
+        # Skip frames with missing data and forward-fill.
+        for i, v in enumerate(frames_verts):
+            ok = (
+                v is not None and not np.any(np.isnan(v))
+                and i < len(frames_kpts) and frames_kpts[i] is not None
+                and i < len(kpts_opensim) and kpts_opensim[i] is not None
+                and i < len(frames_cam_t) and frames_cam_t[i] is not None
+            )
+            if ok:
+                kc = (frames_kpts[i] + frames_cam_t[i][None, :]).astype(np.float32)  # camera-world kpts
+                ko = np.asarray(kpts_opensim[i], dtype=np.float32)                   # OpenSim kpts
+                # Common index set without NaNs
+                valid = ~(np.any(np.isnan(kc), axis=1) | np.any(np.isnan(ko), axis=1))
+                if valid.sum() >= 4:
+                    R, s, t = _umeyama(kc[valid], ko[valid])
+                    last_good = (v.astype(np.float32) @ R.T) * s + t[None, :]
+            filled.append(last_good.copy() if last_good is not None else None)
+    else:
+        for v in frames_verts:
+            if v is not None and not np.any(np.isnan(v)):
+                verts_yup = v.copy().astype(np.float32)
+                verts_yup[:, 1] = -verts_yup[:, 1]   # Y-up
+                verts_yup[:, 0] = -verts_yup[:, 0]   # fix mirror (camera X = subject's left)
+                last_good = verts_yup
+            filled.append(last_good.copy() if last_good is not None else None)
 
     if not any(f is not None for f in filled):
         return
@@ -712,7 +1286,14 @@ def write_mesh_glb(
     # ── Build per-frame world-space keypoints (aligned with mesh) ─────────────
     has_kpts = (frames_kpts is not None and frames_cam_t is not None)
     kpts_world: List[np.ndarray | None] = [None] * N_frames
-    if has_kpts:
+    if use_opensim_frame:
+        # Already in OpenSim frame (meters) — just copy/forward-fill
+        last_kpts: np.ndarray | None = None
+        for i, k in enumerate(kpts_opensim):
+            if k is not None and not np.any(np.isnan(k)):
+                last_kpts = np.asarray(k, dtype=np.float32)
+            kpts_world[i] = last_kpts.copy() if last_kpts is not None else None
+    elif has_kpts:
         last_kpts: np.ndarray | None = None
         for i, (k, ct) in enumerate(zip(frames_kpts, frames_cam_t)):
             if k is not None and ct is not None and not np.any(np.isnan(k)):
@@ -725,7 +1306,13 @@ def write_mesh_glb(
     # ── Build per-frame world-space joint coords (127-joint MHR armature) ─────
     has_jcoords = (frames_joint_coords is not None and frames_cam_t is not None)
     jcoords_world: List[np.ndarray | None] = [None] * N_frames
-    if has_jcoords:
+    if use_opensim_frame and jcoords_opensim is not None:
+        last_jc: np.ndarray | None = None
+        for i, jc in enumerate(jcoords_opensim):
+            if jc is not None and not np.any(np.isnan(jc)):
+                last_jc = np.asarray(jc, dtype=np.float32)
+            jcoords_world[i] = last_jc.copy() if last_jc is not None else None
+    elif has_jcoords:
         last_jc: np.ndarray | None = None
         for i, (jc, ct) in enumerate(zip(frames_joint_coords, frames_cam_t)):
             if jc is not None and ct is not None and not np.any(np.isnan(jc)):
@@ -735,18 +1322,10 @@ def write_mesh_glb(
                 last_jc = w
             jcoords_world[i] = last_jc.copy() if last_jc is not None else None
 
-    # ── Center at pelvis each frame (remove global translation) ───────────────
-    if has_kpts:
-        last_pelvis = np.zeros(3, dtype=np.float32)
-        for i in range(N_frames):
-            kw = kpts_world[i]
-            if kw is not None:
-                last_pelvis = ((kw[9] + kw[10]) / 2.0).astype(np.float32)
-            filled[i] = filled[i] - last_pelvis[None, :]
-            if kpts_world[i] is not None:
-                kpts_world[i] = kpts_world[i] - last_pelvis[None, :]
-            if has_jcoords and jcoords_world[i] is not None:
-                jcoords_world[i] = jcoords_world[i] - last_pelvis[None, :]
+    # NOTE: we keep world-space global translation so the GLB matches the TRC /
+    # OpenSim outputs (mesh moves through the world, like in the source video).
+    # If you ever want a centered/in-place mesh again, subtract the per-frame
+    # pelvis from filled / kpts_world / jcoords_world here.
 
     # ── Smooth mesh vertices + keypoints (Butterworth 6 Hz, same as PostProcessor) ──
     _fps_est = float(N_frames - 1) / max(float(timestamps[-1] - timestamps[0]), 1e-3)
@@ -812,12 +1391,18 @@ def write_mesh_glb(
     def _pack_f32(a): return np.asarray(a, dtype=np.float32).tobytes()
     def _pack_f16(a): return np.asarray(a, dtype=np.float16).tobytes()
     def _pack_u32(a): return np.asarray(a, dtype=np.uint32).tobytes()
-    def _pack_i16_delta(delta):
-        """Quantize (N,3) float32 delta to INT16 normalized, return (bytes, min, max)."""
-        dmin = delta.min(axis=0); dmax = delta.max(axis=0)
-        scale = np.maximum(np.maximum(np.abs(dmin), np.abs(dmax)), 1e-9)
-        raw = np.clip(np.round(delta / scale * 32767), -32767, 32767).astype(np.int16)
-        return raw.tobytes(), dmin.tolist(), dmax.tolist()
+    def _pack_f32_delta(delta):
+        """Pack (N,3) float32 delta as FLOAT32, return (bytes, min, max).
+
+        We do NOT use INT16 normalized morph targets: glTF normalizes by /32767
+        but provides no per-target rescale, so Blender reads the value already
+        divided by the per-axis scale used at packing time. With morph targets
+        especially, the scale is per-frame and per-axis — viewers cannot
+        reconstruct the original delta and the mesh deforms chaotically.
+        """
+        dmin = delta.min(axis=0).tolist()
+        dmax = delta.max(axis=0).tolist()
+        return delta.astype(np.float32).tobytes(), dmin, dmax
 
     byte_offset = 0
     chunks: list[bytes] = []
@@ -841,7 +1426,7 @@ def write_mesh_glb(
     morph_deltas, morph_offsets, morph_lens = [], [], []
     for f in filled[1:]:
         delta = (f - base_pos).astype(np.float32)
-        packed, dmin, dmax = _pack_i16_delta(delta)
+        packed, dmin, dmax = _pack_f32_delta(delta)
         o, l_ = _add(packed)
         morph_offsets.append(o); morph_lens.append(l_); morph_deltas.append((dmin, dmax))
 
@@ -916,6 +1501,121 @@ def write_mesh_glb(
         or_, lr = _add(_pack_f32(ro)); bone_rot_accs.append((or_, lr))
         os, ls = _add(_pack_f32(sc)); bone_scale_accs.append((os, ls))
 
+    # ── Anatomical bones from OpenSim .osim + .mot (optional) ────────────────
+    # Loaded here so we can pack the geometry/animation chunks before assembling
+    # the binary blob below. M maps OpenSim native frame → GLB world frame:
+    #   X_glb = -Z_osim, Y_glb = Y_osim, Z_glb = X_osim
+    anat_bones: list[dict] = []   # [{"name", "verts_acc", "faces_acc", "trans_acc", "rot_acc"}, ...]
+    if osim_path is not None and mot_path is not None:
+        from .opensim_anatomical import compute_body_transforms, load_geometry_meshes
+
+        body_data = compute_body_transforms(osim_path, mot_path)
+        if body_data is not None:
+            geom = load_geometry_meshes(body_data["bodies"], geometry_dir=str(geometry_dir) if geometry_dir else None)
+
+            if use_opensim_frame:
+                # Bones come from .mot/.osim → already in OpenSim frame, which is
+                # also where we put the mesh via Procrustes. No remap, no offset.
+                M = np.eye(3, dtype=np.float32)
+                pelvis_offset = None
+                print("  [anatomical] mesh + bones both in OpenSim frame, no remap needed")
+            else:
+                # Legacy GLB world frame (Y-up + mirror): need M and per-frame
+                # pelvis-alignment offset to bridge OpenSim native → that frame.
+                M = np.array([[0.0, 0.0, -1.0],
+                              [0.0, 1.0,  0.0],
+                              [1.0, 0.0,  0.0]], dtype=np.float32)
+
+                mesh_pelvis_traj = None
+                if has_kpts:
+                    mesh_pelvis_traj = np.zeros((N_frames, 3), dtype=np.float32)
+                    last_p = np.zeros(3, dtype=np.float32)
+                    for i in range(N_frames):
+                        kw = kpts_world[i]
+                        if kw is not None:
+                            last_p = ((kw[9] + kw[10]) / 2.0).astype(np.float32)
+                        mesh_pelvis_traj[i] = last_p
+
+                osim_pelvis_traj_glb = None
+                if "pelvis" in body_data["bodies"]:
+                    _pelvis_W = np.asarray(body_data["bodies"]["pelvis"]["world_transforms"], dtype=np.float32)
+                    osim_pelvis_traj_glb = (_pelvis_W[:, :3, 3] @ M.T).astype(np.float32)
+
+                pelvis_offset = None
+                if mesh_pelvis_traj is not None and osim_pelvis_traj_glb is not None:
+                    n_common = min(mesh_pelvis_traj.shape[0], osim_pelvis_traj_glb.shape[0])
+                    pelvis_offset = mesh_pelvis_traj[:n_common] - osim_pelvis_traj_glb[:n_common]
+                    print(f"  [anatomical] aligning skeleton on mesh pelvis (frame0 offset = {pelvis_offset[0].tolist()})")
+
+            def _mat_to_quat_xyzw(R: np.ndarray) -> np.ndarray:
+                tr = R[0, 0] + R[1, 1] + R[2, 2]
+                if tr > 0:
+                    s = 0.5 / np.sqrt(tr + 1.0)
+                    return np.array([(R[2, 1] - R[1, 2]) * s,
+                                     (R[0, 2] - R[2, 0]) * s,
+                                     (R[1, 0] - R[0, 1]) * s,
+                                     0.25 / s], dtype=np.float32)
+                if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+                    s = 2.0 * np.sqrt(max(1.0 + R[0, 0] - R[1, 1] - R[2, 2], 1e-12))
+                    return np.array([0.25 * s,
+                                     (R[0, 1] + R[1, 0]) / s,
+                                     (R[0, 2] + R[2, 0]) / s,
+                                     (R[2, 1] - R[1, 2]) / s], dtype=np.float32)
+                if R[1, 1] > R[2, 2]:
+                    s = 2.0 * np.sqrt(max(1.0 + R[1, 1] - R[0, 0] - R[2, 2], 1e-12))
+                    return np.array([(R[0, 1] + R[1, 0]) / s,
+                                     0.25 * s,
+                                     (R[1, 2] + R[2, 1]) / s,
+                                     (R[0, 2] - R[2, 0]) / s], dtype=np.float32)
+                s = 2.0 * np.sqrt(max(1.0 + R[2, 2] - R[0, 0] - R[1, 1], 1e-12))
+                return np.array([(R[0, 2] + R[2, 0]) / s,
+                                 (R[1, 2] + R[2, 1]) / s,
+                                 0.25 * s,
+                                 (R[1, 0] - R[0, 1]) / s], dtype=np.float32)
+
+            for body_name, body_data_b in body_data["bodies"].items():
+                meshes_for_body = geom.get(body_name)
+                if not meshes_for_body:
+                    continue
+                # Combine all meshes for this body into one (concat verts + reindex faces)
+                v_offset = 0
+                vlist, flist = [], []
+                for v_arr, f_arr in meshes_for_body:
+                    # Pre-rotate body-local mesh by M (so subsequent T_glb rotates the GLB frame correctly)
+                    v_glb = (v_arr.astype(np.float32) @ M.T).astype(np.float32)
+                    vlist.append(v_glb)
+                    flist.append(f_arr.astype(np.uint32) + v_offset)
+                    v_offset += v_glb.shape[0]
+                verts = np.concatenate(vlist, axis=0)
+                faces_arr = np.concatenate(flist, axis=0).flatten()
+
+                # Per-frame world transform in GLB frame: T_glb = M @ T_osim @ M^-1
+                W = np.asarray(body_data_b["world_transforms"], dtype=np.float32)  # (N, 4, 4)
+                trans = np.zeros((W.shape[0], 3), dtype=np.float32)
+                rot = np.zeros((W.shape[0], 4), dtype=np.float32)
+                for i, T in enumerate(W):
+                    R_osim = T[:3, :3]
+                    t_osim = T[:3, 3]
+                    R_glb = M @ R_osim @ M.T
+                    t_glb = M @ t_osim
+                    if pelvis_offset is not None and i < pelvis_offset.shape[0]:
+                        t_glb = t_glb + pelvis_offset[i]
+                    trans[i] = t_glb
+                    rot[i] = _mat_to_quat_xyzw(R_glb)
+
+                ov, lv = _add(_pack_f32(verts))
+                of, lf = _add(_pack_u32(faces_arr))
+                ot, lt = _add(_pack_f32(trans))
+                or_, lr_ = _add(_pack_f32(rot))
+                anat_bones.append({
+                    "name": body_name,
+                    "verts": (ov, lv, len(verts), _bounds(verts)),
+                    "faces": (of, lf, len(faces_arr)),
+                    "trans": (ot, lt),
+                    "rot":   (or_, lr_),
+                })
+            print(f"  [anatomical] {len(anat_bones)} bones loaded from {Path(osim_path).name}")
+
     bin_data = b''.join(chunks)
 
     # ── Build glTF JSON ───────────────────────────────────────────────────────
@@ -941,8 +1641,8 @@ def write_mesh_glb(
         bufferViews.append({"buffer": 0, "byteOffset": o, "byteLength": l_, "target": 34962})
         acc_idx = len(accessors)
         accessors.append({
-            "bufferView": bv_idx, "byteOffset": 0, "componentType": 5122,
-            "normalized": True, "count": len(base_pos), "type": "VEC3",
+            "bufferView": bv_idx, "byteOffset": 0, "componentType": 5126,  # FLOAT
+            "count": len(base_pos), "type": "VEC3",
             "min": dmin, "max": dmax,
         })
         morph_targets.append({"POSITION": acc_idx})
@@ -1027,6 +1727,11 @@ def write_mesh_glb(
             "name": "bone_ivory",
             "pbrMetallicRoughness": {"baseColorFactor": [0.90, 0.86, 0.74, 1.0], "roughnessFactor": 0.55, "metallicFactor": 0.05},
         },
+        {   # 5: anatomical bone — opaque cream/bone color
+            "name": "bone_anatomical",
+            "pbrMetallicRoughness": {"baseColorFactor": [0.95, 0.91, 0.83, 1.0], "roughnessFactor": 0.65, "metallicFactor": 0.0},
+            "doubleSided": True,
+        },
     ]
     _side_mat = {'R': 1, 'L': 2, 'C': 3}
 
@@ -1104,6 +1809,55 @@ def write_mesh_glb(
         s_s = len(anim_samplers)
         anim_samplers.append({"input": acc_t, "output": bone_acc_s[i], "interpolation": "LINEAR"})
         anim_channels.append({"sampler": s_s, "target": {"node": node_idx, "path": "scale"}})
+
+    # ── Anatomical bones (OpenSim VTP/STL meshes) ────────────────────────────
+    for ab in anat_bones:
+        ov, lv, n_verts, (vmin, vmax) = ab["verts"]
+        of, lf, n_faces_idx = ab["faces"]
+        ot, lt = ab["trans"]
+        or_, lr_ = ab["rot"]
+
+        # bufferViews
+        bv_v = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": ov, "byteLength": lv, "target": 34962})
+        bv_f = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": of, "byteLength": lf, "target": 34963})
+        bv_t = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": ot, "byteLength": lt})
+        bv_r = len(bufferViews); bufferViews.append({"buffer": 0, "byteOffset": or_, "byteLength": lr_})
+
+        # accessors
+        acc_v = len(accessors); accessors.append({
+            "bufferView": bv_v, "byteOffset": 0, "componentType": 5126,
+            "count": n_verts, "type": "VEC3", "min": vmin, "max": vmax,
+        })
+        acc_f = len(accessors); accessors.append({
+            "bufferView": bv_f, "byteOffset": 0, "componentType": 5125,
+            "count": n_faces_idx, "type": "SCALAR",
+        })
+        acc_at = len(accessors); accessors.append({
+            "bufferView": bv_t, "byteOffset": 0, "componentType": 5126,
+            "count": N_frames, "type": "VEC3",
+        })
+        acc_ar = len(accessors); accessors.append({
+            "bufferView": bv_r, "byteOffset": 0, "componentType": 5126,
+            "count": N_frames, "type": "VEC4",
+        })
+
+        # mesh + node
+        mesh_idx = len(meshes_list)
+        meshes_list.append({
+            "name": f"bone_{ab['name']}",
+            "primitives": [{"attributes": {"POSITION": acc_v}, "indices": acc_f, "mode": 4, "material": 5}],
+        })
+        node_idx = len(nodes_list)
+        nodes_list.append({"mesh": mesh_idx, "name": ab["name"]})
+        scene_nodes.append(node_idx)
+
+        # animation channels (translation + rotation)
+        s_t = len(anim_samplers)
+        anim_samplers.append({"input": acc_t, "output": acc_at, "interpolation": "LINEAR"})
+        anim_channels.append({"sampler": s_t, "target": {"node": node_idx, "path": "translation"}})
+        s_r = len(anim_samplers)
+        anim_samplers.append({"input": acc_t, "output": acc_ar, "interpolation": "LINEAR"})
+        anim_channels.append({"sampler": s_r, "target": {"node": node_idx, "path": "rotation"}})
 
     # ── Assemble glTF ─────────────────────────────────────────────────────────
     gltf: dict = {
