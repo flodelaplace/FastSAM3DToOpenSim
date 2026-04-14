@@ -345,7 +345,6 @@ def main(args):
     all_cam_t       = []   # [N_frames] of [3], or None
     all_verts       = []   # [N_frames] of [18439, 3] or None  (for mesh GLB)
     all_joint_coords = []  # [N_frames] of [127, 3] camera-space joint coords, or None
-    all_global_rots  = []  # [N_frames] of [127, 3, 3] world joint rotation matrices, or None
     all_raw_outputs = []   # for video_outputs.json
     inference_times = []
     # Multi-person track storage — keyed by track ID
@@ -391,7 +390,6 @@ def main(args):
             all_cam_t.append(None)
             all_verts.append(None)
             all_joint_coords.append(None)
-            all_global_rots.append(None)
             all_raw_outputs.append({"frame": f"frame_{frame_idx:06d}.jpg", "outputs": []})
             if getattr(args, 'multi_person', False):
                 for tr in tracks.values():
@@ -522,7 +520,6 @@ def main(args):
                 all_cam_t.append(None)
                 all_verts.append(None)
                 all_joint_coords.append(None)
-                all_global_rots.append(None)
                 all_raw_outputs.append({"frame": f"frame_{frame_idx:06d}.jpg", "outputs": []})
                 frame_idx += 1
                 processed += 1
@@ -625,16 +622,10 @@ def main(args):
                 all_joint_coords.append(jc.copy())
             else:
                 all_joint_coords.append(None)
-            gr = person.get("pred_global_rots")        # [127, 3, 3] world rotations
-            if gr is not None and not np.any(np.isnan(gr)):
-                all_global_rots.append(np.asarray(gr, dtype=np.float32).copy())
-            else:
-                all_global_rots.append(None)
         else:
             all_kpts_raw.append(None)
             all_cam_t.append(None)
             all_joint_coords.append(None)
-            all_global_rots.append(None)
 
         timestamps.append(frame_idx / fps)
 
