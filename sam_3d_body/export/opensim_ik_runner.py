@@ -77,13 +77,13 @@ MARKER_WEIGHTS: dict[str, float] = {
 _SCALE_MEASUREMENTS = [
     # Pelvis + sacrum: width from inter-hip distance
     ("pelvis",       [("LHip",      "RHip")],        ["pelvis", "sacrum"],                                                         "X Y Z"),
-    # Trunk height: sacrum-to-neck (Y only — width handled separately)
-    ("torso_height", [("c_spine0",  "Neck")],         ["torso", "Abdomen", "lumbar1", "lumbar2", "lumbar3", "lumbar4", "lumbar5"],  "Y"),
-    # Head: use same trunk-height scale factor (best proxy for overall body scale).
-    # Direct Neck-c_head pair is unreliable (landmark mismatch gives 0.5×).
-    ("head",         [("c_spine0",  "Neck")],         ["head"],                                                                     "X Y Z"),
-    # Trunk width: shoulder-to-shoulder (X,Z — height handled separately)
-    ("torso_width",  [("LShoulder", "RShoulder")],    ["torso", "Abdomen", "lumbar1", "lumbar2", "lumbar3", "lumbar4", "lumbar5"],  "X Z"),
+    # Trunk + head: shoulder-to-shoulder width applied uniformly (X Y Z).
+    # Previously a separate "torso_height" measurement used c_spine0→Neck for Y, but
+    # that pair has a large X-axis offset during walking (body leans forward from camera
+    # pitch), inflating the 3D Euclidean distance by ~15–20% and giving an erroneously
+    # high Y scale (~1.30× vs expected ~1.02×). The lateral shoulder width measurement
+    # is unaffected by forward lean and gives a proportionally correct uniform scale.
+    ("torso_width",  [("LShoulder", "RShoulder")],    ["torso", "Abdomen", "lumbar1", "lumbar2", "lumbar3", "lumbar4", "lumbar5", "head"],  "X Y Z"),
     # Right lower limb
     ("femur_r",      [("RHip",      "RKnee")],        ["femur_r", "patella_r"],                                                     "X Y Z"),
     ("tibia_r",      [("RKnee",     "RAnkle")],       ["tibia_r"],                                                                  "X Y Z"),
@@ -102,8 +102,7 @@ _SCALE_MEASUREMENTS = [
     # Left upper limb
     ("humerus_l",    [("LShoulder", "LElbow")],       ["humerus_l"],                                                                "X Y Z"),
     ("forearm_l",    [("LElbow",    "LWrist")],       ["ulna_l", "radius_l"],                                                       "X Y Z"),
-    # Note: head excluded from direct measurement — Neck-c_head landmark mismatch gives 0.5×.
-    # head is instead included in torso_height (above) to scale uniformly with the body.
+    # Note: head is included in torso_width (above) to scale uniformly with the torso.
 ]
 
 
