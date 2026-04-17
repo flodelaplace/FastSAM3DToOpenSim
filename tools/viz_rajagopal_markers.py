@@ -210,8 +210,8 @@ SOURCES = {
     # RPSI/LPSI frozen — raised +6.6cm sup vs user's original picks (v7326,
     # v6209). Iteration history: orig → +5cm (v7442/v6327, still too low) →
     # +6.6cm (v7441/v6328, current).
-    "RPSI": ("v", 7441),
-    "LPSI": ("v", 6328),
+    "RPSI": ("v", 7319),
+    "LPSI": ("v", 6216),
     # Forearm distal = wrist styloids. Shift ROI center +10mm sup → picks
     # constrained between -0.5cm and +2.5cm relative to the wrist kpt, i.e.
     # the bone styloids just proximal of the wrist joint.
