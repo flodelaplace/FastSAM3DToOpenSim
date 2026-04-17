@@ -105,11 +105,24 @@ def load_geometry_meshes(
     out: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
     missing: list[str] = []
 
+    # Individual vertebrae meshes (cerv*, thoracic*_s) have vertex positions
+    # designed for per-vertebra body frames, not the consolidated torso body.
+    # When a composite mesh (hat_ribs_scap / hat_spine) is present on the same
+    # body, it provides the correct combined visualization — skip all individual
+    # vertebrae.  This matches OpenSim GUI / Pose2Sim_Blender behaviour where
+    # the composite mesh covers the mispositioned vertebrae.
+    _VERTEBRA_PREFIXES = ("cerv", "thoracic")
+
     for body_name, body_data in bodies.items():
+        mesh_list = body_data.get("meshes", [])
+        mesh_files = {Path(m["file"]).stem for m in mesh_list}
+        has_composite = "hat_ribs_scap" in mesh_files or "hat_spine" in mesh_files
         meshes_for_body = []
-        for m in body_data.get("meshes", []):
+        for m in mesh_list:
             f = m["file"]
             stem = Path(f).stem
+            if has_composite and stem.startswith(_VERTEBRA_PREFIXES):
+                continue
             # Prefer .stl (loadable by trimesh alone, no vtk needed),
             # then .ply, then fall back to .vtp (requires vtk).
             candidates = [

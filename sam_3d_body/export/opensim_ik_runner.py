@@ -18,6 +18,95 @@ import sys
 import tempfile
 from pathlib import Path
 
+# ── Rajagopal mocap markerset (--markerset flodelaplace) ────────────────────────
+# Weighting philosophy:
+#   2.0  bony landmarks (vertex picks + acromion + foot) — most reproducible
+#   1.0  joint centers from MHR kpts — minor drift from NN inference
+#   1.5  foot markers — important for ground contact
+#   0.5  head / hand kpts and armature spine joints — noisier, low priority
+MARKER_WEIGHTS_FLODELAPLACE: dict[str, float] = {
+    # Head (direct kpts, noisy face features)
+    "Nose":  0.4, "LEye": 0.3, "REye": 0.3, "LEar": 0.8, "REar": 0.8,
+    "HTOP":  0.5,
+    # Spine armature (jcoord-direct, soft constraint)
+    "c_spine0": 0.5, "c_spine1": 0.5, "c_spine2": 0.5, "c_spine3": 0.5,
+    "c_neck":   0.7, "c_head":   0.6,
+    "RCLAV":    0.5, "LCLAV":    0.5,
+    # Torso bony + JC
+    "C7":   2.0,
+    "RACR": 2.0, "LACR": 2.0,
+    # RSJC/LSJC removed — MHR kpt 5/6 ("shoulder") don't reliably land on the
+    # glenohumeral joint center; acromion (bony, vertex-picked on mesh) is a
+    # more trustworthy handle for shoulder-segment IK.
+    # Upper limb
+    "REJC": 1.5, "LEJC": 1.5,
+    "RLEL": 2.0, "RMEL": 2.0, "LLEL": 2.0, "LMEL": 2.0,
+    "RFAradius": 2.0, "RFAulna": 2.0, "LFAradius": 2.0, "LFAulna": 2.0,
+    # Wrist + hand
+    "RWrist_hand": 0.5, "LWrist_hand": 0.5,
+    "RThumb":      0.5, "RIndex":      0.5, "RPinky":      0.5,
+    "LThumb":      0.5, "LIndex":      0.5, "LPinky":      0.5,
+    "RIndexTip":   0.5, "RPinkyTip":   0.5,
+    "LIndexTip":   0.5, "LPinkyTip":   0.5,
+    # Pelvis bony + JC
+    "RASI": 2.0, "LASI": 2.0, "RPSI": 2.0, "LPSI": 2.0,
+    "RHJC": 1.5, "LHJC": 1.5,
+    # Lower limb
+    "RKJC": 1.5, "LKJC": 1.5,
+    "RAJC": 1.5, "LAJC": 1.5,
+    "RLFC": 2.0, "RMFC": 2.0, "LLFC": 2.0, "LMFC": 2.0,
+    "RLMAL": 2.0, "RMMAL": 2.0, "LLMAL": 2.0, "LMMAL": 2.0,
+    # Foot (bony, high priority for ground contact)
+    "RCAL": 1.5, "LCAL": 1.5,
+    "RTOE": 1.5, "LTOE": 1.5,
+    "RMT5": 1.0, "LMT5": 1.0,
+}
+
+# Scale Tool measurements using Rajagopal marker names — non-uniform per-axis.
+# OpenSim gait-body-frame convention: X=anterior, Y=superior, Z=lateral-right.
+# Bony landmarks (ASIS/PSIS, LFC/MFC, LMAL/MMAL, LEL/MEL, FAradius/FAulna) are
+# preferred for width scaling because they're deterministic vertex picks on
+# the mesh, whereas joint centers come from the MHR NN (more noise).
+_SCALE_MEASUREMENTS_FLODELAPLACE = [
+    # Pelvis: Z (width) from bony ASIS pair, X (AP depth) from ASIS-PSIS pairs.
+    ("pelvis_Z",    [("LASI", "RASI")],                                       ["pelvis", "sacrum"],                                                     "Z"),
+    ("pelvis_X",    [("RASI", "RPSI"), ("LASI", "LPSI")],                     ["pelvis", "sacrum"],                                                     "X"),
+    # Torso: Z (width) from acromions, Y (height) from ACR-ASI, X (AP depth)
+    # from CLAV (anterior) to C7 (posterior) — both on torso at ~ similar Y.
+    # Head is included in Y and X scaling so it grows proportionally (previously
+    # head only got the Z scale → looked crushed when Y/Z differed).
+    ("torso_Z",     [("LACR", "RACR")],                                       ["torso", "head"],                                                        "Z"),
+    ("torso_Y",     [("RACR", "RASI"), ("LACR", "LASI")],                     ["torso", "lumbar1", "lumbar2", "lumbar3", "lumbar4", "lumbar5", "head"], "Y"),
+    ("torso_X",     [("RCLAV", "C7"), ("LCLAV", "C7")],                       ["torso", "head"],                                                        "X"),
+    # Right lower limb
+    ("femur_r_Y",   [("RHJC", "RKJC")],                                       ["femur_r", "patella_r"],                                                 "Y"),
+    ("femur_r_XZ",  [("RLFC", "RMFC")],                                       ["femur_r", "patella_r"],                                                 "X Z"),
+    ("tibia_r_Y",   [("RKJC", "RAJC")],                                       ["tibia_r"],                                                              "Y"),
+    ("tibia_r_XZ",  [("RLMAL", "RMMAL")],                                     ["tibia_r"],                                                              "X Z"),
+    ("foot_r",      [("RCAL", "RTOE")],                                       ["talus_r", "calcn_r", "toes_r"],                                         "X Y Z"),
+    # Right upper limb
+    ("humerus_r_Y", [("RACR", "REJC")],                                       ["humerus_r"],                                                            "Y"),
+    ("humerus_r_XZ",[("RLEL", "RMEL")],                                       ["humerus_r"],                                                            "X Z"),
+    ("forearm_r_Y", [("REJC", "RWrist_hand")],                                ["ulna_r", "radius_r"],                                                   "Y"),
+    ("forearm_r_XZ",[("RFAradius", "RFAulna")],                               ["ulna_r", "radius_r"],                                                   "X Z"),
+    # Left lower limb
+    ("femur_l_Y",   [("LHJC", "LKJC")],                                       ["femur_l", "patella_l"],                                                 "Y"),
+    ("femur_l_XZ",  [("LLFC", "LMFC")],                                       ["femur_l", "patella_l"],                                                 "X Z"),
+    ("tibia_l_Y",   [("LKJC", "LAJC")],                                       ["tibia_l"],                                                              "Y"),
+    ("tibia_l_XZ",  [("LLMAL", "LMMAL")],                                     ["tibia_l"],                                                              "X Z"),
+    ("foot_l",      [("LCAL", "LTOE")],                                       ["talus_l", "calcn_l", "toes_l"],                                         "X Y Z"),
+    # Left upper limb
+    ("humerus_l_Y", [("LACR", "LEJC")],                                       ["humerus_l"],                                                            "Y"),
+    ("humerus_l_XZ",[("LLEL", "LMEL")],                                       ["humerus_l"],                                                            "X Z"),
+    ("forearm_l_Y", [("LEJC", "LWrist_hand")],                                ["ulna_l", "radius_l"],                                                   "Y"),
+    ("forearm_l_XZ",[("LFAradius", "LFAulna")],                               ["ulna_l", "radius_l"],                                                   "X Z"),
+    # Hands (full length, uniform scale)
+    ("hand_r",      [("RWrist_hand", "RIndexTip")],                           ["hand_r"],                                                               "X Y Z"),
+    ("hand_l",      [("LWrist_hand", "LIndexTip")],                           ["hand_l"],                                                               "X Y Z"),
+]
+
+
+# ── Original (pose2sim) markerset ─────────────────────────────────────────────
 # Marker weights for IK – matching Pose2Sim defaults
 MARKER_WEIGHTS: dict[str, float] = {
     # Head / face
@@ -117,7 +206,13 @@ def _write_scale_setup_xml(
     t_end: float,
     trc_marker_names: list[str],
     xml_path: str,
+    measurements: list | None = None,
+    marker_placer: bool = False,
+    placer_t_start: float | None = None,
+    placer_t_end: float | None = None,
 ) -> None:
+    if measurements is None:
+        measurements = _SCALE_MEASUREMENTS
     # ScaleTool resolves marker_file and output_model_file relative to the XML
     # file's directory. Use relative paths; keep model_file absolute (loaded
     # from the assets directory, not the output directory).
@@ -129,7 +224,7 @@ def _write_scale_setup_xml(
     trc_set = set(trc_marker_names)
 
     meas_xml_parts = []
-    for name, pairs, bodies, axes in _SCALE_MEASUREMENTS:
+    for name, pairs, bodies, axes in measurements:
         # Skip if any marker in this measurement is missing from TRC
         if not all(a in trc_set and b in trc_set for a, b in pairs):
             continue
@@ -187,14 +282,32 @@ def _write_scale_setup_xml(
 \t\t\t<output_scale_file>{scale_set_rel}</output_scale_file>
 \t\t\t<preserve_mass_distribution>true</preserve_mass_distribution>
 \t\t</ModelScaler>
-\t\t<MarkerPlacer>
-\t\t\t<apply>false</apply>
-\t\t\t<output_model_file></output_model_file>
-\t\t</MarkerPlacer>
+{_make_marker_placer_xml(marker_placer, trc_rel, out_model_rel,
+                         placer_t_start if placer_t_start is not None else t_start,
+                         placer_t_end   if placer_t_end   is not None else t_end)}
 \t</ScaleTool>
 </OpenSimDocument>
 """
     Path(xml_path).write_text(xml, encoding="utf-8")
+
+
+def _make_marker_placer_xml(enable: bool, trc_rel: str, out_model_rel: str,
+                            t_start: float, t_end: float) -> str:
+    """MarkerPlacer block: after segment scaling, moves every marker on the
+    scaled model so that its world position at the calibration pose matches
+    the TRC. Removes the constant per-marker offset that would otherwise
+    contaminate IK for all frames."""
+    if not enable:
+        return ('\t\t<MarkerPlacer>\n'
+                '\t\t\t<apply>false</apply>\n'
+                '\t\t\t<output_model_file></output_model_file>\n'
+                '\t\t</MarkerPlacer>')
+    return (f'\t\t<MarkerPlacer>\n'
+            f'\t\t\t<apply>true</apply>\n'
+            f'\t\t\t<marker_file>{trc_rel}</marker_file>\n'
+            f'\t\t\t<time_range>{t_start:.6f} {t_end:.6f}</time_range>\n'
+            f'\t\t\t<output_model_file>{out_model_rel}</output_model_file>\n'
+            f'\t\t</MarkerPlacer>')
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +319,9 @@ setup_xml        = sys.argv[1]
 result_json      = sys.argv[2]
 scaled_model_path = sys.argv[3]
 scale_set_path   = sys.argv[4]
+# argv[5] = "1" if MarkerPlacer was used (then we skip the template-reset
+# post-proc so its adjustments aren't overwritten).
+skip_marker_reset = (len(sys.argv) > 5 and sys.argv[5] == "1")
 
 try:
     import opensim
@@ -247,7 +363,7 @@ try:
                 vals = [float(v) for v in val.text.split()]
                 scale_factors[body_name] = vals
 
-    if scale_factors:
+    if scale_factors and not skip_marker_reset:
         # Bodies without a Scale Tool measurement (e.g. hand_r/l) may still be
         # scaled by OpenSim via parent-body inheritance.  Force those to 1.0×
         # so their template positions (set from actual mesh geometry) are preserved.
@@ -277,6 +393,10 @@ def run_scale_tool(
     scaled_model_path: str,
     subject_mass: float = 70.0,
     subject_height: float = 1.75,
+    markerset: str = "pose2sim",
+    calibration_t_start: float | None = None,
+    calibration_t_end:   float | None = None,
+    marker_placer: bool = False,
 ) -> bool:
     """
     Scale the generic OpenSim model to the subject's proportions using the TRC.
@@ -288,7 +408,11 @@ def run_scale_tool(
     if opensim_python is None:
         return False
 
-    t_start, t_end = _get_trc_time_range(trc_path)
+    full_t_start, full_t_end = _get_trc_time_range(trc_path)
+    # ModelScaler + MarkerPlacer both use the calibration window if provided,
+    # else they fall back to the full TRC range.
+    t_start = calibration_t_start if calibration_t_start is not None else full_t_start
+    t_end   = calibration_t_end   if calibration_t_end   is not None else full_t_end
     trc_marker_names = _read_trc_marker_names(trc_path)
     output_dir = str(Path(scaled_model_path).parent.resolve())
 
@@ -298,6 +422,8 @@ def run_scale_tool(
         result_json    = os.path.join(tmp, "result.json")
         script_path    = os.path.join(tmp, "run_scale.py")
 
+        measurements = (_SCALE_MEASUREMENTS_FLODELAPLACE
+                        if markerset == "flodelaplace" else _SCALE_MEASUREMENTS)
         _write_scale_setup_xml(
             model_path=os.path.abspath(model_path),
             trc_path=os.path.abspath(trc_path),
@@ -309,12 +435,17 @@ def run_scale_tool(
             t_end=t_end,
             trc_marker_names=trc_marker_names,
             xml_path=xml_path,
+            measurements=measurements,
+            marker_placer=marker_placer,
+            placer_t_start=t_start,
+            placer_t_end=t_end,
         )
         Path(script_path).write_text(_SCALE_SCRIPT, encoding="utf-8")
 
         result = subprocess.run(
             [opensim_python, script_path, xml_path, result_json,
-             os.path.abspath(scaled_model_path), os.path.abspath(scale_set_path)],
+             os.path.abspath(scaled_model_path), os.path.abspath(scale_set_path),
+             "1" if marker_placer else "0"],
             capture_output=True,
             text=True,
         )
@@ -385,10 +516,13 @@ def _write_ik_setup_xml(
     time_end: float,
     trc_marker_names: list[str],
     xml_path: str,
+    weights: dict[str, float] | None = None,
 ) -> None:
+    if weights is None:
+        weights = MARKER_WEIGHTS
     trc_set = set(trc_marker_names)
     tasks_xml = []
-    for name, weight in MARKER_WEIGHTS.items():
+    for name, weight in weights.items():
         apply = "true" if name in trc_set else "false"
         tasks_xml.append(
             f'\t\t\t<IKMarkerTask name="{name}">\n'
@@ -445,6 +579,7 @@ def run_ik(
     trc_path: str,
     mot_path: str,
     errors_path: str | None = None,
+    markerset: str = "pose2sim",
 ) -> bool:
     """
     Run OpenSim IK and write the resulting MOT to *mot_path*.
@@ -471,6 +606,8 @@ def run_ik(
         result_json = os.path.join(tmp, "result.json")
         script_path = os.path.join(tmp, "run_ik.py")
 
+        weights = (MARKER_WEIGHTS_FLODELAPLACE
+                   if markerset == "flodelaplace" else MARKER_WEIGHTS)
         _write_ik_setup_xml(
             model_path=os.path.abspath(model_path),
             trc_path=os.path.abspath(trc_path),
@@ -479,6 +616,7 @@ def run_ik(
             time_end=time_end,
             trc_marker_names=trc_marker_names,
             xml_path=xml_path,
+            weights=weights,
         )
         Path(script_path).write_text(_IK_SCRIPT, encoding="utf-8")
 
@@ -513,6 +651,320 @@ def run_ik(
         auto_errors.rename(target_errors)
 
     return True
+
+
+# ---------------------------------------------------------------------------
+# Per-marker IK error analysis — re-runs FK on the scaled model at each IK
+# frame and compares model-frame marker positions to the TRC positions.
+# Gives you a per-marker mean/max error table for spotting bad picks.
+# ---------------------------------------------------------------------------
+_PER_MARKER_ERRORS_SCRIPT = """
+import sys, json, math, os
+
+osim_path   = sys.argv[1]
+mot_path    = sys.argv[2]
+trc_path    = sys.argv[3]
+out_csv     = sys.argv[4]
+result_json = sys.argv[5]
+
+def parse_trc(path):
+    '''Minimal TRC parser: returns (times_list, {marker_name: [(x,y,z),...]})
+    in meters regardless of the file unit (mm or m).'''
+    with open(path) as f:
+        lines = f.read().splitlines()
+    # Line 0: "PathFileType ...", line 1: metadata header, line 2: metadata values,
+    # line 3: "Frame#\\tTime\\tMarker1\\t\\t\\tMarker2...", line 4: coord labels
+    # line 5: blank, line 6+: data rows.
+    meta_vals = lines[2].split('\\t')
+    units = meta_vals[4].strip() if len(meta_vals) > 4 else 'mm'
+    scale = 0.001 if units == 'mm' else 1.0
+    hdr = lines[3].split('\\t')
+    marker_names = [h.strip() for h in hdr[2:] if h.strip()]
+    # Skip to data (first non-blank line after line 4).
+    data_start = 5
+    while data_start < len(lines) and not lines[data_start].strip():
+        data_start += 1
+    times = []
+    m_data = {n: [] for n in marker_names}
+    for ln in lines[data_start:]:
+        parts = ln.split('\\t')
+        if len(parts) < 2:
+            continue
+        try:
+            t = float(parts[1])
+        except ValueError:
+            continue
+        times.append(t)
+        for k, name in enumerate(marker_names):
+            col = 2 + k * 3
+            try:
+                x = float(parts[col])     * scale
+                y = float(parts[col + 1]) * scale
+                z = float(parts[col + 2]) * scale
+            except (IndexError, ValueError):
+                x = y = z = float('nan')
+            m_data[name].append((x, y, z))
+    return times, m_data
+
+try:
+    import opensim
+    opensim.Logger.setLevelString('error')
+
+    trc_times, trc_data = parse_trc(trc_path)
+    model = opensim.Model(osim_path)
+    state = model.initSystem()
+
+    storage = opensim.Storage(mot_path)
+    col_labels = storage.getColumnLabels()
+
+    _TRANS_NAMES = {'pelvis_tx', 'pelvis_ty', 'pelvis_tz'}
+    coord_set = model.getCoordinateSet()
+    coord_map = {}
+    for i in range(coord_set.getSize()):
+        c = coord_set.get(i)
+        name = c.getName()
+        idx = col_labels.findIndex(name)
+        if idx >= 0:
+            coord_map[name] = (c, idx, name not in _TRANS_NAMES)
+
+    marker_set = model.getMarkerSet()
+    model_marker_names = [marker_set.get(i).getName() for i in range(marker_set.getSize())]
+    tracked = [m for m in model_marker_names if m in trc_data]
+
+    err_sum    = {m: 0.0 for m in tracked}
+    err_max    = {m: 0.0 for m in tracked}
+    err_count  = {m: 0   for m in tracked}
+
+    n_frames = storage.getSize()
+    tlist = trc_times
+    for i in range(n_frames):
+        sv = storage.getStateVector(i)
+        t  = sv.getTime()
+        data = sv.getData()
+        for name, (coord, col_idx, is_rot) in coord_map.items():
+            val = float(data.get(col_idx - 1))
+            if is_rot:
+                val = math.radians(val)
+            coord.setValue(state, val)
+        model.realizePosition(state)
+        # Nearest TRC frame (assume monotone times; binary search not needed).
+        # fps match between mot and trc → index == i in the common case.
+        if i < len(tlist):
+            j = i
+        else:
+            j = min(range(len(tlist)), key=lambda k: abs(tlist[k] - t))
+        for name in tracked:
+            mk = marker_set.get(name)
+            pm = mk.getLocationInGround(state)
+            pt = trc_data[name][j]
+            if any(v != v for v in pt):  # NaN check
+                continue
+            dx = pm[0] - pt[0]; dy = pm[1] - pt[1]; dz = pm[2] - pt[2]
+            e  = math.sqrt(dx*dx + dy*dy + dz*dz)
+            err_sum[name]   += e
+            err_max[name]    = max(err_max[name], e)
+            err_count[name] += 1
+
+    with open(out_csv, 'w') as f:
+        f.write('marker,mean_mm,max_mm,n_frames\\n')
+        for name in tracked:
+            n  = err_count[name] or 1
+            m_ = err_sum[name] * 1000.0 / n
+            mx = err_max[name] * 1000.0
+            f.write(f'{name},{m_:.2f},{mx:.2f},{err_count[name]}\\n')
+
+    summary = [{'marker': n,
+                'mean_mm': err_sum[n]*1000.0/(err_count[n] or 1),
+                'max_mm':  err_max[n]*1000.0,
+                'n_frames': err_count[n]} for n in tracked]
+    json.dump({"ok": True, "summary": summary, "n_frames": n_frames},
+              open(result_json, 'w'))
+except Exception as e:
+    import traceback
+    json.dump({"ok": False, "error": str(e), "traceback": traceback.format_exc()},
+              open(result_json, 'w'))
+    sys.exit(1)
+"""
+
+
+def run_per_marker_error_analysis(
+    model_path: str,
+    mot_path: str,
+    trc_path: str,
+    out_csv: str,
+) -> list | None:
+    """Compute per-marker mean/max distance between TRC positions and the IK
+    model's marker positions (both in meters → reported in millimeters).
+
+    Returns a list of dicts {marker, mean_mm, max_mm, n_frames} sorted by
+    descending max_mm, or None on failure. Also writes a CSV to *out_csv*.
+    """
+    opensim_python = _find_opensim_python()
+    if opensim_python is None:
+        print("  [IK errors] opensim conda env not found – skipping per-marker analysis")
+        return None
+    for p in (model_path, mot_path, trc_path):
+        if not os.path.isfile(p):
+            print(f"  [IK errors] missing input: {p}")
+            return None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        result_json = os.path.join(tmp, "result.json")
+        script_path = os.path.join(tmp, "run_per_marker.py")
+        Path(script_path).write_text(_PER_MARKER_ERRORS_SCRIPT, encoding="utf-8")
+        child_env = {**os.environ, "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8",
+                     "PYTHONIOENCODING": "utf-8"}
+        result = subprocess.run(
+            [opensim_python, script_path,
+             os.path.abspath(model_path),
+             os.path.abspath(mot_path),
+             os.path.abspath(trc_path),
+             os.path.abspath(out_csv),
+             result_json],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            env=child_env,
+        )
+        if not os.path.exists(result_json):
+            msg = (result.stderr or result.stdout or "(no output)")[-500:]
+            print(f"  [IK errors] subprocess failed:\n{msg}")
+            return None
+        r = json.load(open(result_json))
+        if not r.get("ok"):
+            print(f"  [IK errors] error: {r.get('error')}")
+            return None
+        summary = sorted(r["summary"], key=lambda s: -s["max_mm"])
+        return summary
+
+
+# ---------------------------------------------------------------------------
+# COM analysis — compute whole-body centre of mass from scaled model + IK motion
+# ---------------------------------------------------------------------------
+_COM_SCRIPT = """
+import sys, json, math, os
+
+osim_path   = sys.argv[1]
+mot_path    = sys.argv[2]
+out_sto     = sys.argv[3]
+result_json = sys.argv[4]
+
+try:
+    import opensim
+    opensim.Logger.setLevelString('error')
+
+    model = opensim.Model(osim_path)
+    state = model.initSystem()
+
+    storage = opensim.Storage(mot_path)
+    col_labels = storage.getColumnLabels()
+
+    # Build mapping: coordinate name -> column index in storage
+    # Pelvis translations (pelvis_tx/ty/tz) are in metres; all others in degrees.
+    _TRANS_NAMES = {'pelvis_tx', 'pelvis_ty', 'pelvis_tz'}
+    coord_set = model.getCoordinateSet()
+    coord_map = {}  # coord_name -> (coord_obj, col_idx, is_rotational)
+    for i in range(coord_set.getSize()):
+        c = coord_set.get(i)
+        name = c.getName()
+        idx = col_labels.findIndex(name)
+        if idx >= 0:
+            coord_map[name] = (c, idx, name not in _TRANS_NAMES)
+
+    times, com_x, com_y, com_z = [], [], [], []
+
+    for i in range(storage.getSize()):
+        sv = storage.getStateVector(i)
+        t = sv.getTime()
+        data = sv.getData()
+
+        for name, (coord, col_idx, is_rot) in coord_map.items():
+            val = float(data.get(col_idx - 1))  # -1 because col 0 is time
+            if is_rot:
+                val = math.radians(val)  # MOT stores degrees for rotational DOFs
+            coord.setValue(state, val)
+
+        model.realizePosition(state)
+        com = model.calcMassCenterPosition(state)
+        times.append(t)
+        com_x.append(com[0])
+        com_y.append(com[1])
+        com_z.append(com[2])
+
+    # Write as .sto (OpenSim storage format)
+    with open(out_sto, 'w') as f:
+        f.write("Center of Mass\\n")
+        f.write("version=1\\n")
+        f.write("nRows=%d\\n" % len(times))
+        f.write("nColumns=4\\n")
+        f.write("inDegrees=no\\n")
+        f.write("endheader\\n")
+        f.write("time\\tcom_x\\tcom_y\\tcom_z\\n")
+        for t, x, y, z in zip(times, com_x, com_y, com_z):
+            f.write("%.6f\\t%.6f\\t%.6f\\t%.6f\\n" % (t, x, y, z))
+
+    json.dump({"ok": True, "n_frames": len(times)}, open(result_json, "w"))
+except Exception as e:
+    import traceback
+    json.dump({"ok": False, "error": str(e), "traceback": traceback.format_exc()},
+              open(result_json, "w"))
+    sys.exit(1)
+"""
+
+
+def run_com_analysis(
+    model_path: str,
+    mot_path: str,
+    com_path: str,
+) -> bool:
+    """Compute whole-body centre of mass from scaled model + IK motion.
+
+    Writes a .sto file with columns: time, com_x, com_y, com_z (metres,
+    OpenSim Y-up frame).  Returns True on success.
+    """
+    opensim_python = _find_opensim_python()
+    if opensim_python is None:
+        print("  [COM] opensim conda env not found – skipping COM")
+        return False
+
+    if not os.path.isfile(model_path) or not os.path.isfile(mot_path):
+        print("  [COM] model or mot file not found – skipping COM")
+        return False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        result_json = os.path.join(tmp, "result.json")
+        script_path = os.path.join(tmp, "run_com.py")
+        Path(script_path).write_text(_COM_SCRIPT, encoding="utf-8")
+
+        child_env = {**os.environ, "LC_ALL": "C.UTF-8", "LANG": "C.UTF-8",
+                     "PYTHONIOENCODING": "utf-8"}
+        result = subprocess.run(
+            [opensim_python, script_path,
+             os.path.abspath(model_path),
+             os.path.abspath(mot_path),
+             os.path.abspath(com_path),
+             result_json],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            env=child_env,
+        )
+
+        # Read result_json BEFORE leaving the tmpdir context manager
+        ok = False
+        if os.path.exists(result_json):
+            r = json.load(open(result_json))
+            if r.get("ok"):
+                ok = True
+                print(f"  [COM] {r.get('n_frames', '?')} frames → {com_path}")
+            else:
+                print(f"  [COM] error: {r.get('error', '?')}")
+                tb = r.get("traceback", "")
+                if tb:
+                    print(f"  [COM] traceback:\n{tb[-800:]}")
+        elif result.returncode != 0:
+            msg = (result.stderr or result.stdout or "(no output)")[-500:]
+            print(f"  [COM] subprocess failed (rc={result.returncode}):\n{msg}")
+
+    return ok
 
 
 def _get_trc_time_range(trc_path: str) -> tuple[float, float]:

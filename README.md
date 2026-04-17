@@ -4,7 +4,7 @@
 >
 > Takes the Fast-SAM-3D-Body inference pipeline and exports every frame of a video directly
 > to OpenSim-ready files: TRC marker trajectories, IK-solved MOT joint angles, body model,
-> and a rigged animated GLB skeleton for Blender / three.js.
+> animated body mesh GLB, and anatomical bone GLB.
 > Matches the output format of [SAM3D-OpenSim](https://github.com/AitorIriondo/SAM3D-OpenSim).
 
 ---
@@ -15,13 +15,16 @@
 |---------|-----------------|-----------|
 | 3D body mesh inference | ✓ | ✓ |
 | Annotated video output | ✓ | ✓ |
-| OpenSim TRC marker file (73 markers, mm) | — | ✓ |
+| OpenSim TRC marker file (39–79 markers, mm) | — | ✓ |
 | OpenSim IK-solved MOT (40 DOF, via OpenSim 4.5) | — | ✓ |
-| Pose2Sim_Simple body model | — | ✓ |
-| Rigged animated skeleton GLB (Blender / three.js) | — | ✓ |
-| Animated full-body mesh GLB | — | ✓ (opt-in) |
+| Pose2Sim Wholebody body model | — | ✓ |
+| Animated full-body mesh GLB (morph targets) | — | ✓ (opt-in) |
+| Anatomical bone GLB (OpenSim .vtp meshes + IK) | — | ✓ |
+| Multi-person tracking (BoT-SORT) | — | ✓ |
+| Per-person TRC / GLB + combined scene GLB | — | ✓ |
+| Floor lean correction (MoGe depth + spine) | — | ✓ |
 | Timestamped output folders | — | ✓ |
-| Full setup guides for Linux + Windows | — | ✓ |
+| Full setup guides for Linux + Windows + Docker | — | ✓ |
 | TRT engine build instructions | partial | ✓ |
 
 ---
@@ -32,19 +35,30 @@ Each run creates a timestamped folder: `output_YYYYMMDD_HHMMSS_<videoname>/`
 
 ```
 output_20260320_173750_myvideo/
-  markers_<name>_skeleton.mp4    — annotated video with 2D skeleton overlay
-  markers_<name>.trc             — 73 OpenSim markers in mm, Y-up
-  markers_<name>_ik.mot          — IK-solved joint angles, 40 DOF, degrees
-  markers_<name>_model.osim      — Pose2Sim_Simple body model
-  markers_<name>.glb             — rigged animated skeleton (~1.3 MB for 584 frames)
-  markers_<name>_mesh.glb        — animated full-body mesh (~126 MB, skip with --no_mesh_glb)
-  _ik_marker_errors.sto          — IK marker tracking residuals per frame
-  inference_meta.json            — video metadata
-  video_outputs.json             — per-frame raw 3D keypoints
-  processing_report.json         — pipeline summary: timings, IK/GLB status
+  markers_<name>_skeleton.mp4      — annotated video with 2D skeleton overlay
+  markers_<name>.trc               — OpenSim markers in mm, Y-up (39 body / 79 full mode)
+  markers_<name>_ik.mot            — IK-solved joint angles, 40 DOF, degrees
+  markers_<name>_model.osim        — Pose2Sim Wholebody body model
+  markers_<name>_mesh.glb          — animated full-body mesh + skeleton overlay (skip with --no_mesh_glb)
+  markers_<name>_anatomical.glb    — OpenSim anatomical bones animated by IK
+  _ik_marker_errors.sto            — IK marker tracking residuals per frame
+  inference_meta.json              — video metadata
+  video_outputs.json               — per-frame raw 3D keypoints
+  processing_report.json           — pipeline summary: timings, IK/GLB status
 ```
 
-### TRC marker set — 73 landmarks
+With `--multi_person`, additional per-person files are generated:
+
+```
+  markers_<name>_person01.trc          — per-person TRC
+  markers_<name>_person02.trc
+  markers_<name>_person01_mesh.glb     — per-person mesh GLB
+  markers_<name>_person02_mesh.glb
+  markers_<name>_combined.trc          — all persons in one TRC (world-space offsets)
+  markers_<name>_combined_mesh.glb     — all persons in one GLB scene (distinct colors)
+```
+
+### TRC marker set
 
 **Body (30):** Nose · LEye · REye · LEar · REar · LShoulder · RShoulder · LElbow · RElbow ·
 LHip · RHip · LKnee · RKnee · LAnkle · RAnkle · LBigToe · LSmallToe · LHeel ·
@@ -53,11 +67,16 @@ LCubitalFossa · RCubitalFossa · LAcromion · RAcromion · Neck
 
 **Derived (3):** PelvisCenter · Thorax · SpineMid
 
+**Spine joints (6):** c_spine0 · c_spine1 · c_spine2 · c_spine3 · c_neck · c_head
+(real MHR 127-joint armature positions, not geometric interpolation)
+
 **Hands (40):** full finger tracking (20 per hand) — only present with `--inference_type full`
+
+Total: **39 markers** in `body` mode, **79 markers** in `full` mode.
 
 ### MOT joint angles — 40 DOF
 
-OpenSim IK-solved via `InverseKinematicsTool` using the Pose2Sim_Simple model.
+OpenSim IK-solved via `InverseKinematicsTool` using the Pose2Sim Wholebody model.
 Columns: pelvis tx/ty/tz/tilt/list/rotation · l/r hip flexion/adduction/rotation ·
 l/r knee angle · l/r ankle angle · lumbar extension/bending/rotation ·
 arm flex/add/rot · elbow flex · pro/sup · wrist flex/dev (both sides).
@@ -71,7 +90,7 @@ arm flex/add/rot · elbow flex · pro/sup · wrist flex/dev (both sides).
 | `body` — no hands | **~14 fps** | ~50 s |
 | `full` — body + hands (IK-ready) | **~5.3 fps** | ~115 s |
 
-Total time includes inference, post-processing, OpenSim IK, and Blender GLB export.
+Total time includes inference, post-processing, OpenSim IK, and GLB export.
 
 See [COMPROMISES.md](COMPROMISES.md) for a breakdown of every trade-off.
 
@@ -84,16 +103,12 @@ See [COMPROMISES.md](COMPROMISES.md) for a breakdown of every trade-off.
 - **Linux**: [SETUP.md](SETUP.md)
 - **Windows**: [WINDOWS_SETUP.md](WINDOWS_SETUP.md)
 
-Additional dependencies for the full pipeline:
+Additional dependency for IK:
 
 ```bash
-# OpenSim 4.5 (IK solver)
+# OpenSim 4.5 (IK solver — optional, TRC is always written)
 conda create -n opensim python=3.10
 conda install -n opensim -c opensim-org opensim
-
-# Blender + numpy (rigged GLB export)
-sudo apt install blender
-pip3.12 install numpy --break-system-packages
 ```
 
 ### 2. Run
@@ -124,9 +139,9 @@ The IK MOT is written automatically. Load directly without re-running IK:
 2. `File → Load Motion` → select `markers_<name>_ik.mot`
 3. `File → Open Motion Capture Data` → select `markers_<name>.trc` to inspect markers
 
-### 4. Open in Blender
+### 4. Open in Blender / 3D viewer
 
-`File → Import → glTF 2.0` → select `markers_<name>.glb` (rigged skeleton) or `markers_<name>_mesh.glb`
+`File → Import → glTF 2.0` → select `markers_<name>_mesh.glb` (body mesh + skeleton) or `markers_<name>_anatomical.glb` (OpenSim bone meshes)
 
 ---
 
@@ -136,12 +151,33 @@ The IK MOT is written automatically. Load directly without re-running IK:
 |------|---------|-------------|
 | `--video_path` | — | Input video |
 | `--fx` | auto (MoGe) | Camera focal length in pixels |
-| `--inference_type` | `full` | `full` = body + hands (73 markers, IK-ready) · `body` = faster, fewer markers |
+| `--inference_type` | `body` | `body` = faster, fewer markers · `full` = body + hands (73 markers) |
 | `--person_height` | `1.75` | Known subject height in metres — scales 3D output |
 | `--no_mesh_glb` | off | Skip full-body mesh GLB export (saves ~125 MB) |
-| `--target_fps` | 0 | Downsample input to this FPS (0 = every frame) |
-| `--max_frames` | 0 | Stop after N frames (0 = full video) |
+| `--target_fps` | `30` | Downsample input to this FPS (0 = every frame) |
+| `--max_frames` | `0` | Stop after N frames (0 = full video) |
 | `--output_dir` | auto | Output directory (default: `output_YYYYMMDD_HHMMSS_<name>/`) |
+
+### Multi-person
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--multi_person` | off | Enable multi-person tracking and per-person export |
+| `--tracker` | `botsort` | Tracker: `botsort` (re-ID), `bytetrack` (lighter), `none` (centroid) |
+| `--person_heights` | — | Comma-separated heights left-to-right, e.g. `1.69,1.82` |
+| `--max_persons` | `6` | Max detections per frame |
+| `--run_ik_per_person` | off | Run OpenSim Scale + IK for each person (slow) |
+
+### Lean / floor correction
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--floor_moge` | off | Estimate floor plane from MoGe depth (frame 0) to correct camera pitch |
+| `--lean_ref_frame` | — | Frame index where person stands upright (corrects residual lean) |
+| `--lean_angle` | — | Manual lean correction in degrees (overrides auto-detection) |
+| `--no_lean_fix` | off | Disable all automatic lean correction |
+
+See [HOW_TO_RUN.md](HOW_TO_RUN.md) for the complete flag reference.
 
 ---
 
@@ -161,24 +197,27 @@ Units: millimetres (mm)
 ## Post-processing pipeline
 
 ```
-Camera-space keypoints  (N, 70, 3)
+Camera-space keypoints  (N, 70, 3)  +  joint coords  (N, 127, 3)
     │
     ▼  PostProcessor
     │    ├─ interpolate missing frames
-    │    ├─ normalise bone lengths (anthropometric proportions)
     │    └─ Butterworth low-pass filter  (6 Hz, order 4)
     ▼  CoordinateTransformer
     │    ├─ rotate camera → OpenSim Y-up
-    │    ├─ scale to subject height
-    │    ├─ centre pelvis at origin (XZ)
+    │    ├─ scale to subject height (c_head as top reference)
+    │    ├─ apply global XZ translation from camera trajectory
     │    ├─ align feet to ground (Y=0) per frame
-    │    └─ correct forward lean (auto-detected)
-    ▼  KeypointConverter   (MHR70 → 73 OpenSim markers)
+    │    ├─ MoGe floor-plane correction (optional, --floor_moge)
+    │    └─ spine-based forward-lean correction (auto or --lean_ref_frame)
+    ▼  KeypointConverter   (MHR70 → 73 OpenSim markers + spine joints)
     ▼  TRCExporter         → markers_<name>.trc  (mm)
-    ▼  OpenSim IK          → markers_<name>_ik.mot  (subprocess → opensim env)
-    ▼  Blender GLB         → markers_<name>.glb  (subprocess → blender + rigify rig)
-    ▼  write_mesh_glb()    → markers_<name>_mesh.glb
+    ▼  OpenSim Scale + IK  → markers_<name>_ik.mot  (subprocess → opensim env)
+    ▼  write_mesh_glb()    → markers_<name>_mesh.glb  (morph targets + skeleton overlay)
+    ▼  write_anatomical_glb() → markers_<name>_anatomical.glb  (OpenSim bone meshes + IK)
 ```
+
+In `--multi_person` mode, the pipeline runs per-person through PostProcessor → IK,
+then generates per-person TRC/GLB files and a combined scene.
 
 ---
 

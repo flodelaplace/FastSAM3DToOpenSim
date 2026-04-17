@@ -1564,3 +1564,257 @@ def write_mesh_glb(
     n_joints = len(joint_node_indices)
     n_bones  = len(bone_node_indices)
     print(f"  Mesh GLB: {n_joints} joint spheres, {n_bones} bone sticks, translucent skin")
+
+
+def write_combined_mesh_glb(
+    filepath: str | Path,
+    timestamps: List[float],
+    per_person_verts: List[List[np.ndarray | None]],
+    faces: np.ndarray,
+) -> None:
+    """Write a combined GLB with multiple people's MHR meshes in one scene.
+
+    Each person gets their own mesh node with morph-target animation and a
+    distinct translucent skin color.  No joint/bone overlays — use per-person
+    GLBs for the full overlay.
+
+    Parameters
+    ----------
+    filepath : output .glb path
+    timestamps : frame timestamps in seconds (shared across all persons)
+    per_person_verts : list of per-person vertex lists.
+        Each inner list has N_frames entries of [V, 3] camera-world-space
+        vertex arrays (or None for missing frames).
+    faces : [N_faces, 3] triangle indices (shared MHR topology)
+    """
+    filepath = Path(filepath)
+    N_frames = len(timestamps)
+    faces_np = np.asarray(faces, dtype=np.uint32).flatten()
+    N_verts = int(faces.max()) + 1
+    zero_v = np.zeros((N_verts, 3), dtype=np.float32)
+
+    # Person palette — translucent tints so meshes are distinguishable
+    _COLORS = [
+        [0.45, 0.62, 0.82, 0.38],  # blue
+        [0.82, 0.45, 0.45, 0.38],  # red
+        [0.45, 0.82, 0.55, 0.38],  # green
+        [0.82, 0.72, 0.45, 0.38],  # yellow/orange
+        [0.72, 0.45, 0.82, 0.38],  # purple
+        [0.45, 0.82, 0.82, 0.38],  # cyan
+    ]
+
+    # Pre-process each person's vertices: forward-fill, Y-up flip, Butterworth
+    per_person_filled: list[list[np.ndarray]] = []
+    for verts_list in per_person_verts:
+        last_good = None
+        filled = []
+        for v in verts_list:
+            if v is not None and not np.any(np.isnan(v)):
+                vf = v.copy().astype(np.float32)
+                vf[:, 1] = -vf[:, 1]   # Y-up
+                vf[:, 0] = -vf[:, 0]   # fix mirror
+                last_good = vf
+            filled.append(last_good.copy() if last_good is not None else None)
+
+        if not any(f is not None for f in filled):
+            continue  # skip person with no valid frames
+        filled = [f if f is not None else zero_v for f in filled]
+
+        # Butterworth 6 Hz smoothing (same as write_mesh_glb)
+        _fps_est = float(N_frames - 1) / max(float(timestamps[-1] - timestamps[0]), 1e-3)
+        _nyq = _fps_est / 2.0
+        _cut = 6.0
+        if _cut < _nyq and N_frames >= 13:
+            from scipy.signal import butter, filtfilt
+            _b, _a = butter(4, _cut / _nyq, btype='low')
+            _flat = np.stack(filled, axis=0).reshape(N_frames, -1)
+            filled = [r.reshape(-1, 3) for r in filtfilt(_b, _a, _flat, axis=0).astype(np.float32)]
+        per_person_filled.append(filled)
+
+    if not per_person_filled:
+        return
+
+    N_persons = len(per_person_filled)
+    N_morphs = N_frames - 1
+
+    # ── Binary buffer helpers ────────────────────────────────────────────────
+    def _pack_f32(a): return np.asarray(a, dtype=np.float32).tobytes()
+    def _pack_u32(a): return np.asarray(a, dtype=np.uint32).tobytes()
+
+    byte_offset = 0
+    chunks: list[bytes] = []
+
+    def _add(data: bytes):
+        nonlocal byte_offset
+        pad = (4 - len(data) % 4) % 4
+        data += b'\x00' * pad
+        chunks.append(data)
+        start = byte_offset
+        byte_offset += len(data)
+        return start, len(data) - pad
+
+    def _bounds(arr):
+        return arr.min(axis=0).tolist(), arr.max(axis=0).tolist()
+
+    # Shared face indices
+    off_faces, len_faces = _add(_pack_u32(faces_np))
+
+    # Shared timestamps
+    anim_times = np.array([float(t) for t in timestamps], dtype=np.float32)
+    off_t, len_t = _add(_pack_f32(anim_times))
+
+    # Shared morph weights (frame f activates target f-1 with weight 1.0)
+    weights_np = np.zeros((N_frames, max(N_morphs, 1)), dtype=np.float32)
+    for f in range(1, N_frames):
+        weights_np[f, f - 1] = 1.0
+    off_w, len_w = _add(_pack_f32(weights_np))
+
+    # Per-person mesh data
+    per_person_data = []
+    for filled in per_person_filled:
+        base_pos = filled[0]
+        off_pos, len_pos = _add(_pack_f32(base_pos))
+
+        morph_offsets = []
+        for frame_verts in filled[1:]:
+            delta = (frame_verts - base_pos).astype(np.float32)
+            dmin = delta.min(axis=0).tolist()
+            dmax = delta.max(axis=0).tolist()
+            off_d, len_d = _add(delta.tobytes())
+            morph_offsets.append((off_d, len_d, dmin, dmax))
+
+        per_person_data.append({
+            'base_pos': base_pos,
+            'off_pos': off_pos, 'len_pos': len_pos,
+            'morph_offsets': morph_offsets,
+        })
+
+    bin_data = b''.join(chunks)
+
+    # ── Build glTF JSON ──────────────────────────────────────────────────────
+    bufferViews: list[dict] = []
+    accessors: list[dict] = []
+    meshes_list: list[dict] = []
+    nodes_list: list[dict] = []
+    scene_nodes: list[int] = []
+    materials: list[dict] = []
+    anim_samplers: list[dict] = []
+    anim_channels: list[dict] = []
+
+    # Shared face index accessor
+    bv_faces = len(bufferViews)
+    bufferViews.append({"buffer": 0, "byteOffset": off_faces, "byteLength": len_faces, "target": 34963})
+    acc_faces = len(accessors)
+    accessors.append({
+        "bufferView": bv_faces, "byteOffset": 0, "componentType": 5125,
+        "count": len(faces_np), "type": "SCALAR",
+    })
+
+    # Shared timestamp accessor
+    bv_t = len(bufferViews)
+    bufferViews.append({"buffer": 0, "byteOffset": off_t, "byteLength": len_t})
+    acc_t = len(accessors)
+    accessors.append({
+        "bufferView": bv_t, "byteOffset": 0, "componentType": 5126,
+        "count": N_frames, "type": "SCALAR",
+        "min": [float(anim_times.min())], "max": [float(anim_times.max())],
+    })
+
+    # Shared morph weights accessor
+    bv_w = len(bufferViews)
+    bufferViews.append({"buffer": 0, "byteOffset": off_w, "byteLength": len_w})
+    acc_w = len(accessors)
+    accessors.append({
+        "bufferView": bv_w, "byteOffset": 0, "componentType": 5126,
+        "count": N_frames * max(N_morphs, 1), "type": "SCALAR",
+    })
+
+    # Shared morph weights sampler (reused by all persons)
+    s_weights = len(anim_samplers)
+    anim_samplers.append({"input": acc_t, "output": acc_w, "interpolation": "STEP"})
+
+    # Per-person materials, meshes, nodes, animation channels
+    for pi, pd in enumerate(per_person_data):
+        color = _COLORS[pi % len(_COLORS)]
+        mat_idx = len(materials)
+        materials.append({
+            "name": f"skin_P{pi+1}",
+            "pbrMetallicRoughness": {
+                "baseColorFactor": color,
+                "roughnessFactor": 0.70, "metallicFactor": 0.0,
+            },
+            "alphaMode": "BLEND", "doubleSided": True,
+        })
+
+        # Base position accessor
+        bv_pos = len(bufferViews)
+        bufferViews.append({"buffer": 0, "byteOffset": pd['off_pos'], "byteLength": pd['len_pos'], "target": 34962})
+        acc_pos = len(accessors)
+        accessors.append({
+            "bufferView": bv_pos, "byteOffset": 0, "componentType": 5126,
+            "count": len(pd['base_pos']), "type": "VEC3",
+            **dict(zip(["min", "max"], _bounds(pd['base_pos']))),
+        })
+
+        # Morph target accessors
+        morph_targets = []
+        for off_d, len_d, dmin, dmax in pd['morph_offsets']:
+            bv_d = len(bufferViews)
+            bufferViews.append({"buffer": 0, "byteOffset": off_d, "byteLength": len_d, "target": 34962})
+            acc_d = len(accessors)
+            accessors.append({
+                "bufferView": bv_d, "byteOffset": 0, "componentType": 5126,
+                "count": len(pd['base_pos']), "type": "VEC3",
+                "min": dmin, "max": dmax,
+            })
+            morph_targets.append({"POSITION": acc_d})
+
+        # Mesh
+        mesh_idx = len(meshes_list)
+        meshes_list.append({
+            "name": f"body_P{pi+1}",
+            "primitives": [{
+                "attributes": {"POSITION": acc_pos},
+                "indices": acc_faces,
+                "mode": 4,
+                "material": mat_idx,
+                "targets": morph_targets,
+            }],
+            "weights": [0.0] * max(N_morphs, 1),
+        })
+
+        # Node
+        node_idx = len(nodes_list)
+        nodes_list.append({"mesh": mesh_idx, "name": f"Person_{pi+1}"})
+        scene_nodes.append(node_idx)
+
+        # Animation channel (morph weights) → shared sampler
+        anim_channels.append({"sampler": s_weights, "target": {"node": node_idx, "path": "weights"}})
+
+    gltf: dict = {
+        "asset": {"version": "2.0", "generator": "FastSAM3DBody Multi-Person Exporter"},
+        "scene": 0,
+        "scenes": [{"nodes": scene_nodes}],
+        "nodes": nodes_list,
+        "meshes": meshes_list,
+        "materials": materials,
+        "animations": [{"name": "take", "samplers": anim_samplers, "channels": anim_channels}],
+        "accessors": accessors,
+        "bufferViews": bufferViews,
+        "buffers": [{"byteLength": len(bin_data)}],
+    }
+
+    # ── Write GLB ────────────────────────────────────────────────────────────
+    json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+    pad_j = (4 - len(json_bytes) % 4) % 4
+    json_bytes += b' ' * pad_j
+    pad_b = (4 - len(bin_data) % 4) % 4
+    bin_data += b'\x00' * pad_b
+
+    json_chunk = struct.pack("<II", len(json_bytes), 0x4E4F534A) + json_bytes
+    bin_chunk  = struct.pack("<II", len(bin_data),   0x004E4942) + bin_data
+    header = struct.pack("<III", 0x46546C67, 2, 12 + len(json_chunk) + len(bin_chunk))
+
+    filepath.write_bytes(header + json_chunk + bin_chunk)
+    mb = (12 + len(json_chunk) + len(bin_chunk)) / 1e6
+    print(f"  Combined mesh GLB: {N_persons} person(s), {N_frames} frames, {mb:.1f} MB")

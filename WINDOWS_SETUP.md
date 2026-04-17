@@ -148,15 +148,31 @@ python -c "from ultralytics import YOLO; m = YOLO('checkpoints/yolo/yolo11m-pose
 ```cmd
 python convert_moge_encoder_trt.py
 ```
-If it fails with a weights error, see the known issue in SETUP.md (change `parse(f.read())` to `parse_from_file(onnx_path)`).
+
+**Known issue**: the script must use `parse_from_file()` instead of `parse(f.read())` for loading the ONNX model with external weights. If it fails with an error about missing weights, edit the script and change:
+```python
+# Wrong:
+parser.parse(f.read(), ...)
+# Correct:
+parser.parse_from_file(onnx_path)
+```
+
+Output: `checkpoints\moge_trt\moge_dinov2_encoder_fp16.engine` (~46 MB)
 
 ### 6c. SAM-3D-Body backbone TRT engine
 ```cmd
 python convert_backbone_tensorrt.py
 ```
-If it fails, see the known issue in SETUP.md (add `dynamo=False` to `torch.onnx.export`).
 
-This takes 10–30 minutes.
+**Known issue**: the script needs `dynamo=False` in the `torch.onnx.export` call, otherwise it fails on newer PyTorch. Edit the script and add `dynamo=False`:
+```python
+torch.onnx.export(model, dummy_input, onnx_path, dynamo=False, ...)
+```
+
+This builds for fixed 512x512 input with dynamic batch [1, 2, 4].
+Takes 10-30 minutes depending on GPU.
+
+Output: `checkpoints\sam-3d-body-dinov3\backbone_trt\backbone_dinov3_fp16.engine` (~1.6 GB)
 
 ---
 
@@ -286,6 +302,7 @@ If `torch.compile` (triton-windows) is not working, subtract another ~2-3 fps fr
 
 | Issue | Workaround |
 |-------|-----------|
+| `ModuleNotFoundError: cloudpickle` (or `iopath`, `tabulate`) | We install detectron2 with `--no-deps`, so its transitive deps must be installed explicitly: `pip install cloudpickle iopath tabulate matplotlib packaging hydra-core` |
 | `triton` not found / Triton crash | Set `USE_COMPILE=0 DECODER_COMPILE=0`. Loses ~2-3 fps. |
 | `RuntimeError: CUDA error: no kernel image available` | Your TRT engine was built for a different GPU arch. Rebuild on this machine. |
 | Long path errors during pip install | Enable long paths: run `reg add HKLM\SYSTEM\CurrentControlSet\Control\FileSystem /v LongPathsEnabled /t REG_DWORD /d 1 /f` as Administrator |

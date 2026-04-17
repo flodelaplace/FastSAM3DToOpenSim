@@ -5,15 +5,15 @@ Fast SAM 3D Body – OpenSim Video Export
 ========================================
 Matches SAM3D-OpenSim output format exactly.  Writes to <output_dir>/:
 
-  markers_<name>_skeleton.mp4   — annotated video with 2D skeleton overlay
-  markers_<name>.trc            — 73 markers in mm (Y-up, OpenSim coords)
-  markers_<name>_ik.mot         — joint angles from OpenSim IK solver (40 DOF)
-  markers_<name>_model.osim     — Pose2Sim_Simple body model for IK
-  markers_<name>.glb            — animated skeleton GLB (Blender/rigify)
-  markers_<name>_mesh.glb       — full body mesh GLB (--no_mesh_glb to skip)
-  inference_meta.json           — video metadata
-  video_outputs.json            — per-frame raw 3D keypoints
-  processing_report.json        — pipeline summary and timings
+  markers_<name>_skeleton.mp4     — annotated video with 2D skeleton overlay
+  markers_<name>.trc               — 73 markers in mm (Y-up, OpenSim coords)
+  markers_<name>_ik.mot            — joint angles from OpenSim IK solver (40 DOF)
+  markers_<name>_model.osim        — Pose2Sim Wholebody body model for IK
+  markers_<name>_mesh.glb          — full body mesh GLB + skeleton overlay (--no_mesh_glb to skip)
+  markers_<name>_anatomical.glb    — OpenSim anatomical bones animated by IK
+  inference_meta.json              — video metadata
+  video_outputs.json               — per-frame raw 3D keypoints
+  processing_report.json           — pipeline summary and timings
 
 Usage:
     conda activate fast_sam_3d_body
@@ -68,17 +68,20 @@ sys.path.insert(0, parent_dir)
 from notebook.utils import setup_sam_3d_body
 from sam_3d_body.visualization.skeleton_visualizer import SkeletonVisualizer
 from sam_3d_body.metadata.mhr70 import pose_info as mhr70_pose_info
-from sam_3d_body.export.opensim_exporter import write_mesh_glb
+from sam_3d_body.export.opensim_exporter import write_mesh_glb, write_combined_mesh_glb
 from sam_3d_body.export.post_processing import PostProcessor
 from sam_3d_body.export.coordinate_transform import CoordinateTransformer
 from sam_3d_body.export.keypoint_converter import KeypointConverter
 from sam_3d_body.export.trc_exporter import TRCExporter
-from sam_3d_body.export.opensim_ik_runner import run_ik, run_scale_tool
+from sam_3d_body.export.opensim_ik_runner import (
+    run_ik, run_scale_tool, run_com_analysis,
+    run_per_marker_error_analysis,
+)
 
 # Pose2Sim Wholebody model — has explicit lumbar5–lumbar1 spine segments
 # so that MHR armature spine joints (c_spine0–3, c_neck, c_head) actually
 # drive individual intervertebral DOFs in OpenSim IK.
-_MODEL_TEMPLATE = os.path.join(parent_dir, "assets", "pose2sim_wholebody_model.osim")
+_POSE2SIM_MODEL_TEMPLATE = os.path.join(parent_dir, "assets", "pose2sim_wholebody_model.osim")
 
 
 
@@ -210,6 +213,33 @@ def _lean_angle_at_frame(keypoints, frame_idx):
     return float(a if spine_vec[0] > 0 else -a)
 
 
+def _detect_static_window(kpts_opensim: np.ndarray, fps: float,
+                          window_sec: float = 0.4):
+    """Find the best static-pose window for Scale Tool / MarkerPlacer.
+
+    Scoring: sum of per-keypoint frame-to-frame displacements over a
+    rolling *window_sec* window. The window with minimum motion is the
+    most static segment. Returns (t_start, t_end, frame_start, frame_end).
+    """
+    N = kpts_opensim.shape[0]
+    window = max(5, int(round(window_sec * fps)))
+    if N < window + 2:
+        return 0.0, (N - 1) / fps, 0, N - 1
+
+    # Per-frame displacement between consecutive frames, summed over kpts.
+    diff = np.diff(kpts_opensim, axis=0)                 # (N-1, 70, 3)
+    disp = np.linalg.norm(diff, axis=-1)                 # (N-1, 70)
+    motion = np.nansum(disp, axis=-1)                    # (N-1,)
+
+    # Rolling sum over (window - 1) consecutive differences.
+    kernel = np.ones(window - 1)
+    rolling = np.convolve(motion, kernel, mode="valid")  # len N - window
+    best_start = int(np.argmin(rolling))
+    f_start = best_start
+    f_end   = best_start + window - 1
+    return f_start / fps, f_end / fps, f_start, f_end
+
+
 def _lean_angle_over_range(keypoints, center_frame, half_window=5):
     """Average pelvis→thorax lean angle over a window of frames.
 
@@ -235,6 +265,23 @@ def main(args):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.output_dir = f"output_{timestamp}_{video_name_raw}"
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # ── Markerset selection ──────────────────────────────────────────────────
+    # --markerset pose2sim (default)  : original KeypointConverter + pose2sim_wholebody_model.osim
+    # --markerset flodelaplace        : FlodelaplaceConverter + flodelaplace_mocap.osim
+    markerset = getattr(args, "markerset", "pose2sim")
+    if markerset == "flodelaplace":
+        model_template = os.path.join(parent_dir, "assets", "flodelaplace_mocap.osim")
+        from sam_3d_body.export.flodelaplace_converter import FlodelaplaceConverter
+        florian_converter = FlodelaplaceConverter()
+        # Force vertex collection even when mesh GLB is disabled — the
+        # converter needs the 21 anatomical vertex positions per frame.
+        force_collect_verts = True
+    else:
+        model_template = _POSE2SIM_MODEL_TEMPLATE
+        florian_converter = None
+        force_collect_verts = False
+    print(f"Markerset: {markerset}  (model template: {os.path.basename(model_template)})")
 
     # ── Camera intrinsics ─────────────────────────────────────────────────────
     cam_int = None
@@ -396,6 +443,7 @@ def main(args):
                     tr['kpts'].append(None)
                     tr['cam_t'].append(None)
                     tr['jcoords'].append(None)
+                    tr['verts'].append(None)
             frame_idx += 1
             processed += 1
             continue
@@ -649,6 +697,7 @@ def main(args):
                 tr['kpts'].append(None)
                 tr['cam_t'].append(None)
                 tr['jcoords'].append(None)
+                tr['verts'].append(None)
 
             for p in outputs:
                 # Get track ID: from BoT-SORT when available, otherwise
@@ -679,6 +728,7 @@ def main(args):
                         'kpts': [None] * processed + [None],
                         'cam_t': [None] * processed + [None],
                         'jcoords': [None] * processed + [None],
+                        'verts': [None] * processed + [None],
                         'bbox_cx': [],  # image-space center X for left→right sorting
                     }
                 kpts_p = p.get('pred_keypoints_3d')
@@ -687,13 +737,19 @@ def main(args):
                 tracks[tid]['kpts'][-1] = kpts_p.copy() if kpts_p is not None else None
                 tracks[tid]['cam_t'][-1] = cam_t_p.copy() if cam_t_p is not None else None
                 tracks[tid]['jcoords'][-1] = jc_p.copy() if jc_p is not None else None
+                # Collect mesh vertices for per-person GLB export
+                verts_p = p.get('pred_vertices')
+                if verts_p is not None and cam_t_p is not None and not np.any(np.isnan(verts_p)):
+                    tracks[tid]['verts'][-1] = (verts_p + cam_t_p[None, :]).astype(np.float32)
                 if 'bbox' in p:
                     cx, _ = _centroid_from_bbox(p['bbox'])
                     tracks[tid]['_last_centroid'] = (cx, _centroid_from_bbox(p['bbox'])[1])
                     tracks[tid]['bbox_cx'].append(cx)
 
-        # Collect mesh vertices for mesh GLB
-        if not args.no_mesh_glb and person is not None:
+        # Collect mesh vertices for mesh GLB and/or --markerset flodelaplace
+        # (the latter needs the 21 anatomical vertex positions per frame).
+        need_verts = (not args.no_mesh_glb) or force_collect_verts
+        if need_verts and person is not None:
             verts = person.get("pred_vertices")
             cam_t = person.get("pred_cam_t")
             if verts is not None and cam_t is not None and not np.any(np.isnan(verts)):
@@ -756,6 +812,31 @@ def main(args):
     post_proc = PostProcessor()
     kpts_processed    = post_proc.process(kpts_stack, fps=out_fps)
     jcoords_processed = post_proc.process_jcoords(jcoords_stack, fps=out_fps)
+
+    # 1b. --markerset flodelaplace: pull the 21 anatomical mesh vertex positions
+    # per frame and append them to the jcoords array so they ride the same
+    # post-proc / transform / lean-correction pipeline. Split back out before
+    # calling the Florian converter.
+    #
+    # Frame alignment: `all_verts[i]` is stored as verts+cam_t (world-camera
+    # frame for the GLB path), while `jcoords_stack` is raw pred_joint_coords
+    # in pre-cam_t camera frame. Subtract cam_t_stack[i] back out so the
+    # anat verts land in the *same* frame as jcoords — otherwise transform()
+    # applies cam_t a second time and the new markers end up miles off the
+    # skeleton.
+    N_anat = 0
+    if markerset == "flodelaplace":
+        N_anat = len(florian_converter.vertex_indices)
+        anat_stack = np.full((N, N_anat, 3), np.nan, dtype=np.float64)
+        for i, v in enumerate(all_verts):
+            if v is None:
+                continue
+            ct = cam_t_stack[i]
+            if np.any(np.isnan(ct)):
+                continue
+            anat_stack[i] = florian_converter.extract_anatomical(v) - ct
+        anat_processed = post_proc.process_jcoords(anat_stack, fps=out_fps)
+        jcoords_processed = np.concatenate([jcoords_processed, anat_processed], axis=1)
     # Interpolate + smooth cam_t for global walking trajectory in TRC.
     # Reshape to (N,1,3) so PostProcessor's per-keypoint logic handles it,
     # then squeeze back to (N,3).
@@ -773,7 +854,7 @@ def main(args):
         camera_translation=cam_t_processed,
         center_pelvis=True,
         align_to_ground=True,
-        apply_global_translation=True,
+        apply_global_translation=not args.stationary,
         # When MoGe floor angle is provided, pass it to the transformer so
         # that floor rotation is applied using camera-pitch from MoGe. Also
         # the transformer can optionally skip the spine-based lean correction
@@ -815,18 +896,31 @@ def main(args):
             kpts_opensim, jcoords=jcoords_opensim, cam_t=cam_t_processed
         )
 
-    # 3. Map MHR70 → OpenSim marker names; append real spine/neck/head joints
+    # 3. Map MHR70 → OpenSim marker names.
     body_only = (args.inference_type == "body")
-    converter = KeypointConverter()
-    markers_array, marker_names = converter.convert(
-        kpts_opensim, jcoords_3d=jcoords_opensim, include_derived=True, body_only=body_only
-    )
-
-    # Body-only markers for GLB skeleton visualisation (no spine appended here —
-    # the GLB path builds its own spine overlay from frames_joint_coords)
-    markers_body, _ = converter.convert(
-        kpts_opensim, include_derived=True, body_only=True
-    )
+    if markerset == "flodelaplace":
+        # Split anatomical verts back out of the extended jcoords array.
+        anat_verts_opensim = jcoords_opensim[:, 127:]
+        jcoords_opensim    = jcoords_opensim[:, :127]
+        markers_array, marker_names = florian_converter.convert(
+            kpts_opensim, jcoords_opensim, anat_verts_opensim
+        )
+        # GLB skeleton overlay uses the legacy body_only layout — always build
+        # it from the KeypointConverter for visual parity with the pose2sim
+        # flow, even when the TRC is written with Florian names.
+        markers_body, _ = KeypointConverter().convert(
+            kpts_opensim, include_derived=True, body_only=True
+        )
+    else:
+        converter = KeypointConverter()
+        markers_array, marker_names = converter.convert(
+            kpts_opensim, jcoords_3d=jcoords_opensim, include_derived=True, body_only=body_only
+        )
+        # Body-only markers for GLB skeleton visualisation (no spine appended here —
+        # the GLB path builds its own spine overlay from frames_joint_coords)
+        markers_body, _ = converter.convert(
+            kpts_opensim, include_derived=True, body_only=True
+        )
 
     # ---------------------------------------------------------------------
     # Multi-person per-track post-processing & export (if requested)
@@ -877,6 +971,7 @@ def main(args):
                         tr_a['kpts'][fi] = tr_b['kpts'][fi]
                         tr_a['cam_t'][fi] = tr_b['cam_t'][fi]
                         tr_a['jcoords'][fi] = tr_b['jcoords'][fi]
+                        tr_a['verts'][fi] = tr_b['verts'][fi]
                 merged_ids.add(tr_b['id'])
                 tr_a['_valid_count'] = sum(1 for k in tr_a['kpts'] if k is not None)
                 print(f"  [merge] track {tr_b['id']} → track {tr_a['id']} "
@@ -911,6 +1006,7 @@ def main(args):
         per_person_markers = []   # for combined TRC
         per_person_names = []
         per_person_origins = []   # world-space origins (metres, OpenSim axes)
+        per_person_verts_raw = []  # for combined mesh GLB (raw camera-world verts)
         # Process each track separately through the same pipeline
         for ti, tr in enumerate(tracks_list):
             # Build stacks for this track
@@ -954,7 +1050,7 @@ def main(args):
                 camera_translation=cam_proc,
                 center_pelvis=True,
                 align_to_ground=True,
-                apply_global_translation=True,
+                apply_global_translation=not args.stationary,
                 correct_floor_lean=not args.no_lean_fix,
                 floor_angle=moge_floor_angle,
             )
@@ -996,12 +1092,33 @@ def main(args):
             per_person_markers.append(markers_p)
             per_person_names.append(names_p)
             per_person_origins.append(_cam_sm[0].copy())
+
+            # Per-person mesh GLB export
+            person_verts_list = tr['verts'][:N]
+            per_person_verts_raw.append(person_verts_list)
+            if not args.no_mesh_glb:
+                has_verts = any(v is not None for v in person_verts_list)
+                if has_verts:
+                    glb_person_path = os.path.join(args.output_dir, f"{prefix}_person{ti+1:02d}_mesh.glb")
+                    print(f"    Writing per-person mesh GLB → {glb_person_path}")
+                    person_kpts_raw = tr['kpts'][:N]
+                    person_cam_t_raw = tr['cam_t'][:N]
+                    person_jcoords_raw = tr['jcoords'][:N]
+                    write_mesh_glb(
+                        glb_person_path, timestamps, person_verts_list,
+                        estimator.faces,
+                        frames_kpts=person_kpts_raw,
+                        frames_cam_t=person_cam_t_raw,
+                        frames_joint_coords=person_jcoords_raw,
+                        body_only=body_only,
+                    )
+
             # Optionally run OpenSim scale + IK per-person
             if getattr(args, 'run_ik_per_person', False):
                 person_osim = os.path.join(args.output_dir, f"{prefix}_person{ti+1:02d}_model.osim")
                 try:
-                    if os.path.isfile(_MODEL_TEMPLATE):
-                        shutil.copy(_MODEL_TEMPLATE, person_osim)
+                    if os.path.isfile(model_template):
+                        shutil.copy(model_template, person_osim)
                         print(f"    Writing person model → {person_osim}")
                         scale_ok = run_scale_tool(
                             model_path=person_osim,
@@ -1009,11 +1126,12 @@ def main(args):
                             scaled_model_path=person_osim,
                             subject_mass=args.subject_mass,
                             subject_height=person_height_i,
+                            markerset=markerset,
                         )
                         if not scale_ok:
                             print(f"    WARNING: Scale Tool failed for person {ti+1} – running IK on unscaled model.")
                     else:
-                        print(f"    WARNING: model template not found at {_MODEL_TEMPLATE} — skipping scale for person {ti+1}")
+                        print(f"    WARNING: model template not found at {model_template} — skipping scale for person {ti+1}")
 
                     ik_person_mot = os.path.join(args.output_dir, f"{prefix}_person{ti+1:02d}_ik.mot")
                     ik_person_errors = os.path.join(args.output_dir, f"{prefix}_person{ti+1:02d}_ik_marker_errors.sto")
@@ -1023,6 +1141,7 @@ def main(args):
                         trc_path=trc_person_path,
                         mot_path=ik_person_mot,
                         errors_path=ik_person_errors,
+                        markerset=markerset,
                     )
                     per_person_ik_results.append({
                         'trc': trc_person_path,
@@ -1063,6 +1182,20 @@ def main(args):
                 f" → {combined_trc_path}"
             )
 
+        # ── Combined multi-person mesh GLB (all people in one scene) ─────
+        if not args.no_mesh_glb and len(per_person_verts_raw) >= 2:
+            valid_verts = [vl for vl in per_person_verts_raw
+                          if any(v is not None for v in vl)]
+            if len(valid_verts) >= 2:
+                combined_glb_path = os.path.join(
+                    args.output_dir, f"{prefix}_combined_mesh.glb"
+                )
+                print(f"\n    Writing combined mesh GLB ({len(valid_verts)} persons)"
+                      f" → {combined_glb_path}")
+                write_combined_mesh_glb(
+                    combined_glb_path, timestamps, valid_verts, estimator.faces,
+                )
+
     # ── Export OpenSim files ──────────────────────────────────────────────────
     print("\nExporting OpenSim files...")
 
@@ -1092,10 +1225,20 @@ def main(args):
     exporter.export(markers_array, marker_names, trc_path)
 
     # Scale the generic model to the subject's proportions, then run IK
-    if os.path.isfile(_MODEL_TEMPLATE):
-        shutil.copy(_MODEL_TEMPLATE, osim_path)
+    if os.path.isfile(model_template):
+        shutil.copy(model_template, osim_path)
         print(f"  Writing model     → {osim_path}")
         subject_mass = args.subject_mass
+
+        # Auto-detect the quietest window in the sequence for Scale Tool +
+        # MarkerPlacer. Using a static-pose window instead of the whole video
+        # avoids averaging over dynamic motion (squat, etc.) — JC distances
+        # are stable, MarkerPlacer sees a clean reference pose.
+        calib_ts = calib_te = None
+        if markerset == "flodelaplace" and getattr(args, "auto_static_calib", True):
+            calib_ts, calib_te, f_s, f_e = _detect_static_window(kpts_opensim, out_fps)
+            print(f"  [calib] quietest window: frames {f_s}-{f_e}  ({calib_ts:.2f}-{calib_te:.2f}s)")
+
         print(f"  Scaling model     → {osim_path}  (mass={subject_mass:.1f} kg, height={subject_height:.2f} m)")
         scale_ok = run_scale_tool(
             model_path=osim_path,
@@ -1103,11 +1246,15 @@ def main(args):
             scaled_model_path=osim_path,
             subject_mass=subject_mass,
             subject_height=subject_height,
+            markerset=markerset,
+            calibration_t_start=calib_ts,
+            calibration_t_end=calib_te,
+            marker_placer=getattr(args, "marker_placer", False),
         )
         if not scale_ok:
             print("  WARNING: Scale Tool failed – running IK on unscaled model.")
     else:
-        print(f"  WARNING: model template not found at {_MODEL_TEMPLATE}")
+        print(f"  WARNING: model template not found at {model_template}")
 
     frames_markers      = [markers_array[i] for i in range(N)]
     frames_markers_body = [markers_body[i]  for i in range(N)]
@@ -1118,9 +1265,40 @@ def main(args):
         trc_path=trc_path,
         mot_path=ik_mot_path,
         errors_path=errors_path,
+        markerset=markerset,
     )
     if not ik_ok:
         print("  WARNING: OpenSim IK failed or opensim env not found.")
+
+    # Per-marker IK error analysis — computes mean/max distance in mm between
+    # each TRC marker trajectory and the model's marker FK positions. Useful
+    # to spot bony landmarks that fit poorly (bad vertex pick or bad .osim
+    # local position).
+    if ik_ok and os.path.isfile(osim_path) and os.path.isfile(ik_mot_path):
+        errors_csv = os.path.join(args.output_dir, f"{prefix}_ik_per_marker_errors.csv")
+        print(f"  Computing per-marker IK errors → {errors_csv}")
+        err_summary = run_per_marker_error_analysis(
+            model_path=osim_path, mot_path=ik_mot_path,
+            trc_path=trc_path, out_csv=errors_csv,
+        )
+        if err_summary:
+            print(f"\n  Per-marker IK errors (top 15 worst by max, mm):")
+            print(f"  {'marker':20s} {'mean':>8s} {'max':>8s}   frames")
+            for row in err_summary[:15]:
+                print(f"  {row['marker']:20s} {row['mean_mm']:8.2f} {row['max_mm']:8.2f}   {row['n_frames']}")
+            # Global summary
+            n_total = len(err_summary)
+            mean_global = sum(r['mean_mm'] for r in err_summary) / max(n_total, 1)
+            max_global = max((r['max_mm'] for r in err_summary), default=0.0)
+            print(f"  {'':20s} {'----':>8s} {'----':>8s}")
+            print(f"  {f'ALL ({n_total} markers)':20s} {mean_global:8.2f} {max_global:8.2f}")
+
+    # Centre of mass analysis (requires successful IK + scaled model)
+    com_ok = False
+    if args.compute_com and ik_ok and os.path.isfile(osim_path) and os.path.isfile(ik_mot_path):
+        com_path = os.path.join(args.output_dir, f"{prefix}_com.sto")
+        print(f"  Computing COM     → {com_path}")
+        com_ok = run_com_analysis(osim_path, ik_mot_path, com_path)
 
     if not args.no_mesh_glb:
         print(f"  Writing mesh GLB  → {mesh_glb}")
@@ -1185,7 +1363,7 @@ OpenSim workflow:
   1. Load markers_output_<name>_model.osim in OpenSim
   2. Scale Tool → use TRC for static pose calibration
   3. IK Tool → load TRC → IK MOT is already written if opensim env found
-  4. GLB files can be previewed in Blender (File → Import → glTF 2.0).
+  4. GLB files can be previewed in Blender / any glTF viewer (File → Import → glTF 2.0).
 ─────────────────────────────────────────────────────────────────
 """)
 
@@ -1205,6 +1383,27 @@ if __name__ == "__main__":
     parser.add_argument("--inference_type", default="body", choices=["full", "body"],
                         help="'body' (default) skips hands for speed; "
                              "'full' adds hand markers for IK and GLB.")
+    parser.add_argument("--markerset", default="pose2sim",
+                        choices=["pose2sim", "flodelaplace"],
+                        help="Which marker set + model template to use. "
+                             "'pose2sim' (default) = original KeypointConverter "
+                             "+ pose2sim_wholebody_model.osim. "
+                             "'flodelaplace' = mocap-style markerset using the 64-marker "
+                             "assets/flodelaplace_mocap.osim, with bony landmarks derived "
+                             "from MHR mesh vertex picks + direct kpt/armature sources.")
+    parser.add_argument("--auto_static_calib", action="store_true", default=True,
+                        help="(flodelaplace only) Auto-detect the quietest window in the "
+                             "sequence and use it for Scale Tool + MarkerPlacer calibration "
+                             "instead of the whole video. Default: on.")
+    parser.add_argument("--no_auto_static_calib", action="store_false", dest="auto_static_calib",
+                        help="Disable auto-static-calib; use whole-video range for scaling.")
+    parser.add_argument("--marker_placer", action="store_true", default=False,
+                        help="Enable OpenSim MarkerPlacer: after segment scaling, adjusts "
+                             "each marker's local position on its body so it matches the "
+                             "TRC at the calibration window. Useful when .osim template "
+                             "positions don't match the subject's mesh-picked landmarks. "
+                             "Default OFF — diagnose raw placement errors first, then turn "
+                             "on to clean up IK residuals.")
     parser.add_argument("--target_fps", type=float, default=30,
                         help="Process at this FPS (0=all frames, default=30)")
     parser.add_argument("--max_frames", type=int, default=0,
@@ -1213,6 +1412,15 @@ if __name__ == "__main__":
                         help="Skip full body mesh GLB export (saves ~185 MB for long videos)")
     parser.add_argument("--no_lean_fix", action="store_true",
                         help="Skip automatic forward-lean correction")
+    parser.add_argument("--stationary", action="store_true",
+                        help="Disable global XZ translation — keeps the person centred at "
+                             "origin with feet fixed to the ground. Use for exercises where "
+                             "the subject does not walk (squat, CMJ, deadlift, etc.).")
+    parser.add_argument("--compute_com", action="store_true",
+                        help="Compute whole-body centre of mass (COM) trajectory from the "
+                             "scaled model and IK motion. Writes a _com.sto file with "
+                             "time, com_x, com_y, com_z in metres (OpenSim Y-up frame). "
+                             "Requires successful IK.")
     parser.add_argument("--floor_moge", action="store_true",
                         help="Estimate floor plane from MoGe depth on the first video frame and use its camera-pitch angle to correct forward lean. Requires MoGe to be available.")
     parser.add_argument("--person_height", type=float, default=None,

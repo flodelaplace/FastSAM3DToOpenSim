@@ -1,0 +1,30 @@
+{
+  "comment": "MHR skinned-mesh vertex indices for the Rajagopal2015 mocap markerset. MHR topology is deterministic (18439 verts), so these indices map to the same anatomical landmark across all subjects/frames.",
+  "source_video": "videos/Squat.MP4",
+  "source_frames": "avg of frames 0..9",
+  "picked_by": "tools/viz_rajagopal_markers.py",
+  "validated_by": "Florian, visual check in OpenSim GUI + plotly viz",
+  "vertex_indices": {
+    "RLFC": 16743,
+    "RMFC": 16790,
+    "LLFC": 11545,
+    "LMFC": 11594,
+    "RLMAL": 17393,
+    "RMMAL": 17407,
+    "LLMAL": 12222,
+    "LMMAL": 12236,
+    "RASI": 7696,
+    "LASI": 6531,
+    "RPSI": 7441,
+    "LPSI": 6328,
+    "RFAradius": 14101,
+    "RFAulna": 13955,
+    "LFAradius": 8924,
+    "LFAulna": 8781,
+    "RLEL": 13531,
+    "RMEL": 13512,
+    "LLEL": 8378,
+    "LMEL": 8327,
+    "C7": 5874
+  }
+}
