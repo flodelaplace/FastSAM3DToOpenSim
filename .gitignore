@@ -18,6 +18,30 @@ checkpoints/**/*.plan
 checkpoints/**/*_trt/
 
 /output
+output_*/
 output_opensim/
 output_video/
+outputs/
 videos/
+
+# IDE / editor
+.claude/
+.idea/
+.vscode/
+
+# Template backups + versioned snapshots (keep locally, don't commit)
+assets/*_backup.osim
+assets/flodelaplace_mocap_v*.osim
+
+# Generated viz / tool outputs
+tools/anatomical_landmarks.html
+tools/anatomical_landmarks.json
+tools/mhr_127_joints.csv
+tools/mhr_127_joints.html
+tools/mhr_vertices.csv
+tools/rajagopal_markers_viz.html
+tools/rajagopal_markers_viz.json
+
+# OpenSim logs + stray
+assets/opensim.log
+*.log

@@ -72,12 +72,16 @@ _SCALE_MEASUREMENTS_FLODELAPLACE = [
     ("pelvis_Z",    [("LASI", "RASI")],                                       ["pelvis", "sacrum"],                                                     "Z"),
     ("pelvis_X",    [("RASI", "RPSI"), ("LASI", "LPSI")],                     ["pelvis", "sacrum"],                                                     "X"),
     # Torso: Z (width) from acromions, Y (height) from ACR-ASI, X (AP depth)
-    # from CLAV (anterior) to C7 (posterior) — both on torso at ~ similar Y.
-    # Head is included in Y and X scaling so it grows proportionally (previously
-    # head only got the Z scale → looked crushed when Y/Z differed).
+    # from CLAV (anterior) to C7 (posterior). Head is scaled Z/X uniformly
+    # with torso (largeur épaules, profondeur clav-C7) mais reçoit SA PROPRE
+    # mesure Y via c_neck → HTOP. Avant, le head héritait du torso_Y, ce qui
+    # sous-dimensionnait systématiquement la tête pour les sujets dont les
+    # proportions tête/torse différaient de celles du template (observé :
+    # HTOP/Nose/Ears ~60 mm trop bas sur 5/5 sujets testés).
     ("torso_Z",     [("LACR", "RACR")],                                       ["torso", "head"],                                                        "Z"),
-    ("torso_Y",     [("RACR", "RASI"), ("LACR", "LASI")],                     ["torso", "lumbar1", "lumbar2", "lumbar3", "lumbar4", "lumbar5", "head"], "Y"),
+    ("torso_Y",     [("RACR", "RASI"), ("LACR", "LASI")],                     ["torso", "lumbar1", "lumbar2", "lumbar3", "lumbar4", "lumbar5"],         "Y"),
     ("torso_X",     [("RCLAV", "C7"), ("LCLAV", "C7")],                       ["torso", "head"],                                                        "X"),
+    ("head_Y",      [("c_neck", "HTOP")],                                     ["head"],                                                                 "Y"),
     # Right lower limb
     ("femur_r_Y",   [("RHJC", "RKJC")],                                       ["femur_r", "patella_r"],                                                 "Y"),
     ("femur_r_XZ",  [("RLFC", "RMFC")],                                       ["femur_r", "patella_r"],                                                 "X Z"),

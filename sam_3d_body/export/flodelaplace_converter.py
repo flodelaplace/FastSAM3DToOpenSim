@@ -65,8 +65,11 @@ _JCOORD127: dict[str, int] = {
     "c_spine3": 37,   # upper thoracic
     "c_neck":   110,  # cervical
     "c_head":   113,  # head joint
-    "RCLAV":    74,   # right clavicle (validated visually (Florian Delaplace))
-    "LCLAV":    38,   # left clavicle
+    # Swap : vérifié le 2026-04-24 après analyse d'offset sur 5 sujets —
+    # RCLAV/LCLAV étaient bien inversés (validation visuelle + offsets
+    # ±60 mm anti-symétriques systématiques sur 5 sujets).
+    "RCLAV":    38,   # right clavicle (jcoord 38)
+    "LCLAV":    74,   # left clavicle  (jcoord 74)
     "HTOP":     126,  # top of head (vertex of skull)
 }
 

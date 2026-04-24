@@ -881,9 +881,30 @@ def main(args):
             kpts_opensim, jcoords=jcoords_opensim, angle=lean_angle
         )
     elif not args.no_lean_fix:
-        lean_angle = transformer._estimate_lean_angle(kpts_opensim)
+        # Mode auto : si auto_static_calib est actif, on prend le milieu de
+        # la fenêtre la plus calme (même logique que pour le Scale Tool) →
+        # le sujet y est debout / stationnaire, donc le lean estimé est le
+        # vrai biais de posture et pas la moyenne "mouvement + debout"
+        # donnée par la médiane sur toutes les frames (qui sous-corrige
+        # la phase debout sur un squat, etc).
         src = " (after MoGe)" if moge_floor_angle is not None else ""
-        print(f"  [spine lean] estimated {lean_angle:+.2f}°{src} → correcting")
+        used_static_ref = False
+        if getattr(args, "auto_static_calib", True):
+            try:
+                _ts, _te, f_s, f_e = _detect_static_window(kpts_opensim, out_fps)
+                ref = (f_s + f_e) // 2
+                lean_angle = _lean_angle_over_range(kpts_opensim, ref)
+                print(f"  [spine lean] auto-ref frame {ref} "
+                      f"(milieu de la quietest window {f_s}-{f_e}): "
+                      f"measured {lean_angle:+.2f}°{src} → correcting")
+                used_static_ref = True
+            except Exception as err:
+                print(f"  [spine lean] _detect_static_window failed ({err}), "
+                      f"falling back to median estimator")
+        if not used_static_ref:
+            lean_angle = transformer._estimate_lean_angle(kpts_opensim)
+            print(f"  [spine lean] estimated {lean_angle:+.2f}°{src} "
+                  f"(median all frames) → correcting")
         kpts_opensim, jcoords_opensim = transformer.correct_forward_lean(
             kpts_opensim, jcoords=jcoords_opensim, angle=lean_angle
         )
@@ -1273,8 +1294,11 @@ def main(args):
     # Per-marker IK error analysis — computes mean/max distance in mm between
     # each TRC marker trajectory and the model's marker FK positions. Useful
     # to spot bony landmarks that fit poorly (bad vertex pick or bad .osim
-    # local position).
-    if ik_ok and os.path.isfile(osim_path) and os.path.isfile(ik_mot_path):
+    # local position). Debug-only opt-in: pass --ik_diagnostics locally when
+    # tuning markers; off by default since it roughly doubles the OpenSim
+    # step wall time.
+    if (ik_ok and args.ik_diagnostics
+            and os.path.isfile(osim_path) and os.path.isfile(ik_mot_path)):
         errors_csv = os.path.join(args.output_dir, f"{prefix}_ik_per_marker_errors.csv")
         print(f"  Computing per-marker IK errors → {errors_csv}")
         err_summary = run_per_marker_error_analysis(
@@ -1404,8 +1428,8 @@ if __name__ == "__main__":
                              "positions don't match the subject's mesh-picked landmarks. "
                              "Default OFF — diagnose raw placement errors first, then turn "
                              "on to clean up IK residuals.")
-    parser.add_argument("--target_fps", type=float, default=30,
-                        help="Process at this FPS (0=all frames, default=30)")
+    parser.add_argument("--target_fps", type=float, default=0,
+                        help="Process at this FPS (0=all frames, default=0 = no skipping)")
     parser.add_argument("--max_frames", type=int, default=0,
                         help="Stop after this many input frames (0=all)")
     parser.add_argument("--no_mesh_glb", action="store_true",
@@ -1421,6 +1445,12 @@ if __name__ == "__main__":
                              "scaled model and IK motion. Writes a _com.sto file with "
                              "time, com_x, com_y, com_z in metres (OpenSim Y-up frame). "
                              "Requires successful IK.")
+    parser.add_argument("--ik_diagnostics", action="store_true",
+                        help="Opt-in: run the per-marker IK error analysis (mean/max mm "
+                             "distance between each TRC marker and its model-FK position). "
+                             "This is a debug tool for catching bad vertex picks. Off by "
+                             "default because on CPU-only OpenSim it roughly doubles the IK "
+                             "step wall time. Pass this flag locally when tuning markers.")
     parser.add_argument("--floor_moge", action="store_true",
                         help="Estimate floor plane from MoGe depth on the first video frame and use its camera-pitch angle to correct forward lean. Requires MoGe to be available.")
     parser.add_argument("--person_height", type=float, default=None,

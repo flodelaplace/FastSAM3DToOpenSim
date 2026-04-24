@@ -231,7 +231,11 @@ SOURCES = {
     # cervical vertebra), so the ROI needs to reach through the muscle/skin
     # on the posterior side. Center shifted +3cm sup to raise the pick —
     # previous pick was ~4cm too low vs the .osim template position.
-    "C7":   ("vertex", ("jc", 110, "post", 0.10, [("sup", 0.025)], [("sup", 0.05)])),
+    # C7 : ajout d'un slab lat_R ±1.5cm pour forcer le pick sur la ligne
+    # médiane. Sans ça, le c_neck (jcoord 110) lui-même peut être un peu
+    # latéralisé et le vertex post-c_neck hérite du décalage (~30 mm
+    # systématique observé sur 5 sujets).
+    "C7":   ("vertex", ("jc", 110, "post", 0.10, [("sup", 0.025), ("lat_R", 0.015)], [("sup", 0.05)])),
 }
 
 

@@ -1,19 +1,25 @@
 # FastSAM3DToOpenSim — Docker image
-# Base: CUDA 12.4 (supports Ampere, Ada Lovelace, Hopper — G4dn/G5/G6/P4/P5)
-FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
+# Base: CUDA 12.4 runtime (supports Ampere, Ada Lovelace, Hopper — G4dn/G5/G6/P4/P5)
+# We use the `runtime` variant (not `devel`) because no source compilation is
+# needed — PyTorch ships its own CUDA libs via pip, and detectron2 (the only
+# thing that required nvcc at build-time) has been removed since the AWS
+# pipeline uses YOLO for detection, not ViTDet/detectron2.
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 # --------------------------------------------------------------------------- #
 # System packages                                                               #
 # --------------------------------------------------------------------------- #
 ENV DEBIAN_FRONTEND=noninteractive
+# gcc + python3-dev are required at RUNTIME (not just build) because Triton
+# (used by torch.compile) compiles CUDA kernel wrappers on the fly and needs a
+# C compiler + Python.h available inside the container.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         wget git curl ca-certificates unzip \
         ffmpeg \
         libgl1 libglib2.0-0 \
         libgomp1 libegl1 libxrender1 libxext6 \
         libsm6 libx11-6 \
-        blender \
-        build-essential cmake python3-dev libffi-dev libssl-dev pkg-config \
+        gcc python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # AWS CLI v2 (needed for S3 pull/push in run_job.sh)
@@ -70,13 +76,7 @@ COPY docker/requirements_docker.txt /tmp/requirements_docker.txt
 RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
         -r /tmp/requirements_docker.txt
 
-# Step 6: detectron2 (compiles from source, ~5-8 min)
-RUN CUDA_HOME=/usr/local/cuda CUDA_VISIBLE_DEVICES="" \
-    /opt/conda/envs/fast_sam_3d_body/bin/pip install \
-        --no-build-isolation --no-deps \
-        "git+https://github.com/facebookresearch/detectron2.git@a1ce2f956a1d2212ad672e3c47d53405c2fe4312"
-
-# Step 7: MoGe + utility git deps (~2 min)
+# Step 6: MoGe + utility git deps (~2 min)
 RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
         "git+https://github.com/microsoft/MoGe.git@07444410f1e33f402353b99d6ccd26bd31e469e8" \
         "git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6" \
