@@ -26,6 +26,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip && \
     unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install && rm -rf /tmp/aws /tmp/awscli.zip
 
+# s5cmd v2.2.2 (pinned) — sync S3 ~256 streams parallèles vs 10 pour
+# `aws s3 sync`. Utilisé en chemin rapide pour télécharger les ~498 fichiers
+# du backbone DINOv3 au cold start. run_job.sh garde un fallback automatique
+# vers `aws s3 sync` si s5cmd échoue, donc cet install est purement additif.
+RUN curl -fsSL "https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz" \
+    | tar xz -C /usr/local/bin/ s5cmd && chmod +x /usr/local/bin/s5cmd && \
+    /usr/local/bin/s5cmd version
+
 # --------------------------------------------------------------------------- #
 # Miniforge → /opt/conda                                                        #
 # --------------------------------------------------------------------------- #
@@ -51,7 +59,11 @@ ENV PIP_DEFAULT_TIMEOUT=120 \
     PIP_NO_CACHE_DIR=1
 
 # Step 1: Create env + base build tools (~30s)
-RUN conda create -y -n fast_sam_3d_body python=3.11 && \
+# NB: `pip` ajouté explicitement dans conda create — les versions récentes de
+# conda-forge python ne bundlent plus pip par défaut dans les nouveaux envs
+# (changé courant 2026), il faut le demander explicitement sinon le pip
+# install qui suit fait `No such file or directory: bin/pip`.
+RUN conda create -y -n fast_sam_3d_body python=3.11 pip && \
     /opt/conda/envs/fast_sam_3d_body/bin/pip install \
         numpy cython setuptools virtualenv
 

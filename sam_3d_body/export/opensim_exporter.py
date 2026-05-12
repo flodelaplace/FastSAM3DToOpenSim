@@ -887,6 +887,8 @@ def write_mesh_glb(
     geometry_dir: str | Path | None = None,
     kpts_opensim: List[np.ndarray | None] | None = None,
     jcoords_opensim: List[np.ndarray | None] | None = None,
+    ground_align: bool = False,
+    verts_in_world: bool = False,
 ) -> None:
     """Write animated full body mesh as GLB using morph targets.
 
@@ -943,8 +945,10 @@ def write_mesh_glb(
         for v in frames_verts:
             if v is not None and not np.any(np.isnan(v)):
                 verts_yup = v.copy().astype(np.float32)
-                verts_yup[:, 1] = -verts_yup[:, 1]   # Y-up
-                verts_yup[:, 0] = -verts_yup[:, 0]   # fix mirror (camera X = subject's left)
+                if not verts_in_world:
+                    # Camera frame in → flip pour avoir Y-up et X-mirror
+                    verts_yup[:, 1] = -verts_yup[:, 1]   # Y-up
+                    verts_yup[:, 0] = -verts_yup[:, 0]   # fix mirror (camera X = subject's left)
                 last_good = verts_yup
             filled.append(last_good.copy() if last_good is not None else None)
 
@@ -974,8 +978,9 @@ def write_mesh_glb(
         for i, (k, ct) in enumerate(zip(frames_kpts, frames_cam_t)):
             if k is not None and ct is not None and not np.any(np.isnan(k)):
                 w = (k + ct[None, :]).astype(np.float32)
-                w[:, 1] = -w[:, 1]   # Y-up
-                w[:, 0] = -w[:, 0]   # fix mirror
+                if not verts_in_world:
+                    w[:, 1] = -w[:, 1]   # Y-up
+                    w[:, 0] = -w[:, 0]   # fix mirror
                 last_kpts = w
             kpts_world[i] = last_kpts.copy() if last_kpts is not None else None
 
@@ -993,8 +998,9 @@ def write_mesh_glb(
         for i, (jc, ct) in enumerate(zip(frames_joint_coords, frames_cam_t)):
             if jc is not None and ct is not None and not np.any(np.isnan(jc)):
                 w = (jc + ct[None, :]).astype(np.float32)
-                w[:, 1] = -w[:, 1]   # Y-up
-                w[:, 0] = -w[:, 0]   # fix mirror
+                if not verts_in_world:
+                    w[:, 1] = -w[:, 1]   # Y-up
+                    w[:, 0] = -w[:, 0]   # fix mirror
                 last_jc = w
             jcoords_world[i] = last_jc.copy() if last_jc is not None else None
 
@@ -1002,6 +1008,25 @@ def write_mesh_glb(
     # OpenSim outputs (mesh moves through the world, like in the source video).
     # If you ever want a centered/in-place mesh again, subtract the per-frame
     # pelvis from filled / kpts_world / jcoords_world here.
+
+    # Ground alignment (optional) : shift all per-frame data so the lowest
+    # mesh vertex Y across the entire animation lands at Y=0 (floor). Useful
+    # for visualizers that expect a Y=0 floor plane. Applied AFTER the Y-flip /
+    # X-flip so it operates in the writer's already-Y-up convention.
+    if ground_align:
+        ys = [f[:, 1].min() for f in filled if f is not None]
+        if ys:
+            floor_y = float(min(ys))
+            for f in filled:
+                if f is not None:
+                    f[:, 1] -= floor_y
+            for kw in kpts_world:
+                if kw is not None:
+                    kw[:, 1] -= floor_y
+            for jw in jcoords_world:
+                if jw is not None:
+                    jw[:, 1] -= floor_y
+            print(f"  [write_mesh_glb] ground_align: shifted Y -= {floor_y:.3f} m")
 
     # ── Smooth mesh vertices + keypoints (Butterworth 6 Hz, same as PostProcessor) ──
     _fps_est = float(N_frames - 1) / max(float(timestamps[-1] - timestamps[0]), 1e-3)

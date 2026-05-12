@@ -848,18 +848,20 @@ def main(args):
     #    c_head (jcoords[113]) as the exact top reference — no magic constants.
     #    Global XZ trajectory comes from cam_t (only XZ is applied, not Y).
     transformer = CoordinateTransformer(subject_height=subject_height)
+    # `--floor` flag : si présent, active la mise au sol (per-frame) et le
+    # redressement (one-shot floor lean correction). Si absent, le sujet reste
+    # dans sa position 3D réelle (utile pour rameur, couché, suspension, etc.).
+    _apply_floor = args.floor
     kpts_opensim, jcoords_opensim = transformer.transform(
         kpts_processed,
         jcoords_3d=jcoords_processed,
         camera_translation=cam_t_processed,
         center_pelvis=True,
-        align_to_ground=True,
+        align_to_ground=_apply_floor,
         apply_global_translation=not args.stationary,
-        # When MoGe floor angle is provided, pass it to the transformer so
-        # that floor rotation is applied using camera-pitch from MoGe. Also
-        # the transformer can optionally skip the spine-based lean correction
-        # when MoGe is active to avoid overcorrection.
-        correct_floor_lean=not args.no_lean_fix,
+        # correct_floor_lean : only effective when align_to_ground=True (cf.
+        # transform()). On garde la même gate `_apply_floor` pour les 2.
+        correct_floor_lean=_apply_floor and not args.no_lean_fix,
         floor_angle=moge_floor_angle,
     )
 
@@ -1326,13 +1328,64 @@ def main(args):
 
     if not args.no_mesh_glb:
         print(f"  Writing mesh GLB  → {mesh_glb}")
-        # Mesh GLB: body mesh + keypoint markers + bone sticks (camera-world frame).
-        # Anatomical bones are in a separate GLB (see below) because they live in
-        # OpenSim/TRC frame which differs in scale and proportions from the mesh.
-        write_mesh_glb(mesh_glb, timestamps, all_verts, estimator.faces,
-                       frames_kpts=all_kpts_raw, frames_cam_t=all_cam_t,
-                       frames_joint_coords=all_joint_coords,
-                       body_only=body_only)
+        # Propage la pipeline OpenSim complète (rotation axes + scale + pelvis
+        # centering + floor lean correction + ground alignment) aux mesh verts
+        # via transformer.apply_pipeline_to_verts(). Le transformer a déjà
+        # tourné cette pipeline pour les keypoints (ligne 851), on rejoue les
+        # mêmes opérations en utilisant l'état caché pour que le mesh soit
+        # au même repère world que l'anatomical GLB.
+        # Pour la COHÉRENCE intra-GLB (mesh skin + segments/sphères MHR dessinés
+        # dedans), on utilise le MÊME ground_offset_mode ET le MÊME offset
+        # numérique pour les 3 inputs.
+        #   --floor=True  → constant_from_calib : 1 shift Y unique calculé
+        #                   depuis les kpts (référence biomécanique = feet
+        #                   markers MHR), réutilisé pour mesh + segments.
+        #                   Garantit zéro décalage entre eux.
+        #   --floor=False → none : pas de shift Y, position 3D réelle préservée.
+        # NB : le pipeline TRC/IK/anatomical utilise toujours `align_to_ground`
+        # per_frame de transform() — inchangé.
+        _glb_ground_mode = "constant_from_calib" if _apply_floor else "none"
+        _shared_offset_m = None
+        if _apply_floor:
+            # 1er pass kpts SANS ground_offset pour récupérer leurs positions
+            # post-rotation/scale/centering/lean. Le min Y sur les premières
+            # frames = offset à appliquer à tout (mesh + segments du mesh.glb).
+            _kpts_no_offset = transformer.apply_pipeline_to_verts(
+                [(k + ct[None, :]) if (k is not None and ct is not None) else None
+                 for k, ct in zip(all_kpts_raw, all_cam_t)],
+                output_units="m",
+                ground_offset_mode="none")
+            _calib_ys = [w[:, 1].min() for w in _kpts_no_offset[:20] if w is not None]
+            if _calib_ys:
+                _shared_offset_m = float(min(_calib_ys))
+                print(f"  Mesh GLB: shared calib offset Y -= {_shared_offset_m:.3f} m "
+                      f"(from kpts on {len(_calib_ys)} calib frames)")
+        verts_world = transformer.apply_pipeline_to_verts(
+            all_verts, output_units="m",
+            ground_offset_mode=_glb_ground_mode,
+            override_constant_offset_m=_shared_offset_m)
+        kpts_world = transformer.apply_pipeline_to_verts(
+            [(k + ct[None, :]) if (k is not None and ct is not None) else None
+             for k, ct in zip(all_kpts_raw, all_cam_t)],
+            output_units="m",
+            ground_offset_mode=_glb_ground_mode,
+            override_constant_offset_m=_shared_offset_m)
+        jc_world = transformer.apply_pipeline_to_verts(
+            [(j + ct[None, :]) if (j is not None and ct is not None) else None
+             for j, ct in zip(all_joint_coords, all_cam_t)],
+            output_units="m",
+            ground_offset_mode=_glb_ground_mode,
+            override_constant_offset_m=_shared_offset_m)
+        # Le writer attend des verts en frame caméra (il fait son X/Y flip).
+        # Nos verts sont DÉJÀ en world OpenSim → on signale verts_in_world=True
+        # pour que le writer skip son flip et ne touche pas notre repère.
+        write_mesh_glb(mesh_glb, timestamps, verts_world, estimator.faces,
+                       frames_kpts=kpts_world,
+                       frames_cam_t=[np.zeros(3, dtype=np.float32) if ct is not None else None
+                                     for ct in all_cam_t],
+                       frames_joint_coords=jc_world,
+                       body_only=body_only,
+                       verts_in_world=True)
 
         # Separate anatomical-bone GLB (in OpenSim frame, animated by IK .mot)
         if ik_ok and os.path.isfile(osim_path) and os.path.isfile(ik_mot_path):
@@ -1340,6 +1393,23 @@ def main(args):
             print(f"  Writing anatomical GLB → {anat_glb}")
             from sam_3d_body.export.opensim_exporter import write_anatomical_glb
             write_anatomical_glb(anat_glb, osim_path, ik_mot_path)
+
+            # Derived clinical angles : ajoute 11 colonnes au .mot
+            # (knee_valgus, knee_rotation, ankle_rotation, foot_progression
+            # × R/L + trunk_flexion/lean_lateral/rotation). Réutilise le
+            # body_transforms.json déjà calculé pour l'anatomical GLB —
+            # négligeable en coût supplémentaire (juste de la géométrie).
+            from sam_3d_body.export.clinical_angles import add_clinical_angles_to_mot
+            body_tf_json = os.path.join(
+                args.output_dir,
+                f"{os.path.splitext(os.path.basename(osim_path))[0]}_body_transforms.json",
+            )
+            try:
+                n_added = add_clinical_angles_to_mot(ik_mot_path, body_tf_json)
+                if n_added:
+                    print(f"  Clinical angles    → {n_added} colonnes ajoutées au .mot")
+            except Exception as err:
+                print(f"  [clinical_angles] failed silently: {err}")
         # gltfpack disabled: incompatible with viewer (KHR_mesh_quantization breaks morph targets)
         # _compress_glb(mesh_glb)
 
@@ -1467,6 +1537,15 @@ if __name__ == "__main__":
                              "does not affect kinematics.")
     parser.add_argument("--floor_level", action="store_true",
                         help="(Legacy flag) Per-frame ground alignment is always applied.")
+    parser.add_argument("--floor", action="store_true",
+                        help="Active le pipeline 'mise au sol + redressement' : kpts/jcoords "
+                             "passent par align_to_ground (per-frame, pieds à Y=0) + "
+                             "correct_floor_lean (one-shot, redressement caméra). Mesh GLB "
+                             "shift Y unique calculé sur les premières frames (calib). "
+                             "À utiliser pour les mouvements debout (squat, marche). À OMETTRE "
+                             "pour les mouvements non-standing (rameur, couché, suspension) "
+                             "→ le mesh et squelette restent dans leur position 3D réelle "
+                             "sans forcing au sol.")
     parser.add_argument("--fx", type=float, default=None,
                         help="Focal length x (pixels). Skips MoGe FOV estimation if set.")
     parser.add_argument("--fy", type=float, default=None)

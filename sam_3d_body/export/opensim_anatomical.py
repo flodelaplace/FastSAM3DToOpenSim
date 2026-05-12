@@ -106,11 +106,14 @@ def load_geometry_meshes(
     missing: list[str] = []
 
     # Individual vertebrae meshes (cerv*, thoracic*_s) have vertex positions
-    # designed for per-vertebra body frames, not the consolidated torso body.
-    # When a composite mesh (hat_ribs_scap / hat_spine) is present on the same
-    # body, it provides the correct combined visualization — skip all individual
-    # vertebrae.  This matches OpenSim GUI / Pose2Sim_Blender behaviour where
-    # the composite mesh covers the mispositioned vertebrae.
+    # designed for PER-VERTEBRA body frames, not the consolidated torso body.
+    # Quand toutes les vertèbres sont attachées au même body (torso) sans
+    # chaîne d'offsets, les meshes s'empilent à l'origine du body (= base
+    # lombaire dans flodelaplace_mocap.osim). Donc dès qu'un composite mesh
+    # est présent (hat_ribs_scap ou hat_spine), on skip TOUTES les cerv*+
+    # thoracic* — quitte à avoir un trou visuel entre haut du composite et
+    # le crâne (cervicales non couvertes par hat_ribs_scap). Mieux qu'un amas
+    # de meshes à la mauvaise position.
     _VERTEBRA_PREFIXES = ("cerv", "thoracic")
 
     for body_name, body_data in bodies.items():

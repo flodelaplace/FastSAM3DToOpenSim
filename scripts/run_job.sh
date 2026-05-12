@@ -38,9 +38,26 @@ echo "  Extra args:    ${EXTRA_ARGS:-<none>}"
 echo "  Trim:          ${TRIM_START:-0}s -> ${TRIM_END:-<end>}"
 
 # ---- Sync checkpoints from S3 -----------------------------------------------
+# Chemin rapide : s5cmd (~256 streams parallèles, 5-10× plus rapide qu'aws
+# s3 sync sur le bundle DINOv3 ~498 petits fichiers). Si s5cmd absent ou
+# échoue (auth, glob, S3 hiccup), fallback automatique sur `aws s3 sync` —
+# aucun chemin de régression possible : ce qui marchait avant marche encore.
 echo ">>> Syncing checkpoints from S3..."
 mkdir -p /app/checkpoints
-aws s3 sync "$CHECKPOINTS_S3_URI" /app/checkpoints/ --no-progress
+SYNC_OK=0
+SYNC_START=$(date +%s)
+if command -v s5cmd >/dev/null 2>&1; then
+    if s5cmd sync "${CHECKPOINTS_S3_URI%/}/*" /app/checkpoints/; then
+        SYNC_OK=1
+        echo ">>> Sync checkpoints OK via s5cmd ($(( $(date +%s) - SYNC_START )) s)"
+    else
+        echo ">>> WARN: s5cmd sync a échoué (exit $?), fallback aws s3 sync"
+    fi
+fi
+if [ "$SYNC_OK" = "0" ]; then
+    aws s3 sync "$CHECKPOINTS_S3_URI" /app/checkpoints/ --no-progress
+    echo ">>> Sync checkpoints OK via aws s3 sync ($(( $(date +%s) - SYNC_START )) s)"
+fi
 
 # ---- Pull video from S3 -----------------------------------------------------
 echo ">>> Downloading video from S3..."

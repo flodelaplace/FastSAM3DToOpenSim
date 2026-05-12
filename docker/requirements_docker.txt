@@ -21,6 +21,10 @@ tqdm
 pyzmq
 pygltflib==1.16.5
 trimesh
+# vtk : nécessaire pour lire les .vtp (Pose2Sim Geometry/) dans
+# sam_3d_body/export/opensim_anatomical.py:_load_vtp. Sans ça, les meshes
+# anatomiques ne se chargent pas et l'anatomical.glb sort vide.
+vtk
 braceexpand
 termcolor
 onnx

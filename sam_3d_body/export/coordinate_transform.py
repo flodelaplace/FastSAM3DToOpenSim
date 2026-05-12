@@ -92,22 +92,31 @@ class CoordinateTransformer:
             jc = jc * scale
 
         # 3. Global translation / pelvis centering
+        # NB: on capture les deltas (xz_deltas ou shift) en mètres pour pouvoir
+        # rejouer le même décalage sur d'autres arrays (mesh verts) via
+        # apply_pipeline_to_verts() — utile pour aligner le mesh GLB avec
+        # l'anatomical GLB qui passe par la même pipeline kpts.
+        self._last_xz_deltas_m = None
+        self._last_pelvis_shifts_m = None
         if apply_global_translation and camera_translation is not None:
             kpts, xz_deltas = self._apply_global_translation(kpts, camera_translation, scale)
             if jc is not None:
                 jc[:, :, 0] += xz_deltas[:, 0:1]
                 jc[:, :, 2] += xz_deltas[:, 2:3]
+            self._last_xz_deltas_m = xz_deltas.copy()  # (N, 3) in meters
         elif center_pelvis:
             shift = self._pelvis_shifts(kpts)      # (N, 3) with Y=0
             kpts = kpts - shift[:, None, :]
             if jc is not None:
                 jc = jc - shift[:, None, :]
             self._last_pelvis_shifts = shift * self.scale_factor  # saved in output units (mm)
+            self._last_pelvis_shifts_m = shift.copy()  # (N, 3) in meters
 
         # 3b. Floor-plane lean correction — must run BEFORE per-frame align_to_ground,
         #     which destroys the global floor-tilt signal by independently shifting
         #     every frame.  Fit a line to stance-foot positions across all frames;
         #     the slope reveals the camera pitch → rotate the skeleton to level the floor.
+        self._last_floor_angle_deg = None
         if align_to_ground and correct_floor_lean:
             if floor_angle is not None:
                 _angle = floor_angle
@@ -118,17 +127,142 @@ class CoordinateTransformer:
             if abs(_angle) > 0.5:
                 print(f"  [floor lean] {_src} floor tilt {_angle:+.2f}° → correcting")
                 kpts, jc = self._rotate_around_pelvis_z(kpts, jc, _angle)
+                self._last_floor_angle_deg = _angle
 
         # 4. Align feet to Y=0 each frame
+        self._last_ground_offsets_m = None
         if align_to_ground:
             kpts, ground_offsets = self._align_to_ground(kpts, return_offsets=True)
             if jc is not None:
                 jc[:, :, 1] -= ground_offsets[:, None]
+            self._last_ground_offsets_m = ground_offsets.copy()  # (N,) in meters
 
         # 5. Unit conversion (m → mm if requested)
         kpts = kpts * self.scale_factor
         if jc is not None:
             jc = jc * self.scale_factor
+
+        if single_frame:
+            kpts = kpts[0]
+            if jc is not None:
+                jc = jc[0]
+
+        return (kpts, jc) if jcoords_3d is not None else kpts
+
+    def apply_pipeline_to_verts(
+        self,
+        verts_per_frame: list,
+        output_units: str = "m",
+        ground_offset_mode: str = "per_frame",
+        calib_window_frames: int = 20,
+        override_constant_offset_m: float | None = None,
+    ) -> list:
+        """Rejoue le pipeline transform() sur des points 3D arbitraires
+        (typiquement des vertices de mesh) en utilisant l'état capturé par
+        le dernier appel à transform(). Permet d'aligner le mesh GLB sur le
+        même repère world OpenSim que les keypoints / anatomical GLB.
+
+        Args:
+            verts_per_frame : liste de N arrays (M_i, 3) ou None.
+                              Points en CAMERA-WORLD frame (mesh_local + cam_t).
+            output_units : "m" ou "mm".
+            ground_offset_mode :
+                "per_frame"          → applique ground_offsets[i] par frame (comme kpts).
+                                        Inconvénient pour le mesh : les vertices peuvent
+                                        descendre SOUS Y=0 si le mesh's lowest est sous
+                                        les kpts feet markers.
+                "constant_from_calib" → calcule UN shift Y unique depuis le mesh lui-même
+                                        sur les `calib_window_frames` premières frames
+                                        (fenêtre standing), puis l'applique constant.
+                                        Plus naturel : le mesh est au sol debout, et
+                                        flotte normalement quand les pieds montent.
+                "none"                → pas de ground alignment (utile pour debug).
+            calib_window_frames : nb de frames pour calculer l'offset constant.
+
+        Returns:
+            Liste de N arrays (M_i, 3) ou None, dans le frame OpenSim world.
+
+        Note: l'appel à transform() doit avoir été fait juste avant pour
+        que l'état soit cohérent. La méthode est read-only (ne modifie
+        pas l'état du transformer).
+        """
+        if self._last_scale is None:
+            raise RuntimeError(
+                "Call transform() first to populate transformation state.")
+
+        out_scale = 1000.0 if output_units == "mm" else 1.0
+
+        # Étapes 1-4 (rotation, scale, XZ shifts, floor lean) — appliquées
+        # per-frame comme pour les keypoints.
+        pre_ground: list = []
+        for i, v in enumerate(verts_per_frame):
+            if v is None:
+                pre_ground.append(None)
+                continue
+            w = np.asarray(v, dtype=np.float64).copy()
+            w = w @ self.CAMERA_TO_OPENSIM.T
+            w = w * self._last_scale
+            if self._last_xz_deltas_m is not None and i < len(self._last_xz_deltas_m):
+                d = self._last_xz_deltas_m[i]
+                w[:, 0] += d[0]
+                w[:, 2] += d[2]
+            elif self._last_pelvis_shifts_m is not None and i < len(self._last_pelvis_shifts_m):
+                shift = self._last_pelvis_shifts_m[i]
+                w -= shift[None, :]
+            if (self._last_floor_angle_deg is not None
+                    and abs(self._last_floor_angle_deg) > 0.5
+                    and hasattr(self, "_last_floor_pivots_m")
+                    and i < len(self._last_floor_pivots_m)):
+                theta = np.radians(self._last_floor_angle_deg)
+                c, s = np.cos(theta), np.sin(theta)
+                Rz = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+                pivot = self._last_floor_pivots_m[i]
+                w = (w - pivot) @ Rz + pivot
+            pre_ground.append(w)
+
+        # Étape 5 — Ground alignment (mode-dependent)
+        if ground_offset_mode == "per_frame":
+            # Réutilise les offsets calculés sur kpts. Souci possible : si le
+            # mesh a des vertices plus bas que les feet markers (toes, heels),
+            # le mesh descendra sous Y=0.
+            for i, w in enumerate(pre_ground):
+                if w is None or self._last_ground_offsets_m is None:
+                    continue
+                if i < len(self._last_ground_offsets_m):
+                    w[:, 1] -= self._last_ground_offsets_m[i]
+        elif ground_offset_mode == "constant_from_calib":
+            # Si override_constant_offset_m est fourni → on l'applique tel quel
+            # (utilisé pour partager le MÊME offset entre plusieurs arrays
+            # mesh/kpts/jcoords afin qu'ils restent alignés entre eux dans le
+            # GLB final). Sinon, on calcule l'offset depuis les premières
+            # frames de l'array passé (calib window standing typique).
+            if override_constant_offset_m is not None:
+                constant_offset = float(override_constant_offset_m)
+            else:
+                calib_ys = []
+                for i, w in enumerate(pre_ground[:calib_window_frames]):
+                    if w is not None:
+                        calib_ys.append(float(w[:, 1].min()))
+                if not calib_ys:
+                    constant_offset = 0.0
+                else:
+                    constant_offset = float(min(calib_ys))
+                    print(f"  [apply_pipeline_to_verts] constant_from_calib: "
+                          f"Y -= {constant_offset:.3f} m (calib over "
+                          f"{len(calib_ys)} frames)")
+            for w in pre_ground:
+                if w is not None:
+                    w[:, 1] -= constant_offset
+        # ground_offset_mode == "none" : pas de shift Y
+
+        # Étape 6 — Unit conversion + float32
+        out: list = []
+        for w in pre_ground:
+            if w is None:
+                out.append(None)
+            else:
+                out.append((w * out_scale).astype(np.float32))
+        return out
 
         if single_frame:
             kpts = kpts[0]
@@ -502,11 +636,16 @@ class CoordinateTransformer:
         theta = np.radians(angle_deg)
         c, s = np.cos(theta), np.sin(theta)
         Rz = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
+        pivots = np.zeros((kpts.shape[0], 3), dtype=np.float64)
         for i in range(kpts.shape[0]):
             pelvis = (kpts[i, 9] + kpts[i, 10]) / 2
+            pivots[i] = pelvis
             kpts[i] = (kpts[i] - pelvis) @ Rz + pelvis
             if jc is not None:
                 jc[i] = (jc[i] - pelvis) @ Rz + pelvis
+        # Capture pivots so apply_pipeline_to_verts() peut refaire la même
+        # rotation autour du même axe pour des arrays externes (mesh verts).
+        self._last_floor_pivots_m = pivots
         return kpts, jc
 
     def _apply_global_translation(self, keypoints, camera_translation, scale):

@@ -14,6 +14,10 @@ Tokens:
     e<sec>               trim end   in seconds (integer, default video end)
     st                   --stationary
     com                  --compute_com
+    floor                --floor  (mise au sol + redressement caméra : à utiliser
+                         pour mouvements debout type squat/marche. Omettre pour
+                         rameur, couché, suspension, etc. où le sujet ne doit
+                         pas être forcé au sol.)
 
 Examples:
     squat_jean__h185.mp4              single, full video
@@ -42,7 +46,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 HEIGHT_RE = re.compile(r"^h(\d{2,3}(?:-\d{2,3})*)$")
 START_RE = re.compile(r"^s(\d+)$")
 END_RE = re.compile(r"^e(\d+)$")
-FLAG_TOKENS = {"st", "com"}
+FLAG_TOKENS = {"st", "com", "floor"}
 
 _SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
@@ -84,6 +88,7 @@ def parse_filename(basename):
     trim_end = None
     stationary = False
     compute_com = False
+    floor = False
 
     for t in tokens:
         m = HEIGHT_RE.match(t)
@@ -110,6 +115,9 @@ def parse_filename(basename):
         if t == "com":
             compute_com = True
             continue
+        if t == "floor":
+            floor = True
+            continue
         raise FilenameParseError(f"Unknown token: '{t}'")
 
     if heights is None:
@@ -133,6 +141,8 @@ def parse_filename(basename):
         extra.append("--stationary")
     if compute_com:
         extra.append("--compute_com")
+    if floor:
+        extra.append("--floor")
 
     return {
         "raw_name": raw_name,
