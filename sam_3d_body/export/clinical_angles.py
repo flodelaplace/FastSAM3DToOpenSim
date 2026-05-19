@@ -51,7 +51,47 @@ _REQUIRED_BODIES = (
     "pelvis", "torso",
     "femur_r", "tibia_r", "calcn_r",
     "femur_l", "tibia_l", "calcn_l",
+    "humerus_r", "humerus_l",  # pour shoulders_tilt
 )
+
+
+# ---- Cross-modal naming ---------------------------------------------------- #
+#
+# Pour permettre le suivi longitudinal cohérent entre SAM3D (3D) et gonio2D
+# (2D Sports2D), on alias les colonnes natives OpenSim sous des noms unifiés
+# qui matchent ceux que produira gonio2D après auto-détection du plan caméra.
+# Cf. docs/CROSS_MODAL_ANGLES.md pour la liste complète.
+#
+# Convention : `*_flexion` (sagittal), `*_abduction` (frontal), `*_inversion`
+# (frontal pied), `*_deviation` (frontal poignet). Positif = direction nommée.
+#
+# Pour l'abduction épaule/hanche : OpenSim Rajagopal sort `*_adduction` avec
+# positif = adduction (membre vers la ligne médiane). On négie pour obtenir
+# l'abduction (positif = membre s'écarte du corps).
+
+_UNIFIED_ALIASES: dict[str, tuple[str, float]] = {
+    # nom unifié                : (colonne native dans le .mot, multiplicateur)
+    "right_arm_flexion":          ("arm_flex_r",       1.0),
+    "left_arm_flexion":           ("arm_flex_l",       1.0),
+    "right_arm_abduction":        ("arm_add_r",       -1.0),  # -adduction = abduction
+    "left_arm_abduction":         ("arm_add_l",       -1.0),
+    "right_hip_flexion":          ("hip_flexion_r",    1.0),
+    "left_hip_flexion":           ("hip_flexion_l",    1.0),
+    "right_hip_abduction":        ("hip_adduction_r", -1.0),
+    "left_hip_abduction":         ("hip_adduction_l", -1.0),
+    "right_knee_flexion":         ("knee_angle_r",     1.0),
+    "left_knee_flexion":          ("knee_angle_l",     1.0),
+    "right_ankle_dorsiflexion":   ("ankle_angle_r",    1.0),
+    "left_ankle_dorsiflexion":    ("ankle_angle_l",    1.0),
+    "right_ankle_inversion":      ("subtalar_angle_r", 1.0),
+    "left_ankle_inversion":       ("subtalar_angle_l", 1.0),
+    "right_elbow_flexion":        ("elbow_flex_r",     1.0),
+    "left_elbow_flexion":         ("elbow_flex_l",     1.0),
+    "right_wrist_flexion":        ("wrist_flex_r",     1.0),
+    "left_wrist_flexion":         ("wrist_flex_l",     1.0),
+    "right_wrist_deviation":      ("wrist_dev_r",      1.0),
+    "left_wrist_deviation":       ("wrist_dev_l",      1.0),
+}
 
 
 def _normalize(v: np.ndarray) -> np.ndarray:
@@ -192,6 +232,27 @@ def _trunk_lean_lateral(pelvis_R: np.ndarray, torso_R: np.ndarray) -> float:
     return _signed_angle(world_Y_f, torso_Y_f, -pelvis_X)
 
 
+def _shoulders_tilt(pelvis_R: np.ndarray,
+                    shoulder_r_pos: np.ndarray,
+                    shoulder_l_pos: np.ndarray) -> float:
+    """Inclinaison de la ligne entre les 2 épaules vs l'horizontal du sujet
+    (axe latéral du pelvis), projetée sur le plan frontal du pelvis.
+    Positive = épaule droite plus haute que l'épaule gauche (= asymétrie
+    posturale type compensation cervicale, scoliose, douleur unilatérale).
+
+    Disponibilité : TOUJOURS calculable en SAM3D (3D body transforms),
+    contrairement à la 2D où ça nécessite une vue frontale."""
+    pelvis_X = pelvis_R[:, 0]  # anterior
+    pelvis_Z = pelvis_R[:, 2]  # lateral (right)
+    # Vecteur de l'épaule gauche vers l'épaule droite
+    vec = shoulder_r_pos - shoulder_l_pos
+    # Projection sur plan frontal du sujet (perpendiculaire à pelvis_X)
+    vec_frontal = _project_on_plane(vec, pelvis_X)
+    # Signed angle entre pelvis_Z (= horizontal right) et la ligne épaules,
+    # autour de -pelvis_X (right-hand rule donne "positif = R shoulder up").
+    return _signed_angle(pelvis_Z, vec_frontal, -pelvis_X)
+
+
 def _trunk_rotation(pelvis_R: np.ndarray, torso_R: np.ndarray) -> float:
     """Axial rotation tronc vs pelvis dans plan transverse (perpendiculaire
     à pelvis_Y = up). Positive = torso rotated to the right vs pelvis."""
@@ -248,27 +309,33 @@ def compute_clinical_angles(body_transforms_path: str | Path) -> dict[str, np.nd
         R_by_body[bn] = wts_np[:, :3, :3]
         pos_by_body[bn] = wts_np[:, :3, 3]
 
+    # Noms unifiés (convention cross-modale avec gonio2D, cf.
+    # docs/CROSS_MODAL_ANGLES.md). Pour les angles qui n'ont pas
+    # d'équivalent gonio2D (knee_rotation, ankle_rotation, foot_progression,
+    # trunk_rotation), on garde le nom historique.
     col_names = [
-        "knee_valgus_r", "knee_valgus_l",
-        "knee_rotation_r", "knee_rotation_l",
-        "ankle_rotation_r", "ankle_rotation_l",
-        "foot_progression_r", "foot_progression_l",
-        "trunk_flexion", "trunk_lean_lateral", "trunk_rotation",
+        "right_knee_valgus", "left_knee_valgus",        # renommés (= unifiés)
+        "knee_rotation_r", "knee_rotation_l",           # transverse plane, gardé
+        "ankle_rotation_r", "ankle_rotation_l",         # transverse plane, gardé
+        "foot_progression_r", "foot_progression_l",     # transverse plane, gardé
+        "trunk_flexion",                                # déjà unifié
+        "trunk_lateral_lean",                           # renommé (cohérence gonio2D)
+        "trunk_rotation",                               # transverse plane, gardé
+        "shoulders_tilt",                               # NOUVEAU
     ]
     cols: dict[str, list[float]] = {n: [] for n in col_names}
 
     for f in range(n_frames):
         pelvis_R = R_by_body["pelvis"][f]
         torso_R = R_by_body["torso"][f]
-        pelvis_X = pelvis_R[:, 0]  # anterior direction in world
         for side in ("r", "l"):
             femur_R = R_by_body[f"femur_{side}"][f]
             tibia_R = R_by_body[f"tibia_{side}"][f]
             foot_R = R_by_body[f"calcn_{side}"][f]
-            hip_p = pos_by_body[f"femur_{side}"][f]
             knee_p = pos_by_body[f"tibia_{side}"][f]
             ankle_p = pos_by_body[f"calcn_{side}"][f]
-            cols[f"knee_valgus_{side}"].append(
+            unified_side = "right" if side == "r" else "left"
+            cols[f"{unified_side}_knee_valgus"].append(
                 _knee_valgus(femur_R, tibia_R, side))
             cols[f"knee_rotation_{side}"].append(
                 _knee_rotation(femur_R, tibia_R, side))
@@ -277,10 +344,63 @@ def compute_clinical_angles(body_transforms_path: str | Path) -> dict[str, np.nd
             cols[f"foot_progression_{side}"].append(
                 _foot_progression(pelvis_R, foot_R, side))
         cols["trunk_flexion"].append(_trunk_flexion(pelvis_R, torso_R))
-        cols["trunk_lean_lateral"].append(_trunk_lean_lateral(pelvis_R, torso_R))
+        cols["trunk_lateral_lean"].append(_trunk_lean_lateral(pelvis_R, torso_R))
         cols["trunk_rotation"].append(_trunk_rotation(pelvis_R, torso_R))
+        # shoulders_tilt : utilise les positions des humérus comme proxy des
+        # centres d'épaule (= origines du body humerus_r/l après IK).
+        shoulder_r_pos = pos_by_body["humerus_r"][f]
+        shoulder_l_pos = pos_by_body["humerus_l"][f]
+        cols["shoulders_tilt"].append(
+            _shoulders_tilt(pelvis_R, shoulder_r_pos, shoulder_l_pos))
 
     return {k: np.asarray(v, dtype=np.float64) for k, v in cols.items()}
+
+
+# ---- Unified aliases — lus depuis les colonnes natives OpenSim du .mot ---- #
+
+def compute_unified_aliases_from_mot(mot_path: str | Path) -> dict[str, np.ndarray]:
+    """Lit le `.mot` existant et crée les colonnes alias unifiées en copiant
+    (ou négiant si abduction) les colonnes natives OpenSim.
+
+    Indispensable pour avoir les mêmes noms (`right_arm_flexion`, etc.) que
+    ce que gonio2D produira après auto-détection du plan. Cohérence
+    cross-modale pour le suivi longitudinal de l'app.
+    """
+    mot_path = Path(mot_path)
+    if not mot_path.is_file():
+        return {}
+    text = mot_path.read_text()
+    lines = text.splitlines()
+    end_idx = None
+    for i, line in enumerate(lines):
+        if line.strip().lower() == "endheader":
+            end_idx = i
+            break
+    if end_idx is None or end_idx + 2 > len(lines):
+        return {}
+
+    cnames = [c.strip() for c in lines[end_idx + 1].split("\t")]
+    data_rows: list[list[float]] = []
+    for raw in lines[end_idx + 2:]:
+        if not raw.strip():
+            continue
+        parts = raw.split("\t")
+        if len(parts) != len(cnames):
+            continue
+        try:
+            data_rows.append([float(x) for x in parts])
+        except ValueError:
+            continue
+    if not data_rows:
+        return {}
+    data = np.asarray(data_rows, dtype=np.float64)  # (n_rows, n_cols)
+
+    out: dict[str, np.ndarray] = {}
+    for unified_name, (native_col, mult) in _UNIFIED_ALIASES.items():
+        if native_col in cnames:
+            idx = cnames.index(native_col)
+            out[unified_name] = data[:, idx] * mult
+    return out
 
 
 def append_columns_to_mot(mot_path: str | Path,
@@ -346,12 +466,28 @@ def append_columns_to_mot(mot_path: str | Path,
 
 def add_clinical_angles_to_mot(mot_path: str | Path,
                                body_transforms_path: str | Path) -> int:
-    """One-shot helper : compute + append. Returns number of angles added
-    (0 si pas de body_transforms ou si bodies manquants)."""
-    columns = compute_clinical_angles(body_transforms_path)
-    if not columns:
+    """One-shot helper : compute clinical_angles + unified_aliases puis
+    append au `.mot`. Retourne le nombre total de colonnes ajoutées (0 si
+    pas de body_transforms ou si bodies manquants).
+
+    Ordre :
+      1. Compute clinical_angles depuis body_transforms.json
+         (12 colonnes : knee_valgus×2, knee_rotation×2, ankle_rotation×2,
+          foot_progression×2, trunk_flexion, trunk_lateral_lean,
+          trunk_rotation, shoulders_tilt)
+      2. Compute unified_aliases depuis colonnes natives du .mot
+         (20 colonnes : right/left_{arm,hip}_{flexion,abduction},
+          right/left_{knee,elbow,wrist}_flexion, right/left_ankle_dorsiflexion,
+          right/left_ankle_inversion, right/left_wrist_deviation)
+      3. Append les 32 colonnes au `.mot` en une seule passe.
+    """
+    clinical = compute_clinical_angles(body_transforms_path)
+    if not clinical:
         return 0
-    n_modified = append_columns_to_mot(mot_path, columns)
-    print(f"[clinical_angles] {len(columns)} colonnes ajoutées au .mot "
-          f"({n_modified} lignes data mises à jour) : {list(columns.keys())}")
-    return len(columns)
+    aliases = compute_unified_aliases_from_mot(mot_path)
+    all_cols = {**clinical, **aliases}
+    n_modified = append_columns_to_mot(mot_path, all_cols)
+    print(f"[clinical_angles] {len(all_cols)} colonnes ajoutées au .mot "
+          f"({len(clinical)} clinical + {len(aliases)} alias unifiés, "
+          f"{n_modified} lignes data mises à jour)")
+    return len(all_cols)
