@@ -9,15 +9,15 @@ orientations 3D des bodies (sortie de l'IK).
 
 Convention d'angles dérivés (signes choisis selon usage clinique courant) :
 
-    knee_valgus_r/l         : frontal plane femur-tibia.
-                              Positive = valgus (knee inward / vers le centre).
-    knee_rotation_r/l       : transverse plane, tibia rotation autour axe long
-                              fémur. Positive = rotation externe du tibia.
-    ankle_rotation_r/l      : transverse plane, foot rotation autour axe long
-                              tibia. Positive = rotation externe du pied.
-    foot_progression_r/l    : toes-out angle, plan horizontal, foot anterior
-                              vs pelvis anterior. Positive = pied en dehors
-                              (en abduction de la direction de marche).
+    right/left_knee_valgus      : frontal plane femur-tibia.
+                                  Positive = valgus (knee inward / vers le centre).
+    right/left_knee_rotation    : transverse plane, tibia rotation autour axe
+                                  long fémur. Positive = rotation externe tibia.
+    right/left_ankle_rotation   : transverse plane, foot rotation autour axe
+                                  long tibia. Positive = rotation externe pied.
+    right/left_foot_progression : toes-out angle, plan horizontal, foot anterior
+                                  vs pelvis anterior. Positive = pied en dehors
+                                  (en abduction de la direction de marche).
     trunk_flexion           : sagittal, torso long axis vs world vertical
                               dans plan pelvis-sagittal. Positive = forward
                               lean (lean avant).
@@ -91,6 +91,10 @@ _UNIFIED_ALIASES: dict[str, tuple[str, float]] = {
     "left_wrist_flexion":         ("wrist_flex_l",     1.0),
     "right_wrist_deviation":      ("wrist_dev_r",      1.0),
     "left_wrist_deviation":       ("wrist_dev_l",      1.0),
+    "right_arm_rotation":         ("arm_rot_r",        1.0),
+    "left_arm_rotation":          ("arm_rot_l",        1.0),
+    "right_hip_rotation":         ("hip_rotation_r",   1.0),
+    "left_hip_rotation":          ("hip_rotation_l",   1.0),
 }
 
 
@@ -310,18 +314,17 @@ def compute_clinical_angles(body_transforms_path: str | Path) -> dict[str, np.nd
         pos_by_body[bn] = wts_np[:, :3, 3]
 
     # Noms unifiés (convention cross-modale avec gonio2D, cf.
-    # docs/CROSS_MODAL_ANGLES.md). Pour les angles qui n'ont pas
-    # d'équivalent gonio2D (knee_rotation, ankle_rotation, foot_progression,
-    # trunk_rotation), on garde le nom historique.
+    # docs/CROSS_MODAL_ANGLES.md). Tous les angles utilisent le préfixe
+    # right_/left_ pour la cohérence avec les alias unifiés.
     col_names = [
-        "right_knee_valgus", "left_knee_valgus",        # renommés (= unifiés)
-        "knee_rotation_r", "knee_rotation_l",           # transverse plane, gardé
-        "ankle_rotation_r", "ankle_rotation_l",         # transverse plane, gardé
-        "foot_progression_r", "foot_progression_l",     # transverse plane, gardé
-        "trunk_flexion",                                # déjà unifié
-        "trunk_lateral_lean",                           # renommé (cohérence gonio2D)
-        "trunk_rotation",                               # transverse plane, gardé
-        "shoulders_tilt",                               # NOUVEAU
+        "right_knee_valgus", "left_knee_valgus",
+        "right_knee_rotation", "left_knee_rotation",
+        "right_ankle_rotation", "left_ankle_rotation",
+        "right_foot_progression", "left_foot_progression",
+        "trunk_flexion",
+        "trunk_lateral_lean",
+        "trunk_rotation",
+        "shoulders_tilt",
     ]
     cols: dict[str, list[float]] = {n: [] for n in col_names}
 
@@ -337,11 +340,11 @@ def compute_clinical_angles(body_transforms_path: str | Path) -> dict[str, np.nd
             unified_side = "right" if side == "r" else "left"
             cols[f"{unified_side}_knee_valgus"].append(
                 _knee_valgus(femur_R, tibia_R, side))
-            cols[f"knee_rotation_{side}"].append(
+            cols[f"{unified_side}_knee_rotation"].append(
                 _knee_rotation(femur_R, tibia_R, side))
-            cols[f"ankle_rotation_{side}"].append(
+            cols[f"{unified_side}_ankle_rotation"].append(
                 _ankle_rotation(knee_p, ankle_p, tibia_R, foot_R, side))
-            cols[f"foot_progression_{side}"].append(
+            cols[f"{unified_side}_foot_progression"].append(
                 _foot_progression(pelvis_R, foot_R, side))
         cols["trunk_flexion"].append(_trunk_flexion(pelvis_R, torso_R))
         cols["trunk_lateral_lean"].append(_trunk_lean_lateral(pelvis_R, torso_R))
@@ -472,14 +475,14 @@ def add_clinical_angles_to_mot(mot_path: str | Path,
 
     Ordre :
       1. Compute clinical_angles depuis body_transforms.json
-         (12 colonnes : knee_valgus×2, knee_rotation×2, ankle_rotation×2,
-          foot_progression×2, trunk_flexion, trunk_lateral_lean,
-          trunk_rotation, shoulders_tilt)
+         (12 colonnes : right/left_knee_valgus, right/left_knee_rotation,
+          right/left_ankle_rotation, right/left_foot_progression,
+          trunk_flexion, trunk_lateral_lean, trunk_rotation, shoulders_tilt)
       2. Compute unified_aliases depuis colonnes natives du .mot
-         (20 colonnes : right/left_{arm,hip}_{flexion,abduction},
+         (24 colonnes : right/left_{arm,hip}_{flexion,abduction,rotation},
           right/left_{knee,elbow,wrist}_flexion, right/left_ankle_dorsiflexion,
           right/left_ankle_inversion, right/left_wrist_deviation)
-      3. Append les 32 colonnes au `.mot` en une seule passe.
+      3. Append les 36 colonnes au `.mot` en une seule passe.
     """
     clinical = compute_clinical_angles(body_transforms_path)
     if not clinical:
