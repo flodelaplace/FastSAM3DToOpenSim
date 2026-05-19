@@ -87,6 +87,8 @@ _UNIFIED_ALIASES: dict[str, tuple[str, float]] = {
     "left_ankle_inversion":       ("subtalar_angle_l", 1.0),
     "right_elbow_flexion":        ("elbow_flex_r",     1.0),
     "left_elbow_flexion":         ("elbow_flex_l",     1.0),
+    "right_forearm_pronation":    ("pro_sup_r",        1.0),
+    "left_forearm_pronation":     ("pro_sup_l",        1.0),
     "right_wrist_flexion":        ("wrist_flex_r",     1.0),
     "left_wrist_flexion":         ("wrist_flex_l",     1.0),
     "right_wrist_deviation":      ("wrist_dev_r",      1.0),
@@ -479,10 +481,11 @@ def add_clinical_angles_to_mot(mot_path: str | Path,
           right/left_ankle_rotation, right/left_foot_progression,
           trunk_flexion, trunk_lateral_lean, trunk_rotation, shoulders_tilt)
       2. Compute unified_aliases depuis colonnes natives du .mot
-         (24 colonnes : right/left_{arm,hip}_{flexion,abduction,rotation},
+         (26 colonnes : right/left_{arm,hip}_{flexion,abduction,rotation},
           right/left_{knee,elbow,wrist}_flexion, right/left_ankle_dorsiflexion,
-          right/left_ankle_inversion, right/left_wrist_deviation)
-      3. Append les 36 colonnes au `.mot` en une seule passe.
+          right/left_ankle_inversion, right/left_wrist_deviation,
+          right/left_forearm_pronation)
+      3. Append les 38 colonnes au `.mot` en une seule passe.
     """
     clinical = compute_clinical_angles(body_transforms_path)
     if not clinical:
