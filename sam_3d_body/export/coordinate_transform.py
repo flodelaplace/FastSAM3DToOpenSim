@@ -98,7 +98,18 @@ class CoordinateTransformer:
         # l'anatomical GLB qui passe par la même pipeline kpts.
         self._last_xz_deltas_m = None
         self._last_pelvis_shifts_m = None
-        self._last_stationary_cam_t_m = None
+        self._last_baked_cam_t_m = None
+        # transform() ignore cam_t pour les kpts (kpts entrent SANS cam_t et
+        # sont soit pelvis-centrés, soit délta-anchored au frame 0). Mais le
+        # mesh path (apply_pipeline_to_verts) reçoit `verts + cam_t` déjà
+        # additionné en amont. On stocke cam_t rotated+scaled pour pouvoir
+        # le soustraire au mesh, sinon le mesh garde un résidu cam_t qui
+        # le décale verticalement (un pied au sol, l'autre en l'air) et
+        # frame-to-frame (wobble).
+        if camera_translation is not None:
+            self._last_baked_cam_t_m = (
+                camera_translation @ self.CAMERA_TO_OPENSIM.T * scale
+            ).astype(np.float64)  # (N, 3) in meters
         if apply_global_translation and camera_translation is not None:
             kpts, xz_deltas = self._apply_global_translation(kpts, camera_translation, scale)
             if jc is not None:
@@ -112,15 +123,6 @@ class CoordinateTransformer:
                 jc = jc - shift[:, None, :]
             self._last_pelvis_shifts = shift * self.scale_factor  # saved in output units (mm)
             self._last_pelvis_shifts_m = shift.copy()  # (N, 3) in meters
-            # Stationary mode : transform() ignore cam_t pour les kpts, mais
-            # le mesh path (apply_pipeline_to_verts) reçoit `verts + cam_t`
-            # déjà additionné. On stocke cam_t rotated+scaled pour pouvoir
-            # le soustraire au mesh côté apply_pipeline_to_verts, sinon le
-            # mesh wobble frame-to-frame avec la variation de cam_t.
-            if camera_translation is not None:
-                self._last_stationary_cam_t_m = (
-                    camera_translation @ self.CAMERA_TO_OPENSIM.T * scale
-                ).astype(np.float64)  # (N, 3) in meters
 
         # 3b. Floor-plane lean correction — must run BEFORE per-frame align_to_ground,
         #     which destroys the global floor-tilt signal by independently shifting
@@ -212,6 +214,15 @@ class CoordinateTransformer:
             w = np.asarray(v, dtype=np.float64).copy()
             w = w @ self.CAMERA_TO_OPENSIM.T
             w = w * self._last_scale
+            # Dans les 2 modes (xz_deltas ou pelvis_shifts), on commence par
+            # retirer le cam_t baked dans verts (cf. transform()). Sans ça :
+            #  - stationary : mesh wobble + décalé verticalement vs kpts
+            #  - non-stationary : mesh à 2× la translation des kpts (cam_t
+            #    en plus du delta), un pied au sol l'autre en l'air vs
+            #    l'anatomical qui est bien centré
+            if (self._last_baked_cam_t_m is not None
+                    and i < len(self._last_baked_cam_t_m)):
+                w -= self._last_baked_cam_t_m[i][None, :]
             if self._last_xz_deltas_m is not None and i < len(self._last_xz_deltas_m):
                 d = self._last_xz_deltas_m[i]
                 w[:, 0] += d[0]
@@ -219,12 +230,6 @@ class CoordinateTransformer:
             elif self._last_pelvis_shifts_m is not None and i < len(self._last_pelvis_shifts_m):
                 shift = self._last_pelvis_shifts_m[i]
                 w -= shift[None, :]
-                # Stationary mode : retire aussi cam_t (rotated+scaled) car les
-                # mesh verts l'avaient baked in lors de l'append (verts+cam_t).
-                # Sans ça, mesh = pelvis_local-centered + cam_t résiduel → wobble.
-                if (self._last_stationary_cam_t_m is not None
-                        and i < len(self._last_stationary_cam_t_m)):
-                    w -= self._last_stationary_cam_t_m[i][None, :]
             if (self._last_floor_angle_deg is not None
                     and abs(self._last_floor_angle_deg) > 0.5
                     and hasattr(self, "_last_floor_pivots_m")
