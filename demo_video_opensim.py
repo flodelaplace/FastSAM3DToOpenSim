@@ -339,7 +339,9 @@ def main(args):
                     moge_floor_angle = CoordinateTransformer.floor_angle_from_moge_points(
                         pts, mask, person_bbox=first_bbox, orig_hw=(first_frame.shape[0], first_frame.shape[1])
                     )
-                    print(f"  MoGe floor tilt: {moge_floor_angle:+.2f}° (took {time.time() - t_moge:.2f}s)")
+                    _p, _r = moge_floor_angle
+                    print(f"  MoGe floor tilt: pitch={_p:+.2f}° roll={_r:+.2f}° "
+                          f"(took {time.time() - t_moge:.2f}s)")
                 except Exception:
                     print("  [floor_moge] MoGe floor estimation failed — skipping.")
         else:
@@ -852,6 +854,12 @@ def main(args):
     # redressement (one-shot floor lean correction). Si absent, le sujet reste
     # dans sa position 3D réelle (utile pour rameur, couché, suspension, etc.).
     _apply_floor = args.floor
+    # correct_floor_lean est DÉCOUPLÉ de align_to_ground :
+    # - Activé si MoGe a calculé un angle (= --floor_moge) ou si --floor
+    # - Permet d'avoir le redressement caméra (pitch/roll/body-vertical) en
+    #   mode défaut (--floor_moge sans --floor), sans forcer la mise au sol
+    #   per_frame qui est l'objet propre de --floor.
+    _correct_lean = (moge_floor_angle is not None or _apply_floor) and not args.no_lean_fix
     kpts_opensim, jcoords_opensim = transformer.transform(
         kpts_processed,
         jcoords_3d=jcoords_processed,
@@ -859,9 +867,7 @@ def main(args):
         center_pelvis=True,
         align_to_ground=_apply_floor,
         apply_global_translation=not args.stationary,
-        # correct_floor_lean : only effective when align_to_ground=True (cf.
-        # transform()). On garde la même gate `_apply_floor` pour les 2.
-        correct_floor_lean=_apply_floor and not args.no_lean_fix,
+        correct_floor_lean=_correct_lean,
         floor_angle=moge_floor_angle,
     )
 
@@ -882,13 +888,11 @@ def main(args):
         kpts_opensim, jcoords_opensim = transformer.correct_forward_lean(
             kpts_opensim, jcoords=jcoords_opensim, angle=lean_angle
         )
-    elif not args.no_lean_fix:
-        # Mode auto : si auto_static_calib est actif, on prend le milieu de
-        # la fenêtre la plus calme (même logique que pour le Scale Tool) →
-        # le sujet y est debout / stationnaire, donc le lean estimé est le
-        # vrai biais de posture et pas la moyenne "mouvement + debout"
-        # donnée par la médiane sur toutes les frames (qui sous-corrige
-        # la phase debout sur un squat, etc).
+    elif not args.no_lean_fix and getattr(args, 'enable_auto_lean_fix', False):
+        # Mode auto : DÉSACTIVÉ PAR DÉFAUT (cf. --enable_auto_lean_fix).
+        # La mesure spine sur kpts acromions (67, 68) est biaisée par MHR
+        # — anatomical termine plus penché que mesh. À activer seulement
+        # sur les vidéos où c'est calibré et vérifié visuellement.
         src = " (after MoGe)" if moge_floor_angle is not None else ""
         used_static_ref = False
         if getattr(args, "auto_static_calib", True):
@@ -1091,7 +1095,7 @@ def main(args):
                 k_open, j_open = tr_transformer.correct_forward_lean(
                     k_open, jcoords=j_open, angle=la
                 )
-            elif not args.no_lean_fix:
+            elif not args.no_lean_fix and getattr(args, 'enable_auto_lean_fix', False):
                 la = tr_transformer._estimate_lean_angle(k_open)
                 src = " (after MoGe)" if moge_floor_angle is not None else ""
                 print(f"    [person{ti+1:02d} spine lean] {la:+.2f}°{src} → correcting")
@@ -1344,12 +1348,18 @@ def main(args):
         #   --floor=False → none : pas de shift Y, position 3D réelle préservée.
         # NB : le pipeline TRC/IK/anatomical utilise toujours `align_to_ground`
         # per_frame de transform() — inchangé.
-        _glb_ground_mode = "constant_from_calib" if _apply_floor else "none"
+        # --floor=True  → per_frame : feet à Y=0 chaque frame (subject piedssol)
+        # --floor=False → constant_from_calib : shift Y calculé sur les 20
+        #                 premières frames (assumées standing) appliqué constant.
+        #                 Évite que le mesh soit way below ground quand il y a
+        #                 pas de ground alignment per_frame.
+        _glb_ground_mode = "per_frame" if _apply_floor else "constant_from_calib"
+        # Compute shared calib offset depuis les kpts (= référence biomécanique
+        # pieds) pour assurer que mesh + kpts segments + joints partagent le
+        # même Y zero dans le GLB final. Utilisé en mode constant_from_calib
+        # (no --floor). Pour per_frame (--floor) l'override est ignoré.
         _shared_offset_m = None
-        if _apply_floor:
-            # 1er pass kpts SANS ground_offset pour récupérer leurs positions
-            # post-rotation/scale/centering/lean. Le min Y sur les premières
-            # frames = offset à appliquer à tout (mesh + segments du mesh.glb).
+        if not _apply_floor:
             _kpts_no_offset = transformer.apply_pipeline_to_verts(
                 [(k + ct[None, :]) if (k is not None and ct is not None) else None
                  for k, ct in zip(all_kpts_raw, all_cam_t)],
@@ -1505,7 +1515,11 @@ if __name__ == "__main__":
     parser.add_argument("--no_mesh_glb", action="store_true",
                         help="Skip full body mesh GLB export (saves ~185 MB for long videos)")
     parser.add_argument("--no_lean_fix", action="store_true",
-                        help="Skip automatic forward-lean correction")
+                        help="Skip automatic forward-lean correction (manual --lean_angle "
+                             "or --lean_ref_frame still apply if set)")
+    parser.add_argument("--enable_auto_lean_fix", action="store_true",
+                        help="Active la spine lean correction AUTO (off par défaut depuis "
+                             "que le biais MHR sur acromions rendait l'anatomical penché ≠ mesh)")
     parser.add_argument("--stationary", action="store_true",
                         help="Disable global XZ translation — keeps the person centred at "
                              "origin with feet fixed to the ground. Use for exercises where "

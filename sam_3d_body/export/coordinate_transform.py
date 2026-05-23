@@ -112,40 +112,90 @@ class CoordinateTransformer:
                 jc = jc - shift[:, None, :]
             self._last_pelvis_shifts = shift * self.scale_factor  # saved in output units (mm)
             self._last_pelvis_shifts_m = shift.copy()  # (N, 3) in meters
-            # Stationary mode : transform() ignore cam_t pour les kpts, mais
-            # le mesh path (apply_pipeline_to_verts) reçoit `verts + cam_t`
-            # déjà additionné. On stocke cam_t rotated+scaled pour pouvoir
-            # le soustraire au mesh côté apply_pipeline_to_verts, sinon le
-            # mesh wobble frame-to-frame avec la variation de cam_t.
+            # Stationary mode : transform() ignore cam_t XZ pour les kpts (pelvis
+            # centré XZ), mais on ajoute cam_t_Y pour préserver la motion
+            # verticale naturelle (pelvis qui descend pendant un squat). Sinon
+            # l'anatomical reste bloqué à pelvis_Y = 0 (canonical SMPL).
+            #
+            # Le mesh (apply_pipeline_to_verts) reçoit verts + cam_t baked déjà,
+            # on stocke cam_t_XZ (Y=0) pour soustraire seulement le XZ et garder
+            # le Y. Comme ça mesh et kpts sont symétriques.
             if camera_translation is not None:
-                self._last_stationary_cam_t_m = (
-                    camera_translation @ self.CAMERA_TO_OPENSIM.T * scale
-                ).astype(np.float64)  # (N, 3) in meters
+                ct_os = (camera_translation @ self.CAMERA_TO_OPENSIM.T * scale
+                         ).astype(np.float64)  # (N, 3) in meters
+                # Inject cam_t_Y aux kpts pour préserver vertical motion
+                kpts[:, :, 1] += ct_os[:, 1:2]
+                if jc is not None:
+                    jc[:, :, 1] += ct_os[:, 1:2]
+                # Stocker XZ-only pour soustraction côté mesh (Y=0 préservé)
+                ct_os_xz = ct_os.copy()
+                ct_os_xz[:, 1] = 0
+                self._last_stationary_cam_t_m = ct_os_xz
 
         # 3b. Floor-plane lean correction — must run BEFORE per-frame align_to_ground,
         #     which destroys the global floor-tilt signal by independently shifting
         #     every frame.  Fit a line to stance-foot positions across all frames;
         #     the slope reveals the camera pitch → rotate the skeleton to level the floor.
         self._last_floor_angle_deg = None
-        if align_to_ground and correct_floor_lean:
+        self._last_roll_angle_deg = None
+        self._last_body_vertical_R = None
+        if correct_floor_lean:
             if floor_angle is not None:
-                _angle = floor_angle
+                # MoGe : tuple (pitch, roll). Back-compat float = pitch seul.
+                if isinstance(floor_angle, tuple):
+                    _pitch, _roll = floor_angle
+                else:
+                    _pitch, _roll = float(floor_angle), 0.0
                 _src = "MoGe"
-            else:
-                _angle = self._fit_floor_plane_angle(kpts)
+            elif align_to_ground:
+                _pitch = self._fit_floor_plane_angle(kpts)
+                _roll = 0.0
                 _src = "foot-traj"
-            if abs(_angle) > 0.5:
-                print(f"  [floor lean] {_src} floor tilt {_angle:+.2f}° → correcting")
-                kpts, jc = self._rotate_around_pelvis_z(kpts, jc, _angle)
-                self._last_floor_angle_deg = _angle
+            else:
+                _pitch, _roll, _src = 0.0, 0.0, None
+            if _src is not None and abs(_pitch) > 0.5:
+                print(f"  [floor lean] {_src} pitch {_pitch:+.2f}° → correcting")
+                kpts, jc = self._rotate_around_pelvis_z(kpts, jc, _pitch)
+                self._last_floor_angle_deg = _pitch
+            if _src is not None and abs(_roll) > 0.5:
+                print(f"  [floor lean] {_src} roll  {_roll:+.2f}° → correcting")
+                kpts, jc = self._rotate_around_pelvis_x(kpts, jc, _roll)
+                self._last_roll_angle_deg = _roll
 
-        # 4. Align feet to Y=0 each frame
+            # Body-vertical correction : SEULEMENT si --floor (= align_to_ground)
+            # car ça utilise la posture du sujet (assume standing) qui n'est
+            # pas valide pour rameur/LASEGUE/suspendu. Le mode défaut se base
+            # uniquement sur MoGe (= signal du sol).
+            if align_to_ground:
+                kpts, jc = self._apply_body_vertical_correction(kpts, jc)
+
+        # 4. Align feet to Y=0
         self._last_ground_offsets_m = None
         if align_to_ground:
+            # --floor : per-frame ground align (feet à Y=0 chaque frame)
             kpts, ground_offsets = self._align_to_ground(kpts, return_offsets=True)
             if jc is not None:
                 jc[:, :, 1] -= ground_offsets[:, None]
             self._last_ground_offsets_m = ground_offsets.copy()  # (N,) in meters
+        elif correct_floor_lean:
+            # Mode défaut (MoGe sans --floor) : shift constant calibré sur les
+            # 20 premières frames pour mettre les pieds proche du sol initial.
+            # Sans ça l'anatomical apparaît sous le sol (kpts.Y = cam_t_y brut).
+            # Le shift est appliqué à TOUTES les frames de manière constante,
+            # ce qui préserve la motion Y naturelle (squat, sauts, etc).
+            n_calib = min(20, kpts.shape[0])
+            calib_min_y = []
+            for i in range(n_calib):
+                foot = kpts[i, _FOOT_INDICES]
+                if not np.any(np.isnan(foot)):
+                    calib_min_y.append(np.min(foot[:, 1]))
+            if calib_min_y:
+                constant_offset = float(np.min(calib_min_y))
+                print(f"  [floor lean] constant ground shift Y -= {constant_offset:.3f} m "
+                      f"(calib over {len(calib_min_y)} frames)")
+                kpts[:, :, 1] -= constant_offset
+                if jc is not None:
+                    jc[:, :, 1] -= constant_offset
 
         # 5. Unit conversion (m → mm if requested)
         kpts = kpts * self.scale_factor
@@ -225,6 +275,7 @@ class CoordinateTransformer:
                 if (self._last_stationary_cam_t_m is not None
                         and i < len(self._last_stationary_cam_t_m)):
                     w -= self._last_stationary_cam_t_m[i][None, :]
+            # Pitch correction (axe Z lateral)
             if (self._last_floor_angle_deg is not None
                     and abs(self._last_floor_angle_deg) > 0.5
                     and hasattr(self, "_last_floor_pivots_m")
@@ -234,6 +285,23 @@ class CoordinateTransformer:
                 Rz = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float64)
                 pivot = self._last_floor_pivots_m[i]
                 w = (w - pivot) @ Rz + pivot
+            # Roll correction (axe X anterior), APRÈS pitch
+            if (getattr(self, "_last_roll_angle_deg", None) is not None
+                    and abs(self._last_roll_angle_deg) > 0.5
+                    and hasattr(self, "_last_roll_pivots_m")
+                    and i < len(self._last_roll_pivots_m)):
+                theta = np.radians(self._last_roll_angle_deg)
+                c, s = np.cos(theta), np.sin(theta)
+                Rx = np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+                pivot = self._last_roll_pivots_m[i]
+                w = (w - pivot) @ Rx + pivot
+            # Body-vertical correction (3D Rodrigues from standing window)
+            if (getattr(self, "_last_body_vertical_R", None) is not None
+                    and hasattr(self, "_last_body_vertical_pivots_m")
+                    and i < len(self._last_body_vertical_pivots_m)):
+                R_bv = self._last_body_vertical_R
+                pivot = self._last_body_vertical_pivots_m[i]
+                w = (w - pivot) @ R_bv.T + pivot
             pre_ground.append(w)
 
         # Étape 5 — Ground alignment (mode-dependent)
@@ -535,9 +603,10 @@ class CoordinateTransformer:
         orig_hw=None,
         floor_frac: float = 0.25,
         n_samples: int = 4000,
-    ) -> float:
+    ) -> tuple:
         """
-        Estimate the lean correction angle from MoGe 3D points on the floor.
+        Estimate floor lean angles (pitch, roll) from MoGe 3D points.
+        Returns (pitch_deg, roll_deg) tuple — both clamped to ±60°.
 
         MoGe uses a Y-UP camera convention (X=right, Y=up, Z=forward).
         Floor points are BELOW the optical axis → most negative Y_cam/Z_cam.
@@ -564,12 +633,17 @@ class CoordinateTransformer:
         orig_hw     : (H, W) of original frame — needed to scale bbox to MoGe grid
         floor_frac  : fraction of image rows from the bottom to consider as floor
 
-        Returns lean correction angle in degrees. Clamped to ±15°.
+        Returns (pitch_deg, roll_deg) tuple - both clamped to ±60°.
         """
-        LEAN_SCALE = 0.33  # camera-pitch → lean-correction scale (see docstring)
+        # LEAN_SCALE = 0.5 → compromis entre 0.33 (calibré pour aitor_garden_walk,
+        # sous-correction sur autres vidéos) et 1.0 (sur-correction si MoGe
+        # surestime le pitch caméra). Peut être ajusté par vidéo via env
+        # variable MOGE_LEAN_SCALE pour debug.
+        import os as _os
+        LEAN_SCALE = float(_os.environ.get("MOGE_LEAN_SCALE", "0.5"))
         # points must be (H, W, 3) spatial grid
         if points.ndim != 3:
-            return 0.0
+            return (0.0, 0.0)
         H, W = points.shape[:2]
 
         # Build per-pixel valid mask (H, W)
@@ -598,7 +672,7 @@ class CoordinateTransformer:
         mask_flat = valid_mask.reshape(-1)
         valid = pts_flat[mask_flat]
         if len(valid) < 50:
-            return 0.0
+            return (0.0, 0.0)
 
         # Floor candidates: depth-normalized image-row position Y/Z = -(v-cy)/fy
         # Depth-independent — bottom floor_frac of image rows regardless of distance
@@ -607,7 +681,7 @@ class CoordinateTransformer:
         floor_pts = valid[y_norm <= thresh]
 
         if len(floor_pts) < 20:
-            return 0.0
+            return (0.0, 0.0)
 
         # Random subsample for speed
         if len(floor_pts) > n_samples:
@@ -623,15 +697,26 @@ class CoordinateTransformer:
         if normal[1] < 0:
             normal = -normal
 
-        # Camera pitch: angle between floor normal and Y_cam axis
-        # θ = arctan(n_z / n_y): positive when n_z > 0 (camera tilts down)
-        raw_angle = float(np.degrees(np.arctan2(normal[2], normal[1])))
-        correction = raw_angle * LEAN_SCALE
+        # Camera pitch: angle dans plan YZ (rotation autour axe X cam = lateral)
+        # θ_pitch = arctan(n_z / n_y): positive when n_z > 0 (caméra penche bas)
+        raw_pitch = float(np.degrees(np.arctan2(normal[2], normal[1])))
+        # Camera roll: angle dans plan XY (rotation autour axe Z cam = forward)
+        # θ_roll = arctan(n_x / n_y): positive when n_x > 0 (caméra penche droite)
+        raw_roll = float(np.degrees(np.arctan2(normal[0], normal[1])))
+        correction_pitch = raw_pitch * LEAN_SCALE
+        correction_roll = raw_roll * LEAN_SCALE
         print(f"  [floor_moge] floor candidates: {len(floor_pts)}, "
               f"Z_mean={floor_pts[:,2].mean():.1f}, "
               f"normal=[{normal[0]:.3f},{normal[1]:.3f},{normal[2]:.3f}], "
-              f"camera_pitch={raw_angle:+.2f}°, correction={correction:+.2f}°")
-        return float(np.clip(correction, -15.0, 15.0))
+              f"camera_pitch={raw_pitch:+.2f}° → {correction_pitch:+.2f}°, "
+              f"camera_roll={raw_roll:+.2f}° → {correction_roll:+.2f}°")
+        # Roll négé pour matcher la convention de _rotate_around_pelvis_x.
+        # Env var MOGE_DISABLE_ROLL=1 pour tester sans roll si suspicion.
+        DISABLE_ROLL = bool(int(_os.environ.get("MOGE_DISABLE_ROLL", "0")))
+        return (
+            float(np.clip(correction_pitch, -60.0, 60.0)),
+            0.0 if DISABLE_ROLL else float(np.clip(-correction_roll, -60.0, 60.0)),
+        )
 
     def _rotate_around_pelvis_z(
         self,
@@ -662,6 +747,85 @@ class CoordinateTransformer:
         # Capture pivots so apply_pipeline_to_verts() peut refaire la même
         # rotation autour du même axe pour des arrays externes (mesh verts).
         self._last_floor_pivots_m = pivots
+        return kpts, jc
+
+    def _apply_body_vertical_correction(self, kpts, jc, calib_n_frames=20,
+                                          min_cos_threshold=0.5):
+        """Rotate so that the subject's body axis (midfoot→neck) aligns with +Y.
+        Uses first calib_n_frames as standing reference. Skips if body axis
+        isn't already mostly vertical (cos(angle_with_Y) < min_cos_threshold)
+        — protects against non-standing subjects (LASEGUE etc.)."""
+        n = min(calib_n_frames, kpts.shape[0])
+        midfeet = []
+        necks = []
+        for i in range(n):
+            foot = kpts[i, _FOOT_INDICES]
+            if np.any(np.isnan(foot)):
+                continue
+            midfoot = np.mean(foot, axis=0)
+            # neck = midpoint of left-shoulder (5) and right-shoulder (6)
+            neck = (kpts[i, 5] + kpts[i, 6]) / 2
+            if np.any(np.isnan(neck)):
+                continue
+            midfeet.append(midfoot)
+            necks.append(neck)
+        if len(midfeet) < 5:
+            return kpts, jc
+        mean_midfoot = np.mean(midfeet, axis=0)
+        mean_neck = np.mean(necks, axis=0)
+        body_axis = mean_neck - mean_midfoot
+        norm = np.linalg.norm(body_axis)
+        if norm < 1e-6:
+            return kpts, jc
+        body_axis = body_axis / norm
+        target = np.array([0.0, 1.0, 0.0])
+        cos_a = float(np.dot(body_axis, target))
+        if cos_a < min_cos_threshold:
+            print(f"  [body-vertical] body axis Y={cos_a:.2f} < threshold "
+                  f"{min_cos_threshold} (subject probably not standing), skip")
+            return kpts, jc
+        axis = np.cross(body_axis, target)
+        sin_a = float(np.linalg.norm(axis))
+        if sin_a < 1e-6:
+            return kpts, jc
+        axis = axis / sin_a
+        angle = float(np.degrees(np.arctan2(sin_a, cos_a)))
+        if abs(angle) < 0.5:
+            return kpts, jc
+        print(f"  [body-vertical] body axis tilt {angle:.2f}° → correcting "
+              f"(axis=[{axis[0]:.2f},{axis[1]:.2f},{axis[2]:.2f}])")
+        # Rodrigues rotation matrix (column-vector form)
+        K = np.array([[0, -axis[2], axis[1]],
+                      [axis[2], 0, -axis[0]],
+                      [-axis[1], axis[0], 0]], dtype=np.float64)
+        R = np.eye(3) + sin_a * K + (1.0 - cos_a) * K @ K
+        # Apply to all frames around per-frame pelvis pivot
+        pivots = np.zeros((kpts.shape[0], 3), dtype=np.float64)
+        for i in range(kpts.shape[0]):
+            pelvis = (kpts[i, 9] + kpts[i, 10]) / 2
+            pivots[i] = pelvis
+            # Row vector convention : v @ R.T applique R (column form) sur v
+            kpts[i] = (kpts[i] - pelvis) @ R.T + pelvis
+            if jc is not None:
+                jc[i] = (jc[i] - pelvis) @ R.T + pelvis
+        self._last_body_vertical_R = R
+        self._last_body_vertical_pivots_m = pivots
+        return kpts, jc
+
+    def _rotate_around_pelvis_x(self, kpts, jc, angle_deg):
+        """Rotate around per-frame pelvis pivot autour de l'axe X (anterior).
+        Utilisé pour corriger le roll caméra (caméra penchée sur le côté)."""
+        theta = np.radians(angle_deg)
+        c, s = np.cos(theta), np.sin(theta)
+        Rx = np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+        pivots = np.zeros((kpts.shape[0], 3), dtype=np.float64)
+        for i in range(kpts.shape[0]):
+            pelvis = (kpts[i, 9] + kpts[i, 10]) / 2
+            pivots[i] = pelvis
+            kpts[i] = (kpts[i] - pelvis) @ Rx + pelvis
+            if jc is not None:
+                jc[i] = (jc[i] - pelvis) @ Rx + pelvis
+        self._last_roll_pivots_m = pivots
         return kpts, jc
 
     def _apply_global_translation(self, keypoints, camera_translation, scale):

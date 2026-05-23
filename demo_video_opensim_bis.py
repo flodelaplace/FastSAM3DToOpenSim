@@ -293,7 +293,8 @@ def main(args):
                 moge_floor_angle = CoordinateTransformer.floor_angle_from_moge_points(
                     _pts, _mask, person_bbox=_bbox, orig_hw=_orig_hw
                 )
-                print(f"  MoGe floor tilt: {moge_floor_angle:+.2f}° "
+                _p, _r = moge_floor_angle
+                print(f"  MoGe floor tilt: pitch={_p:+.2f}° roll={_r:+.2f}° "
                       f"(took {time.time() - t_moge:.2f}s)")
             else:
                 print("  [floor_moge] Could not read first frame — skipping.")
