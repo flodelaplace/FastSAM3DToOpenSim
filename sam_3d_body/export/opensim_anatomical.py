@@ -17,6 +17,58 @@ import numpy as np
 from .opensim_ik_runner import _find_opensim_python
 
 
+# ---------------------------------------------------------------------------
+# Visual overrides applied to anatomical-GLB meshes ONLY.
+# These do NOT change the .osim or the IK — they only nudge how the meshes are
+# rendered relative to their OpenSim body frames.
+#
+# Why we need them
+# ----------------
+# Several Pose2Sim mesh files (humerus_rv.vtp, skull.vtp) are authored with
+# their local origin near the *midpoint* of the bone rather than at the
+# attachment joint. When OpenSim places them at the body origin (which is the
+# joint origin for humerus_r/l and head), the visible bone hangs ~5–10 cm
+# below the actual joint, giving the impression that the humeral head and the
+# cranium are 'too low' even though the IK chain is correct.
+#
+# We compensate by translating the mesh vertices in their own body-local frame
+# before they're added to the world transform. Tuned visually on SquatEla and
+# strainingCed; ajuste les chiffres si une nouvelle vidéo montre un décalage
+# résiduel.
+# ---------------------------------------------------------------------------
+ANATOMICAL_MESH_OFFSETS: dict[str, np.ndarray] = {
+    # body_name → (dx, dy, dz) translation in the body's local frame, metres.
+    # +Y in body-local is "up the bone" toward the proximal joint for limbs in
+    # the Pose2Sim model, so a positive Y raises the visible bone toward the
+    # joint origin.
+    # NOTE for humerus: we used to translate +Y here, but that detached the
+    # distal end of the humerus from the elbow joint (ulna mesh stays
+    # anchored). Switched to ANATOMICAL_MESH_AXIAL_STRETCH instead — stretches
+    # the bone upward while keeping the elbow end fixed.
+    "head":      np.array([0.01, 0.07, 0.0], dtype=np.float32),
+}
+
+# Per-body uniform scale tweak applied AFTER the .osim's mesh scale_factors.
+# Use < 1.0 to shrink visible mesh; > 1.0 to enlarge. Doesn't affect the body
+# origin or any joint, only the mesh appearance.
+ANATOMICAL_MESH_SCALE: dict[str, float] = {
+    # The head body is scaled by torso_width in the Scale Tool, which over-
+    # inflates the cranium (~1.5x on a typical subject). Pull it back to a
+    # more anatomically plausible size for the visual.
+    "head": 0.85,
+}
+
+# Per-body axial stretch along the bone's main axis (body-local Y), anchored
+# at the distal end (the bone's bottom in body-local frame, i.e. min Y of the
+# mesh after the scale_factors / local_transform pipeline). Anchor = elbow for
+# the humerus → stretching upward raises the proximal end (humeral head)
+# toward the shoulder joint while the elbow stays connected to the ulna.
+ANATOMICAL_MESH_AXIAL_STRETCH: dict[str, float] = {
+    "humerus_r": 1.10,
+    "humerus_l": 1.10,
+}
+
+
 def _default_geometry_dir() -> str | None:
     """Best-effort lookup of a Pose2Sim Geometry folder shipped with the repo."""
     candidates = []
@@ -161,6 +213,20 @@ def load_geometry_meshes(
             R_loc = local[:3, :3]
             t_loc = local[:3, 3]
             verts = verts @ R_loc.T + t_loc[None, :]
+
+            # Visual-only overrides: shrink the cranium that the Scale Tool
+            # inflates via torso_width, stretch the humerus upward to reach the
+            # shoulder joint without detaching the elbow, and raise the head
+            # mesh so it sits on top of the cervical chain instead of hanging.
+            # See ANATOMICAL_MESH_OFFSETS / SCALE / AXIAL_STRETCH for rationale.
+            if body_name in ANATOMICAL_MESH_SCALE:
+                verts = verts * float(ANATOMICAL_MESH_SCALE[body_name])
+            if body_name in ANATOMICAL_MESH_AXIAL_STRETCH:
+                factor = float(ANATOMICAL_MESH_AXIAL_STRETCH[body_name])
+                y_anchor = float(verts[:, 1].min())
+                verts[:, 1] = y_anchor + (verts[:, 1] - y_anchor) * factor
+            if body_name in ANATOMICAL_MESH_OFFSETS:
+                verts = verts + ANATOMICAL_MESH_OFFSETS[body_name][None, :]
 
             meshes_for_body.append((verts, faces))
         if meshes_for_body:
