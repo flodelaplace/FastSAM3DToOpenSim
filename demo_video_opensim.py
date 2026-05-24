@@ -73,6 +73,7 @@ from sam_3d_body.export.post_processing import PostProcessor
 from sam_3d_body.export.coordinate_transform import CoordinateTransformer
 from sam_3d_body.export.keypoint_converter import KeypointConverter
 from sam_3d_body.export.trc_exporter import TRCExporter
+from sam_3d_body.export.avatar_retarget import generate_avatar_from_trc
 from sam_3d_body.export.opensim_ik_runner import (
     run_ik, run_scale_tool, run_com_analysis,
     run_per_marker_error_analysis,
@@ -1251,6 +1252,31 @@ def main(args):
     exporter = TRCExporter(fps=out_fps, units="mm")
     exporter.export(markers_array, marker_names, trc_path)
 
+    # --- Optional humanised avatar retarget ------------------------------
+    if args.avatar_glb:
+        if not os.path.isfile(args.avatar_glb):
+            print(f"  WARNING: avatar GLB not found at {args.avatar_glb} — skipping retarget.")
+        else:
+            avatar_stem = os.path.splitext(os.path.basename(args.avatar_glb))[0]
+            # Strip a trailing "_apose"/"_opaque" suffix for nicer output name
+            for tag in ("_apose_opaque", "_opaque", "_apose"):
+                if avatar_stem.endswith(tag):
+                    avatar_stem = avatar_stem[: -len(tag)]
+                    break
+            avatar_out = os.path.join(
+                args.output_dir, f"{prefix}_avatar_{avatar_stem}.glb"
+            )
+            print(f"  Retargeting → avatar GLB ({avatar_stem})")
+            try:
+                generate_avatar_from_trc(
+                    trc_path=trc_path,
+                    avatar_glb_path=args.avatar_glb,
+                    out_path=avatar_out,
+                )
+                print(f"  Avatar GLB        → {avatar_out}")
+            except Exception as e:
+                print(f"  WARNING: avatar retarget failed: {e}")
+
     # Scale the generic model to the subject's proportions, then run IK
     if os.path.isfile(model_template):
         shutil.copy(model_template, osim_path)
@@ -1613,5 +1639,12 @@ if __name__ == "__main__":
                         help="Also write the combined TRC used for IK in addition to per-person TRCs.")
     parser.add_argument("--run_ik_per_person", action="store_true",
                         help="Run OpenSim scale + IK for each per-person TRC (slow).")
+    parser.add_argument("--avatar_glb", default=None,
+                        help="Path to a rigged humanoid GLB (MakeHuman 'Default' rig in "
+                             "T- or A-pose). When set, retargets the TRC onto this avatar "
+                             "and writes markers_<name>_avatar_<avatar_stem>.glb next to "
+                             "the standard outputs. Use the opaque-patched variant "
+                             "(assets/avatars/*_opaque.glb) to avoid the MakeHuman BLEND "
+                             "alpha default.")
     args = parser.parse_args()
     main(args)

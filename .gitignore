@@ -45,3 +45,7 @@ tools/rajagopal_markers_viz.json
 # OpenSim logs + stray
 assets/opensim.log
 *.log
+
+# Per-clip retargeted avatar GLB outputs (intermediate POCs kept locally only)
+assets/avatars/*pocA*.glb
+assets/avatars/avatar_*_animated_*.glb
