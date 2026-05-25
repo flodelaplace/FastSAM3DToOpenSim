@@ -45,7 +45,11 @@ MAKEHUMAN_BONE_TARGETS: dict[str, tuple[str, str, str | None, str | None]] = {
     "spine04":      ("c_spine0",  "c_spine1",   None,         None),
     "spine03":      ("c_spine1",  "c_spine2",   None,         None),
     "spine02":      ("c_spine2",  "c_spine3",   None,         None),
-    "spine01":      ("c_spine3",  "C7",         None,         None),
+    # spine01 (top thoracic) disabled: applying c_spine3→C7 rotation on top of
+    # the avatar's natural kyphosis doubled the curvature and pushed the chest
+    # mesh forward, giving male avatars a visual "breast" bulge. Lets the
+    # avatar's bind thoracic curve stay anatomical. spine02-05 still capture
+    # the subject's lean.
     # Neck / head (2 DOF)
     # neck01 disabled — see note in previous version.
     "neck02":       ("c_neck",    "c_head",     None,         None),
@@ -299,6 +303,7 @@ def retarget_from_trc(
         """
         ji = name_to_local[bone_name]
         head = rig.bind_world[ji, :3, 3]
+
         # Walk down through twist children until we hit a "real" anatomical bone.
         # A MakeHuman twist bone has a name ending in "02" with the same prefix.
         current = ji
@@ -481,6 +486,7 @@ def retarget_from_trc(
                         main_av = _vec_into_avatar(dir_t_subj) / n
                         bind_main = bone_bind_dir_avatar[ji]
 
+
                         # If axial markers are provided, compute a full 3-axis
                         # frame for both bind and target → captures the rotation
                         # around the bone (e.g. hip rotation, forearm pronation).
@@ -493,16 +499,12 @@ def retarget_from_trc(
                             try:
                                 lat_pos = _marker_pos(aux_lat, frame_pos, name_to_idx)
                                 med_pos = _marker_pos(aux_med, frame_pos, name_to_idx)
-                                aux_subj = lat_pos - med_pos  # lateral → medial
+                                aux_subj = lat_pos - med_pos
                                 aux_av = _vec_into_avatar(aux_subj)
-                                # In the avatar's bind, "lateral → medial" of a
-                                # LEFT bone (lateral side outside at +X, medial
-                                # toward centre) actually means `lat - med`
-                                # itself points outward = +X. For RIGHT bones
-                                # it's mirrored = −X.
-                                if ".L" in rig.joint_names[ji]:
+                                _name = rig.joint_names[ji]
+                                if ".L" in _name:
                                     bind_aux = np.array([1.0, 0.0, 0.0])
-                                elif ".R" in rig.joint_names[ji]:
+                                elif ".R" in _name:
                                     bind_aux = np.array([-1.0, 0.0, 0.0])
                                 else:
                                     bind_aux = None
@@ -669,13 +671,75 @@ def export_animated_glb(
 # Convenience one-shot
 # ---------------------------------------------------------------------------
 
+def stretch_torso_to_subject(
+    rig: AvatarRig,
+    trc_positions: np.ndarray,
+    marker_names: list[str],
+    min_ratio: float = 0.80,
+    max_ratio: float = 1.30,
+) -> float:
+    """Scale the avatar's spine chain so its (root → upperarm acromion) length
+    matches the subject's (midhip → midacromion) distance at frame 0.
+
+    The MakeHuman avatars have fixed body proportions; a subject with a longer
+    torso than the avatar template visually looks "compressed" because the
+    retargeting only rotates the bones (it never stretches them). This function
+    multiplies each spine bone's local translation by the subject/avatar ratio
+    so the torso skin stretches proportionally while the limbs stay untouched.
+
+    Returns the applied ratio (1.0 if subject torso wasn't measurable or the
+    ratio was within [0.95, 1.05] of identity).
+    """
+    name_to_idx = {n: i for i, n in enumerate(marker_names)}
+    try:
+        midhip_s  = 0.5 * (trc_positions[0, name_to_idx["LHJC"]] + trc_positions[0, name_to_idx["RHJC"]])
+        midacr_s  = 0.5 * (trc_positions[0, name_to_idx["LACR"]] + trc_positions[0, name_to_idx["RACR"]])
+        subject_torso = float(np.linalg.norm(midacr_s - midhip_s))
+    except (KeyError, IndexError):
+        return 1.0
+
+    try:
+        # Avatar acromion ≈ upperarm01.L/R bind positions (they sit at the shoulder)
+        upperarm_l = rig.bind_world[rig.name_to_local_idx["upperarm01.L"], :3, 3]
+        upperarm_r = rig.bind_world[rig.name_to_local_idx["upperarm01.R"], :3, 3]
+        midacr_a   = 0.5 * (upperarm_l + upperarm_r)
+        midhip_a   = rig.bind_world[rig.name_to_local_idx["root"], :3, 3]
+        avatar_torso = float(np.linalg.norm(midacr_a - midhip_a))
+    except KeyError:
+        return 1.0
+
+    if subject_torso < 0.05 or avatar_torso < 0.05:
+        return 1.0
+    ratio = subject_torso / avatar_torso
+    ratio = float(np.clip(ratio, min_ratio, max_ratio))
+    if 0.95 < ratio < 1.05:
+        return ratio  # no-op
+
+    spine_bones = ("spine05", "spine04", "spine03", "spine02", "spine01")
+    for bone in spine_bones:
+        if bone not in rig.name_to_local_idx:
+            continue
+        ji = rig.name_to_local_idx[bone]
+        node_idx = rig.joint_node_indices[ji]
+        node = rig.gltf.nodes[node_idx]
+        if node.translation is not None:
+            node.translation = [float(v) * ratio for v in node.translation]
+        rig.bind_local_t[ji] = rig.bind_local_t[ji] * ratio
+    print(f"  [avatar_retarget] torso stretch ratio={ratio:.3f} "
+          f"(subj {subject_torso*100:.1f}cm vs avatar {avatar_torso*100:.1f}cm)")
+    return ratio
+
+
 def generate_avatar_from_trc(
     trc_path: str | Path,
     avatar_glb_path: str | Path,
     out_path: str | Path,
+    stretch_torso: bool = True,
 ) -> Path:
     rig = load_avatar_glb(avatar_glb_path)
     positions, marker_names, fps = load_trc(trc_path)
+    if stretch_torso:
+        stretch_torso_to_subject(rig, positions, marker_names)
     result = retarget_from_trc(rig, positions, marker_names)
     result.fps = fps
     return export_animated_glb(rig, result, out_path)
