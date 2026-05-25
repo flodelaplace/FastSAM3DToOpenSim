@@ -756,8 +756,14 @@ def main(args):
             verts = person.get("pred_vertices")
             cam_t = person.get("pred_cam_t")
             if verts is not None and cam_t is not None and not np.any(np.isnan(verts)):
-                v_world = verts + cam_t[None, :]
-                all_verts.append(v_world.astype(np.float32))
+                # Store RAW verts (no cam_t) — apply_pipeline_to_verts will add
+                # the XZ delta of cam_t internally via _last_xz_deltas_m, exactly
+                # the way transform() does it for kpts. Adding cam_t here baked
+                # a residual cam_t.Y into the mesh frame that did not exist in
+                # the kpts/anatomical chain, putting the mesh visibly below
+                # ground for shots where the camera sits well above the subject
+                # (e.g. rower seated on machine).
+                all_verts.append(verts.astype(np.float32))
             else:
                 all_verts.append(None)
         else:
@@ -821,12 +827,9 @@ def main(args):
     # post-proc / transform / lean-correction pipeline. Split back out before
     # calling the Florian converter.
     #
-    # Frame alignment: `all_verts[i]` is stored as verts+cam_t (world-camera
-    # frame for the GLB path), while `jcoords_stack` is raw pred_joint_coords
-    # in pre-cam_t camera frame. Subtract cam_t_stack[i] back out so the
-    # anat verts land in the *same* frame as jcoords — otherwise transform()
-    # applies cam_t a second time and the new markers end up miles off the
-    # skeleton.
+    # Frame alignment: since the cam_t fix below, `all_verts[i]` is stored
+    # RAW (no cam_t), in the same camera-local frame as jcoords_stack. So we
+    # can extract anatomical verts directly without subtracting cam_t.
     N_anat = 0
     if markerset == "flodelaplace":
         N_anat = len(florian_converter.vertex_indices)
@@ -834,10 +837,7 @@ def main(args):
         for i, v in enumerate(all_verts):
             if v is None:
                 continue
-            ct = cam_t_stack[i]
-            if np.any(np.isnan(ct)):
-                continue
-            anat_stack[i] = florian_converter.extract_anatomical(v) - ct
+            anat_stack[i] = florian_converter.extract_anatomical(v)
         anat_processed = post_proc.process_jcoords(anat_stack, fps=out_fps)
         jcoords_processed = np.concatenate([jcoords_processed, anat_processed], axis=1)
     # Interpolate + smooth cam_t for global walking trajectory in TRC.
@@ -1387,8 +1387,7 @@ def main(args):
         _shared_offset_m = None
         if not _apply_floor:
             _kpts_no_offset = transformer.apply_pipeline_to_verts(
-                [(k + ct[None, :]) if (k is not None and ct is not None) else None
-                 for k, ct in zip(all_kpts_raw, all_cam_t)],
+                [k.copy() if k is not None else None for k in all_kpts_raw],
                 output_units="m",
                 ground_offset_mode="none")
             _calib_ys = [w[:, 1].min() for w in _kpts_no_offset[:20] if w is not None]
@@ -1396,19 +1395,22 @@ def main(args):
                 _shared_offset_m = float(min(_calib_ys))
                 print(f"  Mesh GLB: shared calib offset Y -= {_shared_offset_m:.3f} m "
                       f"(from kpts on {len(_calib_ys)} calib frames)")
+        # Pass RAW points (no cam_t added) so apply_pipeline_to_verts mirrors
+        # exactly what transform() did for the canonical kpts_opensim — the
+        # only cam_t contribution goes through _last_xz_deltas_m (XZ delta
+        # from frame 0). This puts mesh + kpts + jcoords in the same frame
+        # as the anatomical GLB (which is driven by kpts_opensim → TRC → IK).
         verts_world = transformer.apply_pipeline_to_verts(
             all_verts, output_units="m",
             ground_offset_mode=_glb_ground_mode,
             override_constant_offset_m=_shared_offset_m)
         kpts_world = transformer.apply_pipeline_to_verts(
-            [(k + ct[None, :]) if (k is not None and ct is not None) else None
-             for k, ct in zip(all_kpts_raw, all_cam_t)],
+            [k.copy() if k is not None else None for k in all_kpts_raw],
             output_units="m",
             ground_offset_mode=_glb_ground_mode,
             override_constant_offset_m=_shared_offset_m)
         jc_world = transformer.apply_pipeline_to_verts(
-            [(j + ct[None, :]) if (j is not None and ct is not None) else None
-             for j, ct in zip(all_joint_coords, all_cam_t)],
+            [j.copy() if j is not None else None for j in all_joint_coords],
             output_units="m",
             ground_offset_mode=_glb_ground_mode,
             override_constant_offset_m=_shared_offset_m)

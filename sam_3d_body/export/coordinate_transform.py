@@ -224,7 +224,13 @@ class CoordinateTransformer:
 
         Args:
             verts_per_frame : liste de N arrays (M_i, 3) ou None.
-                              Points en CAMERA-WORLD frame (mesh_local + cam_t).
+                              Points en CAMERA LOCAL frame (no cam_t added).
+                              The cam_t contribution is replayed internally via
+                              `_last_xz_deltas_m` so that the result matches
+                              what transform() produces for the kpts. Adding
+                              cam_t to the input here would bake a residual
+                              cam_t.Y offset into the mesh frame that does not
+                              exist in the kpts/TRC/anatomical chain.
             output_units : "m" ou "mm".
             ground_offset_mode :
                 "per_frame"          → applique ground_offsets[i] par frame (comme kpts).
