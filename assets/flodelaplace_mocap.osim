@@ -6739,7 +6739,7 @@
 							
 							<socket_parent>/bodyset/head</socket_parent>
 							
-							<translation>0 0.03 0</translation>
+							<translation>0 -0.04 0</translation>
 							
 							<orientation>0 0 0</orientation>
 						</PhysicalOffsetFrame>
@@ -31446,7 +31446,7 @@
 				</Marker>
 				<Marker name="HTOP">
 					<socket_parent_frame>/bodyset/head</socket_parent_frame>
-					<location>0.0 0.15 0.0</location>
+					<location>0.0 0.196 0.0</location>
 				</Marker>
 				
 				<Marker name="c_spine0">

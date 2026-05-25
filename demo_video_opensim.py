@@ -268,8 +268,8 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ── Markerset selection ──────────────────────────────────────────────────
-    # --markerset pose2sim (default)  : original KeypointConverter + pose2sim_wholebody_model.osim
-    # --markerset flodelaplace        : FlodelaplaceConverter + flodelaplace_mocap.osim
+    # --markerset flodelaplace (default) : FlodelaplaceConverter + flodelaplace_mocap.osim
+    # --markerset pose2sim               : original KeypointConverter + pose2sim_wholebody_model.osim
     markerset = getattr(args, "markerset", "pose2sim")
     if markerset == "flodelaplace":
         model_template = os.path.join(parent_dir, "assets", "flodelaplace_mocap.osim")
@@ -1513,14 +1513,14 @@ if __name__ == "__main__":
     parser.add_argument("--inference_type", default="body", choices=["full", "body"],
                         help="'body' (default) skips hands for speed; "
                              "'full' adds hand markers for IK and GLB.")
-    parser.add_argument("--markerset", default="pose2sim",
+    parser.add_argument("--markerset", default="flodelaplace",
                         choices=["pose2sim", "flodelaplace"],
                         help="Which marker set + model template to use. "
-                             "'pose2sim' (default) = original KeypointConverter "
-                             "+ pose2sim_wholebody_model.osim. "
-                             "'flodelaplace' = mocap-style markerset using the 64-marker "
-                             "assets/flodelaplace_mocap.osim, with bony landmarks derived "
-                             "from MHR mesh vertex picks + direct kpt/armature sources.")
+                             "'flodelaplace' (default) = mocap-style markerset using the "
+                             "64-marker assets/flodelaplace_mocap.osim, with bony landmarks "
+                             "derived from MHR mesh vertex picks + direct kpt/armature sources. "
+                             "'pose2sim' = original KeypointConverter "
+                             "+ pose2sim_wholebody_model.osim.")
     parser.add_argument("--auto_static_calib", action="store_true", default=True,
                         help="(flodelaplace only) Auto-detect the quietest window in the "
                              "sequence and use it for Scale Tool + MarkerPlacer calibration "

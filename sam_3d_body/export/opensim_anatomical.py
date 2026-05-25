@@ -38,24 +38,22 @@ from .opensim_ik_runner import _find_opensim_python
 # ---------------------------------------------------------------------------
 ANATOMICAL_MESH_OFFSETS: dict[str, np.ndarray] = {
     # body_name → (dx, dy, dz) translation in the body's local frame, metres.
-    # +Y in body-local is "up the bone" toward the proximal joint for limbs in
-    # the Pose2Sim model, so a positive Y raises the visible bone toward the
-    # joint origin.
-    # NOTE for humerus: we used to translate +Y here, but that detached the
-    # distal end of the humerus from the elbow joint (ulna mesh stays
-    # anchored). Switched to ANATOMICAL_MESH_AXIAL_STRETCH instead — stretches
-    # the bone upward while keeping the elbow end fixed.
-    "head":      np.array([0.01, 0.07, 0.0], dtype=np.float32),
+    # Head lift moved to the OpenSim template (flodelaplace_mocap.osim
+    # head_torso joint, head_offset PhysicalOffsetFrame Y: 0.03 → -0.022) so
+    # the model is anatomically correct in OpenSim and the IK benefits from
+    # closer marker-to-body alignment. The offset is scaled by K_head_size,
+    # which varies <5% between subjects, so the visible lift stays ~7 cm
+    # across heights without being literally constant.
 }
 
-# Per-body uniform scale tweak applied AFTER the .osim's mesh scale_factors.
-# Use < 1.0 to shrink visible mesh; > 1.0 to enlarge. Doesn't affect the body
-# origin or any joint, only the mesh appearance.
-ANATOMICAL_MESH_SCALE: dict[str, float] = {
-    # The head body is scaled by torso_width in the Scale Tool, which over-
-    # inflates the cranium (~1.5x on a typical subject). Pull it back to a
-    # more anatomically plausible size for the visual.
-    "head": 0.85,
+# Per-body scale tweak applied AFTER the .osim's mesh scale_factors.
+# Accepts either a scalar (uniform shrink/grow) or a 3-vector (per-axis X Y Z
+# in the body's local frame). Use < 1.0 to shrink, > 1.0 to enlarge. Doesn't
+# affect the body origin or any joint, only the mesh appearance.
+ANATOMICAL_MESH_SCALE: dict[str, float | np.ndarray] = {
+    # Empty: head is now scaled uniformly via head_size=(c_head, HTOP) in the
+    # Scale Tool, which preserves the template's anatomical proportions.
+    # Visual scale overrides only used if a specific mesh needs cosmetic fix.
 }
 
 # Per-body axial stretch along the bone's main axis (body-local Y), anchored
@@ -67,6 +65,54 @@ ANATOMICAL_MESH_AXIAL_STRETCH: dict[str, float] = {
     "humerus_r": 1.10,
     "humerus_l": 1.10,
 }
+
+# Bodies that sit downstream of the torso in the kinematic tree. When the
+# torso is visually scaled non-uniformly (e.g. narrowed in Z via
+# ANATOMICAL_MESH_SCALE["torso"]), we propagate the same per-axis scale to
+# the TORSO-LOCAL position of each descendant so the whole upper chain
+# (shoulders, arms, head) stays inside the narrowed torso.
+_TORSO_DESCENDANT_BODIES: tuple[str, ...] = (
+    "head",
+    "humerus_r", "ulna_r", "radius_r", "hand_r",
+    "humerus_l", "ulna_l", "radius_l", "hand_l",
+)
+
+
+def apply_visual_overrides_to_world_transforms(body_data: dict) -> dict:
+    """Mutate body_data['bodies'][child]['world_transforms'] to reflect
+    ANATOMICAL_MESH_SCALE per-axis values on the torso.
+
+    Scalar scales (e.g. head=0.85) do not move children — only the mesh is
+    shrunk. Per-axis scales on the torso (e.g. narrow Z) translate each
+    descendant inward in torso-local frame so the shoulders, arms and head
+    follow the narrowed torso mesh.
+    """
+    torso_scale = ANATOMICAL_MESH_SCALE.get("torso")
+    if torso_scale is None or isinstance(torso_scale, (int, float)):
+        return body_data
+    scale_vec = np.asarray(torso_scale, dtype=np.float64).reshape(3)
+    if np.allclose(scale_vec, 1.0):
+        return body_data
+
+    bodies = body_data.get("bodies", {})
+    if "torso" not in bodies:
+        return body_data
+
+    torso_W = np.asarray(bodies["torso"]["world_transforms"], dtype=np.float64)  # (N, 4, 4)
+    torso_W_inv = np.linalg.inv(torso_W)
+
+    for child in _TORSO_DESCENDANT_BODIES:
+        if child not in bodies:
+            continue
+        child_W = np.asarray(bodies[child]["world_transforms"], dtype=np.float64)
+        # Express child in torso-local frame.
+        local = np.einsum("nij,njk->nik", torso_W_inv, child_W)
+        # Scale only the translation column per axis (rotation untouched).
+        local[:, :3, 3] = local[:, :3, 3] * scale_vec[None, :]
+        # Recompose to world.
+        new_W = np.einsum("nij,njk->nik", torso_W, local)
+        bodies[child]["world_transforms"] = new_W.tolist()
+    return body_data
 
 
 def _default_geometry_dir() -> str | None:
@@ -220,7 +266,11 @@ def load_geometry_meshes(
             # mesh so it sits on top of the cervical chain instead of hanging.
             # See ANATOMICAL_MESH_OFFSETS / SCALE / AXIAL_STRETCH for rationale.
             if body_name in ANATOMICAL_MESH_SCALE:
-                verts = verts * float(ANATOMICAL_MESH_SCALE[body_name])
+                s = ANATOMICAL_MESH_SCALE[body_name]
+                if isinstance(s, (int, float)):
+                    verts = verts * float(s)
+                else:
+                    verts = verts * np.asarray(s, dtype=np.float32)[None, :]
             if body_name in ANATOMICAL_MESH_AXIAL_STRETCH:
                 factor = float(ANATOMICAL_MESH_AXIAL_STRETCH[body_name])
                 y_anchor = float(verts[:, 1].min())

@@ -25,12 +25,15 @@ from pathlib import Path
 #   1.5  foot markers — important for ground contact
 #   0.5  head / hand kpts and armature spine joints — noisier, low priority
 MARKER_WEIGHTS_FLODELAPLACE: dict[str, float] = {
-    # Head (direct kpts, noisy face features)
-    "Nose":  0.4, "LEye": 0.3, "REye": 0.3, "LEar": 0.8, "REar": 0.8,
-    "HTOP":  0.5,
+    # Head: bumped HTOP, c_head, LEar/REar to ~2.0 so the IK pulls the head
+    # body to actually follow the cranial markers (was ~0.5–0.8, so the head
+    # body lagged behind the visible mesh during motion). Eye/Nose stay low
+    # because they're noisy MHR projections.
+    "Nose":  0.5, "LEye": 0.3, "REye": 0.3, "LEar": 1.8, "REar": 1.8,
+    "HTOP":  2.0,
     # Spine armature (jcoord-direct, soft constraint)
     "c_spine0": 0.5, "c_spine1": 0.5, "c_spine2": 0.5, "c_spine3": 0.5,
-    "c_neck":   0.7, "c_head":   0.6,
+    "c_neck":   1.0, "c_head":   2.0,
     "RCLAV":    0.5, "LCLAV":    0.5,
     # Torso bony + JC
     "C7":   2.0,
@@ -71,17 +74,27 @@ _SCALE_MEASUREMENTS_FLODELAPLACE = [
     # Pelvis: Z (width) from bony ASIS pair, X (AP depth) from ASIS-PSIS pairs.
     ("pelvis_Z",    [("LASI", "RASI")],                                       ["pelvis", "sacrum"],                                                     "Z"),
     ("pelvis_X",    [("RASI", "RPSI"), ("LASI", "LPSI")],                     ["pelvis", "sacrum"],                                                     "X"),
-    # Torso: Z (width) from acromions, Y (height) from ACR-ASI, X (AP depth)
-    # from CLAV (anterior) to C7 (posterior). Head is scaled Z/X uniformly
-    # with torso (largeur épaules, profondeur clav-C7) mais reçoit SA PROPRE
-    # mesure Y via c_neck → HTOP. Avant, le head héritait du torso_Y, ce qui
-    # sous-dimensionnait systématiquement la tête pour les sujets dont les
-    # proportions tête/torse différaient de celles du template (observé :
-    # HTOP/Nose/Ears ~60 mm trop bas sur 5/5 sujets testés).
-    ("torso_Z",     [("LACR", "RACR")],                                       ["torso", "head"],                                                        "Z"),
-    ("torso_Y",     [("RACR", "RASI"), ("LACR", "LASI")],                     ["torso", "lumbar1", "lumbar2", "lumbar3", "lumbar4", "lumbar5"],         "Y"),
-    ("torso_X",     [("RCLAV", "C7"), ("LCLAV", "C7")],                       ["torso", "head"],                                                        "X"),
-    ("head_Y",      [("c_neck", "HTOP")],                                     ["head"],                                                                 "Y"),
+    # Torso: Z (width) averaged from acromions AND ASIS so the trunk isn't
+    # systematically too wide. SAM3D's LACR/RACR markers are projected on the
+    # mesh surface and drift laterally past the bony acromion, inflating the
+    # torso_Z ratio. Mixing in the bony pelvic landmarks (LASI/RASI) gives a
+    # narrower, more anatomically plausible torso silhouette. Y (height) from
+    # ACR-ASI, X (AP depth) from CLAV→C7. Head has its OWN dedicated scale
+    # measurements below — it no longer inherits torso_Z/torso_X.
+    ("torso_Z",     [("LACR", "RACR"), ("LASI", "RASI")],                     ["torso"],                                                                "Z"),
+    # torso_Y averages ACR-ASI (anterior bony pair) with ACR-HJC (joint
+    # center). ACR-ASI alone tended to underscale torso height on subjects
+    # with low-sitting ASIS, pulling the shoulder bone down and putting the
+    # head visually 1-2 cm too low even after the head_offset compensation.
+    # Adding the joint-center pair gives a more representative average.
+    ("torso_Y",     [("RACR", "RASI"), ("LACR", "LASI"), ("RACR", "RHJC"), ("LACR", "LHJC")],  ["torso", "lumbar1", "lumbar2", "lumbar3", "lumbar4", "lumbar5"],         "Y"),
+    ("torso_X",     [("RCLAV", "C7"), ("LCLAV", "C7")],                       ["torso"],                                                                "X"),
+    # Head: ONE uniform measurement on all 3 axes preserves the anatomical
+    # proportions of the template skull mesh. Splitting axes (separate head_Y
+    # and head_Z) made K differ per axis and gave a tall/wide-but-flat head.
+    # c_head→HTOP captures cranium height (~25 cm) and gives K ~1.0 on most
+    # subjects → minimal inflation, proportions preserved.
+    ("head_size",   [("c_head", "HTOP")],                                     ["head"],                                                                 "X Y Z"),
     # Right lower limb
     ("femur_r_Y",   [("RHJC", "RKJC")],                                       ["femur_r", "patella_r"],                                                 "Y"),
     ("femur_r_XZ",  [("RLFC", "RMFC")],                                       ["femur_r", "patella_r"],                                                 "X Z"),

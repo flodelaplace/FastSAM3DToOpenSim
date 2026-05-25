@@ -677,12 +677,17 @@ def write_anatomical_glb(
 
     Returns True on success, False otherwise (e.g. opensim env unavailable).
     """
-    from .opensim_anatomical import compute_body_transforms, load_geometry_meshes
+    from .opensim_anatomical import (
+        compute_body_transforms,
+        load_geometry_meshes,
+        apply_visual_overrides_to_world_transforms,
+    )
 
     body_data = compute_body_transforms(osim_path, mot_path)
     if body_data is None:
         print("  [anatomical GLB] could not compute body transforms, skipping.")
         return False
+    body_data = apply_visual_overrides_to_world_transforms(body_data)
     geom = load_geometry_meshes(
         body_data["bodies"],
         geometry_dir=str(geometry_dir) if geometry_dir else None,
@@ -1208,10 +1213,15 @@ def write_mesh_glb(
     #   X_glb = -Z_osim, Y_glb = Y_osim, Z_glb = X_osim
     anat_bones: list[dict] = []   # [{"name", "verts_acc", "faces_acc", "trans_acc", "rot_acc"}, ...]
     if osim_path is not None and mot_path is not None:
-        from .opensim_anatomical import compute_body_transforms, load_geometry_meshes
+        from .opensim_anatomical import (
+            compute_body_transforms,
+            load_geometry_meshes,
+            apply_visual_overrides_to_world_transforms,
+        )
 
         body_data = compute_body_transforms(osim_path, mot_path)
         if body_data is not None:
+            body_data = apply_visual_overrides_to_world_transforms(body_data)
             geom = load_geometry_meshes(body_data["bodies"], geometry_dir=str(geometry_dir) if geometry_dir else None)
 
             if use_opensim_frame:
