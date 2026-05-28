@@ -24,6 +24,11 @@ S3_OUTPUT_URI = os.environ.get(
 # g4dn.xlarge Spot eu-west-3 — approximate (price varies ±10%).
 SPOT_PRICE_USD_PER_HOUR = 0.16
 
+# Estimated time for a warm container restart on an already-running instance
+# (docker container restart + TRT engine cache fetch from S3). Used to split
+# queue_wait from boot_pull when the instance was already up before the job.
+WARM_RESTART_MS = 30_000
+
 
 def _fmt_duration(ms):
     if ms is None or ms < 0:
@@ -90,6 +95,86 @@ def _estimate_cost(container_ms):
     return hours * SPOT_PRICE_USD_PER_HOUR
 
 
+def _get_instance_launch_ms(job_id):
+    """Return the EC2 launch time (ms epoch) of the instance that ran this job.
+
+    Walks: Batch DescribeJobs → containerInstanceArn → ECS DescribeContainerInstances
+           → ec2InstanceId → EC2 DescribeInstances → LaunchTime.
+
+    Returns None on any failure (so the caller falls back to legacy single-bucket).
+    """
+    try:
+        batch = boto3.client("batch")
+        jobs = batch.describe_jobs(jobs=[job_id]).get("jobs", [])
+        if not jobs:
+            return None
+        attempts = jobs[0].get("attempts", [])
+        if not attempts:
+            return None
+        # Last attempt is the one that ran to SUCCEEDED/FAILED
+        last = attempts[-1]
+        container_instance_arn = last.get("container", {}).get("containerInstanceArn")
+        if not container_instance_arn:
+            return None
+        # The container_instance_arn looks like
+        # arn:aws:ecs:<region>:<acct>:container-instance/<cluster>/<id>
+        # We need the cluster part for DescribeContainerInstances.
+        # Format: container-instance/<cluster>/<uuid>
+        parts = container_instance_arn.split("/")
+        if len(parts) < 3:
+            return None
+        cluster = parts[1]
+        ecs = boto3.client("ecs")
+        resp = ecs.describe_container_instances(
+            cluster=cluster, containerInstances=[container_instance_arn]
+        )
+        instances = resp.get("containerInstances", [])
+        if not instances:
+            return None
+        ec2_id = instances[0].get("ec2InstanceId")
+        if not ec2_id:
+            return None
+        ec2 = boto3.client("ec2")
+        resp = ec2.describe_instances(InstanceIds=[ec2_id])
+        for r in resp.get("Reservations", []):
+            for inst in r.get("Instances", []):
+                lt = inst.get("LaunchTime")
+                if lt is not None:
+                    # Convert datetime → ms epoch
+                    return int(lt.timestamp() * 1000)
+    except Exception as err:
+        print(f"WARN: _get_instance_launch_ms failed: {err}")
+    return None
+
+
+def _split_pre_container_time(created_at, started_at, launch_at):
+    """Decompose started_at - created_at into queue_wait_ms + boot_pull_ms.
+
+    Two regimes:
+      - launch_at > created_at → instance was created (or in process of launching)
+        AFTER job submission. The job waited (launch_at - created_at) for the
+        instance to spawn, then (started_at - launch_at) for boot + image pull.
+      - launch_at <= created_at → instance was already running when the job was
+        submitted. The job waited for the previous job/capacity to free up. A
+        small fixed amount is attributed to container restart (warm path).
+    """
+    if not (created_at and started_at):
+        return None, None, "unknown"
+    if launch_at is None:
+        return None, None, "unknown"
+    if launch_at > created_at:
+        queue_wait_ms = launch_at - created_at
+        boot_pull_ms = max(0, started_at - launch_at)
+        regime = "fresh"
+    else:
+        # Warm path: instance was already up
+        total = started_at - created_at
+        boot_pull_ms = min(WARM_RESTART_MS, total)
+        queue_wait_ms = max(0, total - boot_pull_ms)
+        regime = "warm"
+    return queue_wait_ms, boot_pull_ms, regime
+
+
 def lambda_handler(event, context):
     detail = event.get("detail", {})
     job_id = detail.get("jobId", "?")
@@ -111,6 +196,12 @@ def lambda_handler(event, context):
     total_ms = (stopped_at - created_at) if (stopped_at and created_at) else None
     cost_usd = _estimate_cost(container_ms)
 
+    # Split cold_start_ms into queue_wait + boot_pull using EC2 instance launch time
+    launch_at = _get_instance_launch_ms(job_id)
+    queue_wait_ms, boot_pull_ms, regime = _split_pre_container_time(
+        created_at, started_at, launch_at
+    )
+
     output_folder = _find_output_folder(video_name) if status == "SUCCEEDED" else None
     report = _fetch_report(output_folder) if output_folder else {}
 
@@ -127,7 +218,19 @@ def lambda_handler(event, context):
     lines.append("")
 
     lines.append("─── Temps d'exécution ───")
-    lines.append(f"Cold start    : {_fmt_duration(cold_start_ms)}  (boot Spot + pull image ECR)")
+    if queue_wait_ms is not None and boot_pull_ms is not None:
+        boot_label = (
+            "boot Spot + pull image ECR" if regime == "fresh"
+            else "warm restart (instance déjà chaude)"
+        )
+        queue_label = (
+            "attente lancement instance" if regime == "fresh"
+            else "attente fin job précédent"
+        )
+        lines.append(f"Queue wait    : {_fmt_duration(queue_wait_ms)}  ({queue_label})")
+        lines.append(f"Boot + pull   : {_fmt_duration(boot_pull_ms)}  ({boot_label})")
+    else:
+        lines.append(f"Cold start    : {_fmt_duration(cold_start_ms)}  (boot Spot + pull image ECR)")
     lines.append(f"Container     : {_fmt_duration(container_ms)}  (sync checkpoints + inférence + upload)")
     lines.append(f"Total         : {_fmt_duration(total_ms)}")
     lines.append("")
