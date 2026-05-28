@@ -58,6 +58,7 @@ class CoordinateTransformer:
         apply_global_translation: bool = False,
         correct_floor_lean: bool = True,
         floor_angle: Optional[float] = None,
+        apply_body_vertical: Optional[bool] = None,
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
         Transform keypoints (and optionally jcoords) to OpenSim world space.
@@ -98,7 +99,7 @@ class CoordinateTransformer:
         # l'anatomical GLB qui passe par la même pipeline kpts.
         self._last_xz_deltas_m = None
         self._last_pelvis_shifts_m = None
-        self._last_stationary_cam_t_m = None
+        self._last_stationary_cam_t_y_m = None
         if apply_global_translation and camera_translation is not None:
             kpts, xz_deltas = self._apply_global_translation(kpts, camera_translation, scale)
             if jc is not None:
@@ -117,9 +118,10 @@ class CoordinateTransformer:
             # verticale naturelle (pelvis qui descend pendant un squat). Sinon
             # l'anatomical reste bloqué à pelvis_Y = 0 (canonical SMPL).
             #
-            # Le mesh (apply_pipeline_to_verts) reçoit verts + cam_t baked déjà,
-            # on stocke cam_t_XZ (Y=0) pour soustraire seulement le XZ et garder
-            # le Y. Comme ça mesh et kpts sont symétriques.
+            # Le mesh (apply_pipeline_to_verts) reçoit verts RAW (sans cam_t
+            # ajouté), donc on stocke cam_t.Y pour qu'il puisse ré-appliquer
+            # exactement la même injection verticale que les kpts (et ainsi
+            # rester aligné avec l'anatomical, qui lui suit kpts via TRC/IK).
             if camera_translation is not None:
                 ct_os = (camera_translation @ self.CAMERA_TO_OPENSIM.T * scale
                          ).astype(np.float64)  # (N, 3) in meters
@@ -127,10 +129,8 @@ class CoordinateTransformer:
                 kpts[:, :, 1] += ct_os[:, 1:2]
                 if jc is not None:
                     jc[:, :, 1] += ct_os[:, 1:2]
-                # Stocker XZ-only pour soustraction côté mesh (Y=0 préservé)
-                ct_os_xz = ct_os.copy()
-                ct_os_xz[:, 1] = 0
-                self._last_stationary_cam_t_m = ct_os_xz
+                # Stocker la Y-injection pour la rejouer côté mesh.
+                self._last_stationary_cam_t_y_m = ct_os[:, 1].copy()
 
         # 3b. Floor-plane lean correction — must run BEFORE per-frame align_to_ground,
         #     which destroys the global floor-tilt signal by independently shifting
@@ -162,11 +162,17 @@ class CoordinateTransformer:
                 kpts, jc = self._rotate_around_pelvis_x(kpts, jc, _roll)
                 self._last_roll_angle_deg = _roll
 
-            # Body-vertical correction : SEULEMENT si --floor (= align_to_ground)
-            # car ça utilise la posture du sujet (assume standing) qui n'est
-            # pas valide pour rameur/LASEGUE/suspendu. Le mode défaut se base
-            # uniquement sur MoGe (= signal du sol).
-            if align_to_ground:
+            # Body-vertical correction : utilise la posture du sujet pour
+            # forcer midfoot→neck à être vertical. Suppose le sujet DEBOUT.
+            # → Ne pas activer pour rameur, sit-to-stand, Lasègue, suspension.
+            # Default = on si --floor (legacy : align_to_ground True).
+            # `apply_body_vertical` permet l'override explicite (ex : --floor
+            # avec sujet assis sur chaise = pieds au sol mais corps incliné).
+            _do_body_vertical = (
+                apply_body_vertical if apply_body_vertical is not None
+                else align_to_ground
+            )
+            if _do_body_vertical:
                 kpts, jc = self._apply_body_vertical_correction(kpts, jc)
 
         # 4. Align feet to Y=0
@@ -275,12 +281,13 @@ class CoordinateTransformer:
             elif self._last_pelvis_shifts_m is not None and i < len(self._last_pelvis_shifts_m):
                 shift = self._last_pelvis_shifts_m[i]
                 w -= shift[None, :]
-                # Stationary mode : retire aussi cam_t (rotated+scaled) car les
-                # mesh verts l'avaient baked in lors de l'append (verts+cam_t).
-                # Sans ça, mesh = pelvis_local-centered + cam_t résiduel → wobble.
-                if (self._last_stationary_cam_t_m is not None
-                        and i < len(self._last_stationary_cam_t_m)):
-                    w -= self._last_stationary_cam_t_m[i][None, :]
+                # Stationary mode : verts d'entrée sont RAW (sans cam_t baked).
+                # On rejoue la même Y-injection que transform() fait aux kpts
+                # pour que mesh et anatomical/kpts restent verticalement
+                # alignés (squat descend, etc).
+                if (self._last_stationary_cam_t_y_m is not None
+                        and i < len(self._last_stationary_cam_t_y_m)):
+                    w[:, 1] += self._last_stationary_cam_t_y_m[i]
             # Pitch correction (axe Z lateral)
             if (self._last_floor_angle_deg is not None
                     and abs(self._last_floor_angle_deg) > 0.5

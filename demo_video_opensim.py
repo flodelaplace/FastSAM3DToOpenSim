@@ -854,7 +854,10 @@ def main(args):
     # `--floor` flag : si présent, active la mise au sol (per-frame) et le
     # redressement (one-shot floor lean correction). Si absent, le sujet reste
     # dans sa position 3D réelle (utile pour rameur, couché, suspension, etc.).
-    _apply_floor = args.floor
+    _apply_floor = args.floor or args.floor_seated
+    # --floor_seated désactive uniquement le body-vertical correction (le
+    # sujet assis n'a pas un axe midfoot→neck vertical à imposer).
+    _apply_body_vertical = (not args.floor_seated) if _apply_floor else None
     # correct_floor_lean est DÉCOUPLÉ de align_to_ground :
     # - Activé si MoGe a calculé un angle (= --floor_moge) ou si --floor
     # - Permet d'avoir le redressement caméra (pitch/roll/body-vertical) en
@@ -870,6 +873,7 @@ def main(args):
         apply_global_translation=not args.stationary,
         correct_floor_lean=_correct_lean,
         floor_angle=moge_floor_angle,
+        apply_body_vertical=_apply_body_vertical,
     )
 
     # 2b. Spine-based forward-lean correction (runs after floor-plane rotation above).
@@ -1081,6 +1085,7 @@ def main(args):
                 apply_global_translation=not args.stationary,
                 correct_floor_lean=not args.no_lean_fix,
                 floor_angle=moge_floor_angle,
+                apply_body_vertical=not args.floor_seated,
             )
 
             # Spine lean correction
@@ -1588,6 +1593,11 @@ if __name__ == "__main__":
                              "pour les mouvements non-standing (rameur, couché, suspension) "
                              "→ le mesh et squelette restent dans leur position 3D réelle "
                              "sans forcing au sol.")
+    parser.add_argument("--floor_seated", action="store_true",
+                        help="Variante de --floor pour les mouvements ASSIS (sit-to-stand, "
+                             "tests sur chaise, etc.) : pieds à Y=0 chaque frame, MAIS "
+                             "désactive le body-vertical correction qui force midfoot→neck "
+                             "vertical (faux quand le sujet est assis). Implique --floor.")
     parser.add_argument("--fx", type=float, default=None,
                         help="Focal length x (pixels). Skips MoGe FOV estimation if set.")
     parser.add_argument("--fy", type=float, default=None)
