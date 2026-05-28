@@ -1,7 +1,7 @@
 services:
   fast-sam-opensim:
     build: .
-    image: fast-sam-opensim:latest
+    image: synkro-fastsam3d:local
     deploy:
       resources:
         reservations:
