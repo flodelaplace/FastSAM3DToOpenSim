@@ -1420,7 +1420,10 @@ def main(args):
                   f"— skip export.")
         else:
             npz_path = os.path.join(args.output_dir, f"{prefix}_mesh.npz")
-            faces_np = np.asarray(estimator.faces.detach().cpu()).astype(np.int32)
+            _faces_raw = estimator.faces
+            if hasattr(_faces_raw, "detach"):
+                _faces_raw = _faces_raw.detach().cpu()
+            faces_np = np.asarray(_faces_raw).astype(np.int32)
             np.savez_compressed(
                 npz_path,
                 verts=np.asarray(all_verts[fi], dtype=np.float32),
