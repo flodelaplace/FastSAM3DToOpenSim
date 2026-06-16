@@ -954,6 +954,49 @@ def main(args):
             kpts_opensim, include_derived=True, body_only=True
         )
 
+    # ── --feet_anchor : shift global per-frame pour que le midpoint des
+    # pieds reste à sa position médiane sur toute la vidéo. Translate tout
+    # le corps (mesh + kpts + jcoords + markers) du même delta XZ par frame.
+    # Effet : pieds collés au sol, le reste du corps articule autour.
+    feet_anchor_shifts_xz = None  # (N, 2) array, [dx, dz] per frame, or None
+    if args.feet_anchor:
+        # Référence : midpoint LCAL/RCAL (talons) si dispo, sinon LAJC/RAJC
+        name_to_idx = {n: i for i, n in enumerate(marker_names)}
+        ref_pair = None
+        for cand in [("LCAL", "RCAL"), ("LAJC", "RAJC")]:
+            if cand[0] in name_to_idx and cand[1] in name_to_idx:
+                ref_pair = cand
+                break
+        if ref_pair is None:
+            print("  [feet_anchor] WARNING: no LCAL/RCAL or LAJC/RAJC in markers — skipping.")
+        else:
+            li, ri = name_to_idx[ref_pair[0]], name_to_idx[ref_pair[1]]
+            midfoot = 0.5 * (markers_array[:, li, :] + markers_array[:, ri, :])  # (N, 3)
+            valid = ~(np.isnan(midfoot[:, 0]) | np.isnan(midfoot[:, 2]))
+            if not valid.any():
+                print("  [feet_anchor] WARNING: midfoot all NaN — skipping.")
+            else:
+                target_x = float(np.median(midfoot[valid, 0]))
+                target_z = float(np.median(midfoot[valid, 2]))
+                # markers_array / kpts_opensim / jcoords_opensim are all in
+                # METRES (TRC exporter scales to mm at write time). Shifts in
+                # metres directly.
+                shifts = np.zeros((markers_array.shape[0], 2), dtype=np.float64)
+                shifts[valid, 0] = target_x - midfoot[valid, 0]
+                shifts[valid, 1] = target_z - midfoot[valid, 2]
+                # Apply uniform XZ shift to all geometry (metres everywhere).
+                markers_array[:, :, 0] += shifts[:, 0:1]
+                markers_array[:, :, 2] += shifts[:, 1:2]
+                kpts_opensim[:, :, 0] += shifts[:, 0:1]
+                kpts_opensim[:, :, 2] += shifts[:, 1:2]
+                if jcoords_opensim is not None:
+                    jcoords_opensim[:, :, 0] += shifts[:, 0:1]
+                    jcoords_opensim[:, :, 2] += shifts[:, 1:2]
+                feet_anchor_shifts_xz = shifts  # in METRES, applied later to mesh
+                print(f"  [feet_anchor] anchored midpoint {ref_pair[0]}/{ref_pair[1]} "
+                      f"to ({target_x:+.3f}, {target_z:+.3f}) m. "
+                      f"max shift = {np.max(np.abs(shifts)):.3f} m")
+
     # ---------------------------------------------------------------------
     # Multi-person per-track post-processing & export (if requested)
     # ---------------------------------------------------------------------
@@ -1451,6 +1494,20 @@ def main(args):
             output_units="m",
             ground_offset_mode=_glb_ground_mode,
             override_constant_offset_m=_shared_offset_m)
+        # --feet_anchor : applique le même shift global XZ (en mètres) que
+        # celui appliqué aux kpts/markers/jcoords pour que le mesh GLB et
+        # l'anatomical/IK restent alignés au sol.
+        if feet_anchor_shifts_xz is not None:
+            for i, dxz in enumerate(feet_anchor_shifts_xz):
+                if verts_world[i] is not None:
+                    verts_world[i][:, 0] += dxz[0]
+                    verts_world[i][:, 2] += dxz[1]
+                if kpts_world[i] is not None:
+                    kpts_world[i][:, 0] += dxz[0]
+                    kpts_world[i][:, 2] += dxz[1]
+                if jc_world[i] is not None:
+                    jc_world[i][:, 0] += dxz[0]
+                    jc_world[i][:, 2] += dxz[1]
         # Le writer attend des verts en frame caméra (il fait son X/Y flip).
         # Nos verts sont DÉJÀ en world OpenSim → on signale verts_in_world=True
         # pour que le writer skip son flip et ne touche pas notre repère.
@@ -1639,6 +1696,14 @@ if __name__ == "__main__":
                              "tests sur chaise, etc.) : pieds à Y=0 chaque frame, MAIS "
                              "désactive le body-vertical correction qui force midfoot→neck "
                              "vertical (faux quand le sujet est assis). Implique --floor.")
+    parser.add_argument("--feet_anchor", action="store_true",
+                        help="Shift global per-frame qui verrouille le midpoint des pieds "
+                             "(LCAL/RCAL ou LAJC/RAJC) à sa position médiane sur toute la "
+                             "vidéo. Translate solidairement mesh + anatomical + kpts + "
+                             "markers (XZ uniquement). À utiliser pour les exercices où "
+                             "le sujet garde les pieds au sol (5STS, tests sur chaise, "
+                             "Lasègue). À NE PAS utiliser si les pieds bougent vraiment "
+                             "(marche, course).")
     parser.add_argument("--fx", type=float, default=None,
                         help="Focal length x (pixels). Skips MoGe FOV estimation if set.")
     parser.add_argument("--fy", type=float, default=None)
