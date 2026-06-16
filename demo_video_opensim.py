@@ -751,7 +751,7 @@ def main(args):
 
         # Collect mesh vertices for mesh GLB and/or --markerset flodelaplace
         # (the latter needs the 21 anatomical vertex positions per frame).
-        need_verts = (not args.no_mesh_glb) or force_collect_verts
+        need_verts = (not args.no_mesh_glb) or force_collect_verts or args.export_mesh_npz
         if need_verts and person is not None:
             verts = person.get("pred_vertices")
             cam_t = person.get("pred_cam_t")
@@ -1361,6 +1361,38 @@ def main(args):
         print(f"  Computing COM     → {com_path}")
         com_ok = run_com_analysis(osim_path, ik_mot_path, com_path)
 
+    # ── --export_mesh_npz : raw MHR mesh of one frame, estimator camera frame ──
+    # Tous les tableaux ci-dessous (all_verts, all_kpts_raw, all_joint_coords)
+    # proviennent du même tour de la boucle d'inférence et n'ont subi AUCUNE
+    # transformation pipeline (rotation OS, scale, floor lean, etc.) → repère
+    # « estimator_camera_raw », unités mètres, cohérence verts/joints/keypoints
+    # parfaite pour la frame choisie.
+    if args.export_mesh_npz:
+        fi = int(args.mesh_npz_frame)
+        if fi < 0 or fi >= len(all_verts):
+            print(f"  WARNING: --mesh_npz_frame {fi} hors limites "
+                  f"(0..{len(all_verts)-1}) — skip export.")
+        elif all_verts[fi] is None or all_kpts_raw[fi] is None or all_joint_coords[fi] is None:
+            print(f"  WARNING: frame {fi} sans détection (verts/kpts/jcoords None) "
+                  f"— skip export.")
+        else:
+            npz_path = os.path.join(args.output_dir, f"{prefix}_mesh.npz")
+            faces_np = np.asarray(estimator.faces.detach().cpu()).astype(np.int32)
+            np.savez_compressed(
+                npz_path,
+                verts=np.asarray(all_verts[fi], dtype=np.float32),
+                faces=faces_np,
+                joint_coords=np.asarray(all_joint_coords[fi], dtype=np.float32),
+                keypoints=np.asarray(all_kpts_raw[fi], dtype=np.float32),
+                frame_index=np.asarray(fi),
+                coordinate_frame=np.asarray("estimator_camera_raw"),
+                units=np.asarray("meters"),
+                n_vertices=np.asarray(int(all_verts[fi].shape[0])),
+                source=np.asarray(os.path.basename(args.video_path)),
+            )
+            print(f"  Mesh NPZ          → {npz_path}  (frame {fi}, "
+                  f"{all_verts[fi].shape[0]} verts, estimator_camera_raw)")
+
     if not args.no_mesh_glb:
         print(f"  Writing mesh GLB  → {mesh_glb}")
         # Propage la pipeline OpenSim complète (rotation axes + scale + pelvis
@@ -1547,6 +1579,15 @@ if __name__ == "__main__":
                         help="Stop after this many input frames (0=all)")
     parser.add_argument("--no_mesh_glb", action="store_true",
                         help="Skip full body mesh GLB export (saves ~185 MB for long videos)")
+    parser.add_argument("--export_mesh_npz", action="store_true",
+                        help="Export raw MHR mesh d'UNE frame en .npz (verts/faces/"
+                             "joint_coords/keypoints + meta), repère estimator_camera_raw, "
+                             "unités mètres. Off par défaut. Frame choisie via "
+                             "--mesh_npz_frame. Force la collecte des verts mesh même si "
+                             "--no_mesh_glb est passé.")
+    parser.add_argument("--mesh_npz_frame", type=int, default=0,
+                        help="Index de la frame à exporter quand --export_mesh_npz est actif "
+                             "(défaut 0).")
     parser.add_argument("--no_lean_fix", action="store_true",
                         help="Skip automatic forward-lean correction (manual --lean_angle "
                              "or --lean_ref_frame still apply if set)")
