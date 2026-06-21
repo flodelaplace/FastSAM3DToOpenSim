@@ -6,12 +6,21 @@
 #   S3_INPUT_URI         s3://bucket/input/video.mp4            (required)
 #   S3_OUTPUT_URI        s3://bucket/output/                     (required, trailing /)
 #   CHECKPOINTS_S3_URI   s3://bucket/checkpoints/                (required, trailing /)
+#   MODE                 sam3d | avatar                          (default: sam3d)
 #   INFERENCE_TYPE       body | full                             (default: body)
 #   EXTRA_ARGS           per-video flags from filename parser    (default: empty)
 #   TRIM_START           integer seconds (ffmpeg -ss)            (optional)
 #   TRIM_END             integer seconds (ffmpeg -to)            (optional)
 #
 # Flow: sync checkpoints → pull video → [ffmpeg trim] → process → push to S3
+#
+# MODE switches the Python entry point (same Docker image, same EXTRA_ARGS grammar):
+#   MODE=sam3d   → demo_video_opensim.py  (full pipeline: TRC + IK + mesh + anat GLB + .mot)
+#                  Output S3 layout:   <S3_OUTPUT_URI>/output_<TS>_<name>/{trc,mot,glb,...}
+#   MODE=avatar  → generate_avatars.py    (skip OpenSim, TRC + N humanised avatar GLBs only)
+#                  Output S3 layout:   <S3_OUTPUT_URI>/{template_id}.glb        (flat under
+#                  the prefix — the Lambda already builds it as
+#                  02-output-avatar/<user>/<exercise>/)
 # =============================================================================
 set -euo pipefail
 
@@ -20,16 +29,28 @@ set -euo pipefail
 : "${S3_OUTPUT_URI:?S3_OUTPUT_URI is not set}"
 : "${CHECKPOINTS_S3_URI:?CHECKPOINTS_S3_URI is not set}"
 
+MODE="${MODE:-sam3d}"
 INFERENCE_TYPE="${INFERENCE_TYPE:-body}"
 VIDEO_BASENAME=$(basename "$S3_INPUT_URI")
 VIDEO_NAME="${VIDEO_BASENAME%.*}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOCAL_INPUT="/tmp/input/${VIDEO_BASENAME}"
 PROC_INPUT="$LOCAL_INPUT"
-OUTPUT_DIR="/outputs/output_${TIMESTAMP}_${VIDEO_NAME}"
-S3_OUTPUT_PATH="${S3_OUTPUT_URI%/}/output_${TIMESTAMP}_${VIDEO_NAME}/"
+
+# In avatar mode we write outputs DIRECTLY under S3_OUTPUT_URI (no extra
+# `output_<TS>_<name>/` wrapper) — the Lambda has already crafted the prefix
+# as 02-output-avatar/<user>/<exercise>/. In sam3d mode we keep the timestamped
+# wrapper since the user/exercise grouping doesn't exist there.
+if [ "$MODE" = "avatar" ]; then
+    OUTPUT_DIR="/outputs/avatar_${TIMESTAMP}_${VIDEO_NAME}"
+    S3_OUTPUT_PATH="${S3_OUTPUT_URI%/}/"
+else
+    OUTPUT_DIR="/outputs/output_${TIMESTAMP}_${VIDEO_NAME}"
+    S3_OUTPUT_PATH="${S3_OUTPUT_URI%/}/output_${TIMESTAMP}_${VIDEO_NAME}/"
+fi
 
 echo "=== FastSAM3DToOpenSim AWS Batch Job ==="
+echo "  Mode:          $MODE"
 echo "  Input:         $S3_INPUT_URI"
 echo "  Output S3:     $S3_OUTPUT_PATH"
 echo "  Checkpoints:   $CHECKPOINTS_S3_URI"
@@ -128,23 +149,57 @@ fi
 
 # ---- Run inference ----------------------------------------------------------
 # Static prod flags — per-video flags come via EXTRA_ARGS (set by the Lambda
-# from the filename meta block: h<cm>, s/e trim, st, com, multi-person).
-echo ">>> Processing video..."
-# shellcheck disable=SC2086
-python demo_video_opensim.py \
-    --video_path "$PROC_INPUT" \
-    --output_dir "$OUTPUT_DIR" \
-    --inference_type "$INFERENCE_TYPE" \
-    --markerset flodelaplace \
-    --floor_moge \
-    --detector_model checkpoints/yolo/yolo11m-pose.engine \
-    --bbox_thr 0.2 --nms_thr 0.9 \
-    --detect_then_infer --inference_batch_cap 4 \
-    --fallback_lower_bbox 0.05 --fallback_nms 0.9 --fallback_iou_thresh 0.5 \
-    ${EXTRA_ARGS:-}
+# from the filename meta block: h<cm>, s/e trim, st, com, multi-person, floor,
+# floor_seated, feet_anchor, etc.).
+echo ">>> Processing video (mode=$MODE)..."
+if [ "$MODE" = "avatar" ]; then
+    # Avatar pipeline : same SAM3D body inference + retarget onto each
+    # MakeHuman template in assets/avatars/avatar_*_apose_opaque.glb. Writes
+    # markers_<name>.trc + markers_<name>_avatar_<template>.glb per template.
+    # shellcheck disable=SC2086
+    python generate_avatars.py \
+        --video_path "$PROC_INPUT" \
+        --output_dir "$OUTPUT_DIR" \
+        --inference_type "$INFERENCE_TYPE" \
+        --markerset flodelaplace \
+        --floor_moge \
+        --detector_model checkpoints/yolo/yolo11m-pose.engine \
+        --bbox_thr 0.2 --nms_thr 0.9 \
+        --detect_then_infer --inference_batch_cap 4 \
+        --fallback_lower_bbox 0.05 --fallback_nms 0.9 --fallback_iou_thresh 0.5 \
+        ${EXTRA_ARGS:-}
+else
+    # shellcheck disable=SC2086
+    python demo_video_opensim.py \
+        --video_path "$PROC_INPUT" \
+        --output_dir "$OUTPUT_DIR" \
+        --inference_type "$INFERENCE_TYPE" \
+        --markerset flodelaplace \
+        --floor_moge \
+        --detector_model checkpoints/yolo/yolo11m-pose.engine \
+        --bbox_thr 0.2 --nms_thr 0.9 \
+        --detect_then_infer --inference_batch_cap 4 \
+        --fallback_lower_bbox 0.05 --fallback_nms 0.9 --fallback_iou_thresh 0.5 \
+        ${EXTRA_ARGS:-}
+fi
 
 # ---- Push results to S3 -----------------------------------------------------
 echo ">>> Uploading results to S3..."
-aws s3 cp "$OUTPUT_DIR" "$S3_OUTPUT_PATH" --recursive --no-progress
+if [ "$MODE" = "avatar" ]; then
+    # Avatar : on n'envoie QUE les GLB avatars (pas le TRC, pas l'inference_meta).
+    # L'app kiné a juste besoin des avatars finaux.
+    AVATAR_COUNT=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*_avatar_*.glb" | wc -l)
+    echo ">>> Uploading $AVATAR_COUNT avatar GLB(s) to $S3_OUTPUT_PATH"
+    for glb in "$OUTPUT_DIR"/*_avatar_*.glb; do
+        [ -f "$glb" ] || continue
+        # Strip the markers_<name>_avatar_ prefix → keep only "<template_id>.glb"
+        # ex: markers_squat_001__h180_floor_avatar_female_young.glb → female_young.glb
+        BASENAME=$(basename "$glb")
+        TEMPLATE_ID=$(echo "$BASENAME" | sed -E 's/.*_avatar_(.+)\.glb$/\1.glb/')
+        aws s3 cp "$glb" "${S3_OUTPUT_PATH}${TEMPLATE_ID}" --no-progress
+    done
+else
+    aws s3 cp "$OUTPUT_DIR" "$S3_OUTPUT_PATH" --recursive --no-progress
+fi
 
 echo "=== Job complete -> $S3_OUTPUT_PATH ==="
