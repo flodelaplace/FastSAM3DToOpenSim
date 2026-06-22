@@ -6,10 +6,9 @@ Fast SAM 3D Body — Avatar-only generation
 Variante simplifiée de demo_video_opensim.py qui s'arrête après l'export TRC
 et génère UN GLB avatar par template présent dans assets/avatars/.
 
-Pipeline :
-  Video → SAM3D body inference → post-processing → TRC (en mémoire)
-        → boucle sur assets/avatars/avatar_*_apose_opaque.glb
-        → 1 GLB avatar par template
+Pipeline : Video → SAM3D body → post-process → TRC (en mémoire)
+           → boucle assets/avatars/avatar_*_apose_opaque.glb
+           → 1 GLB avatar par template
 
 Output dir contient :
   markers_<name>.trc                    — TRC source (mm, Y-up)
@@ -18,16 +17,12 @@ Output dir contient :
 
 PAS générés (vs demo_video_opensim.py) :
   _model.osim, _ik.mot, _mesh.glb, _anatomical.glb, _ik_marker_errors.sto,
-  clinical_angles, processing_report.json, video_outputs.json
+  clinical_angles, processing_report.json, _skeleton.mp4, video_outputs.json
 
-Templates auto-détectés via glob('assets/avatars/avatar_*_apose_opaque.glb').
-Ajouter un nouveau template = poser le fichier, aucune modif code.
-
-Usage typique (Docker) :
-    VIDEO=Squat.MP4 HEIGHT=1.85 OUTPUT_NAME=avatars_squat \\
-      EXTRA_ARGS="--floor" \\
-      ./scripts/test_docker_local.sh
-    (avec l'entrypoint Docker pointant sur generate_avatars.py)
+Supporte tous les flags du SAM3D pipeline : --floor, --floor_seated,
+--feet_anchor, --stationary, etc. Aucune divergence d'argparse — ce
+script est un fork direct de demo_video_opensim.py avec early-return
+après le TRC + boucle templates avatar.
 """
 
 import argparse
@@ -360,14 +355,11 @@ def main(args):
     meta_path      = os.path.join(args.output_dir, "inference_meta.json")
     outputs_path   = os.path.join(args.output_dir, "video_outputs.json")
 
+    # Avatar pipeline : skip skeleton.mp4 generation (gain de CPU encoding +
+    # évite la dépendance fonctionnelle au codec mp4v du conda ffmpeg).
     class _NoOpVideoWriter:
-        """No-op stand-in for cv2.VideoWriter — avatar pipeline skips the
-        skeleton overlay video to gain processing time and avoid generating
-        a useless _skeleton.mp4 file."""
-        def write(self, *args, **kwargs):
-            pass
-        def release(self):
-            pass
+        def write(self, *a, **kw): pass
+        def release(self): pass
     writer = _NoOpVideoWriter()
 
     print(f"\nVideo: {width}x{height} @ {fps:.1f}fps | {total} frames")
@@ -739,7 +731,7 @@ def main(args):
 
         # Collect mesh vertices for mesh GLB and/or --markerset flodelaplace
         # (the latter needs the 21 anatomical vertex positions per frame).
-        need_verts = (not args.no_mesh_glb) or force_collect_verts
+        need_verts = (not args.no_mesh_glb) or force_collect_verts or args.export_mesh_npz
         if need_verts and person is not None:
             verts = person.get("pred_vertices")
             cam_t = person.get("pred_cam_t")
@@ -757,10 +749,7 @@ def main(args):
         else:
             all_verts.append(None)
 
-        # Skip skeleton overlay drawing — avatar pipeline doesn't need it.
-        # writer is _NoOpVideoWriter anyway, but we save the CPU rendering cost.
-        # vis_frame = draw_results_on_frame(frame_bgr, outputs, visualizer)
-        writer.write(frame_bgr)
+        # Avatar pipeline : skip drawing the skeleton overlay (writer is no-op).
 
         processed += 1
         avg_fps = 1.0 / (sum(inference_times) / len(inference_times))
@@ -844,7 +833,10 @@ def main(args):
     # `--floor` flag : si présent, active la mise au sol (per-frame) et le
     # redressement (one-shot floor lean correction). Si absent, le sujet reste
     # dans sa position 3D réelle (utile pour rameur, couché, suspension, etc.).
-    _apply_floor = args.floor
+    _apply_floor = args.floor or args.floor_seated
+    # --floor_seated désactive uniquement le body-vertical correction (le
+    # sujet assis n'a pas un axe midfoot→neck vertical à imposer).
+    _apply_body_vertical = (not args.floor_seated) if _apply_floor else None
     # correct_floor_lean est DÉCOUPLÉ de align_to_ground :
     # - Activé si MoGe a calculé un angle (= --floor_moge) ou si --floor
     # - Permet d'avoir le redressement caméra (pitch/roll/body-vertical) en
@@ -860,6 +852,7 @@ def main(args):
         apply_global_translation=not args.stationary,
         correct_floor_lean=_correct_lean,
         floor_angle=moge_floor_angle,
+        apply_body_vertical=_apply_body_vertical,
     )
 
     # 2b. Spine-based forward-lean correction (runs after floor-plane rotation above).
@@ -939,6 +932,49 @@ def main(args):
         markers_body, _ = converter.convert(
             kpts_opensim, include_derived=True, body_only=True
         )
+
+    # ── --feet_anchor : shift global per-frame pour que le midpoint des
+    # pieds reste à sa position médiane sur toute la vidéo. Translate tout
+    # le corps (mesh + kpts + jcoords + markers) du même delta XZ par frame.
+    # Effet : pieds collés au sol, le reste du corps articule autour.
+    feet_anchor_shifts_xz = None  # (N, 2) array, [dx, dz] per frame, or None
+    if args.feet_anchor:
+        # Référence : midpoint LCAL/RCAL (talons) si dispo, sinon LAJC/RAJC
+        name_to_idx = {n: i for i, n in enumerate(marker_names)}
+        ref_pair = None
+        for cand in [("LCAL", "RCAL"), ("LAJC", "RAJC")]:
+            if cand[0] in name_to_idx and cand[1] in name_to_idx:
+                ref_pair = cand
+                break
+        if ref_pair is None:
+            print("  [feet_anchor] WARNING: no LCAL/RCAL or LAJC/RAJC in markers — skipping.")
+        else:
+            li, ri = name_to_idx[ref_pair[0]], name_to_idx[ref_pair[1]]
+            midfoot = 0.5 * (markers_array[:, li, :] + markers_array[:, ri, :])  # (N, 3)
+            valid = ~(np.isnan(midfoot[:, 0]) | np.isnan(midfoot[:, 2]))
+            if not valid.any():
+                print("  [feet_anchor] WARNING: midfoot all NaN — skipping.")
+            else:
+                target_x = float(np.median(midfoot[valid, 0]))
+                target_z = float(np.median(midfoot[valid, 2]))
+                # markers_array / kpts_opensim / jcoords_opensim are all in
+                # METRES (TRC exporter scales to mm at write time). Shifts in
+                # metres directly.
+                shifts = np.zeros((markers_array.shape[0], 2), dtype=np.float64)
+                shifts[valid, 0] = target_x - midfoot[valid, 0]
+                shifts[valid, 1] = target_z - midfoot[valid, 2]
+                # Apply uniform XZ shift to all geometry (metres everywhere).
+                markers_array[:, :, 0] += shifts[:, 0:1]
+                markers_array[:, :, 2] += shifts[:, 1:2]
+                kpts_opensim[:, :, 0] += shifts[:, 0:1]
+                kpts_opensim[:, :, 2] += shifts[:, 1:2]
+                if jcoords_opensim is not None:
+                    jcoords_opensim[:, :, 0] += shifts[:, 0:1]
+                    jcoords_opensim[:, :, 2] += shifts[:, 1:2]
+                feet_anchor_shifts_xz = shifts  # in METRES, applied later to mesh
+                print(f"  [feet_anchor] anchored midpoint {ref_pair[0]}/{ref_pair[1]} "
+                      f"to ({target_x:+.3f}, {target_z:+.3f}) m. "
+                      f"max shift = {np.max(np.abs(shifts)):.3f} m")
 
     # ---------------------------------------------------------------------
     # Multi-person per-track post-processing & export (if requested)
@@ -1071,6 +1107,7 @@ def main(args):
                 apply_global_translation=not args.stationary,
                 correct_floor_lean=not args.no_lean_fix,
                 floor_angle=moge_floor_angle,
+                apply_body_vertical=not args.floor_seated,
             )
 
             # Spine lean correction
@@ -1243,18 +1280,17 @@ def main(args):
 
     # --- Boucle sur tous les templates avatars présents -------------------
     import glob
-    templates = sorted(glob.glob(os.path.join(parent_dir, "assets", "avatars", "avatar_*_apose_opaque.glb")))
+    templates = sorted(glob.glob(os.path.join(parent_dir, "assets", "avatars",
+                                              "avatar_*_apose_opaque.glb")))
     if not templates:
-        print("  WARNING: aucun template avatar trouvé dans assets/avatars/avatar_*_apose_opaque.glb")
+        print("  WARNING: aucun template avatar trouvé dans assets/avatars/")
     else:
         print(f"\n  Generating {len(templates)} avatar(s) from TRC...")
         for tpl in templates:
             tpl_stem = os.path.splitext(os.path.basename(tpl))[0]
-            # avatar_female_young_apose_opaque → female_young
             short = tpl_stem
-            for prefix_tag in ("avatar_",):
-                if short.startswith(prefix_tag):
-                    short = short[len(prefix_tag):]
+            if short.startswith("avatar_"):
+                short = short[len("avatar_"):]
             for tag in ("_apose_opaque", "_opaque", "_apose"):
                 if short.endswith(tag):
                     short = short[: -len(tag)]
@@ -1272,6 +1308,278 @@ def main(args):
 
     print(f"\nDone! TRC + {len(templates)} avatar(s) in {args.output_dir}")
     return  # skip OpenSim scaling, IK, mesh GLB, anatomical GLB, clinical angles
+
+    # Scale the generic model to the subject's proportions, then run IK
+    if os.path.isfile(model_template):
+        shutil.copy(model_template, osim_path)
+        print(f"  Writing model     → {osim_path}")
+        subject_mass = args.subject_mass
+
+        # Auto-detect the quietest window in the sequence for Scale Tool +
+        # MarkerPlacer. Using a static-pose window instead of the whole video
+        # avoids averaging over dynamic motion (squat, etc.) — JC distances
+        # are stable, MarkerPlacer sees a clean reference pose.
+        calib_ts = calib_te = None
+        if markerset == "flodelaplace" and getattr(args, "auto_static_calib", True):
+            calib_ts, calib_te, f_s, f_e = _detect_static_window(kpts_opensim, out_fps)
+            print(f"  [calib] quietest window: frames {f_s}-{f_e}  ({calib_ts:.2f}-{calib_te:.2f}s)")
+
+        print(f"  Scaling model     → {osim_path}  (mass={subject_mass:.1f} kg, height={subject_height:.2f} m)")
+        scale_ok = run_scale_tool(
+            model_path=osim_path,
+            trc_path=trc_path,
+            scaled_model_path=osim_path,
+            subject_mass=subject_mass,
+            subject_height=subject_height,
+            markerset=markerset,
+            calibration_t_start=calib_ts,
+            calibration_t_end=calib_te,
+            marker_placer=getattr(args, "marker_placer", False),
+        )
+        if not scale_ok:
+            print("  WARNING: Scale Tool failed – running IK on unscaled model.")
+    else:
+        print(f"  WARNING: model template not found at {model_template}")
+
+    frames_markers      = [markers_array[i] for i in range(N)]
+    frames_markers_body = [markers_body[i]  for i in range(N)]
+
+    print(f"  Running OpenSim IK → {ik_mot_path}")
+    ik_ok = run_ik(
+        model_path=osim_path,
+        trc_path=trc_path,
+        mot_path=ik_mot_path,
+        errors_path=errors_path,
+        markerset=markerset,
+    )
+    if not ik_ok:
+        print("  WARNING: OpenSim IK failed or opensim env not found.")
+
+    # Per-marker IK error analysis — computes mean/max distance in mm between
+    # each TRC marker trajectory and the model's marker FK positions. Useful
+    # to spot bony landmarks that fit poorly (bad vertex pick or bad .osim
+    # local position). Debug-only opt-in: pass --ik_diagnostics locally when
+    # tuning markers; off by default since it roughly doubles the OpenSim
+    # step wall time.
+    if (ik_ok and args.ik_diagnostics
+            and os.path.isfile(osim_path) and os.path.isfile(ik_mot_path)):
+        errors_csv = os.path.join(args.output_dir, f"{prefix}_ik_per_marker_errors.csv")
+        print(f"  Computing per-marker IK errors → {errors_csv}")
+        err_summary = run_per_marker_error_analysis(
+            model_path=osim_path, mot_path=ik_mot_path,
+            trc_path=trc_path, out_csv=errors_csv,
+        )
+        if err_summary:
+            print(f"\n  Per-marker IK errors (top 15 worst by max, mm):")
+            print(f"  {'marker':20s} {'mean':>8s} {'max':>8s}   frames")
+            for row in err_summary[:15]:
+                print(f"  {row['marker']:20s} {row['mean_mm']:8.2f} {row['max_mm']:8.2f}   {row['n_frames']}")
+            # Global summary
+            n_total = len(err_summary)
+            mean_global = sum(r['mean_mm'] for r in err_summary) / max(n_total, 1)
+            max_global = max((r['max_mm'] for r in err_summary), default=0.0)
+            print(f"  {'':20s} {'----':>8s} {'----':>8s}")
+            print(f"  {f'ALL ({n_total} markers)':20s} {mean_global:8.2f} {max_global:8.2f}")
+
+    # Centre of mass analysis (requires successful IK + scaled model)
+    com_ok = False
+    if args.compute_com and ik_ok and os.path.isfile(osim_path) and os.path.isfile(ik_mot_path):
+        com_path = os.path.join(args.output_dir, f"{prefix}_com.sto")
+        print(f"  Computing COM     → {com_path}")
+        com_ok = run_com_analysis(osim_path, ik_mot_path, com_path)
+
+    # ── --export_mesh_npz : raw MHR mesh of one frame, estimator camera frame ──
+    # Tous les tableaux ci-dessous (all_verts, all_kpts_raw, all_joint_coords)
+    # proviennent du même tour de la boucle d'inférence et n'ont subi AUCUNE
+    # transformation pipeline (rotation OS, scale, floor lean, etc.) → repère
+    # « estimator_camera_raw », unités mètres, cohérence verts/joints/keypoints
+    # parfaite pour la frame choisie.
+    if args.export_mesh_npz:
+        fi = int(args.mesh_npz_frame)
+        if fi < 0 or fi >= len(all_verts):
+            print(f"  WARNING: --mesh_npz_frame {fi} hors limites "
+                  f"(0..{len(all_verts)-1}) — skip export.")
+        elif all_verts[fi] is None or all_kpts_raw[fi] is None or all_joint_coords[fi] is None:
+            print(f"  WARNING: frame {fi} sans détection (verts/kpts/jcoords None) "
+                  f"— skip export.")
+        else:
+            npz_path = os.path.join(args.output_dir, f"{prefix}_mesh.npz")
+            _faces_raw = estimator.faces
+            if hasattr(_faces_raw, "detach"):
+                _faces_raw = _faces_raw.detach().cpu()
+            faces_np = np.asarray(_faces_raw).astype(np.int32)
+            np.savez_compressed(
+                npz_path,
+                verts=np.asarray(all_verts[fi], dtype=np.float32),
+                faces=faces_np,
+                joint_coords=np.asarray(all_joint_coords[fi], dtype=np.float32),
+                keypoints=np.asarray(all_kpts_raw[fi], dtype=np.float32),
+                frame_index=np.asarray(fi),
+                coordinate_frame=np.asarray("estimator_camera_raw"),
+                units=np.asarray("meters"),
+                n_vertices=np.asarray(int(all_verts[fi].shape[0])),
+                source=np.asarray(os.path.basename(args.video_path)),
+            )
+            print(f"  Mesh NPZ          → {npz_path}  (frame {fi}, "
+                  f"{all_verts[fi].shape[0]} verts, estimator_camera_raw)")
+
+    if not args.no_mesh_glb:
+        print(f"  Writing mesh GLB  → {mesh_glb}")
+        # Propage la pipeline OpenSim complète (rotation axes + scale + pelvis
+        # centering + floor lean correction + ground alignment) aux mesh verts
+        # via transformer.apply_pipeline_to_verts(). Le transformer a déjà
+        # tourné cette pipeline pour les keypoints (ligne 851), on rejoue les
+        # mêmes opérations en utilisant l'état caché pour que le mesh soit
+        # au même repère world que l'anatomical GLB.
+        # Pour la COHÉRENCE intra-GLB (mesh skin + segments/sphères MHR dessinés
+        # dedans), on utilise le MÊME ground_offset_mode ET le MÊME offset
+        # numérique pour les 3 inputs.
+        #   --floor=True  → constant_from_calib : 1 shift Y unique calculé
+        #                   depuis les kpts (référence biomécanique = feet
+        #                   markers MHR), réutilisé pour mesh + segments.
+        #                   Garantit zéro décalage entre eux.
+        #   --floor=False → none : pas de shift Y, position 3D réelle préservée.
+        # NB : le pipeline TRC/IK/anatomical utilise toujours `align_to_ground`
+        # per_frame de transform() — inchangé.
+        # --floor=True  → per_frame : feet à Y=0 chaque frame (subject piedssol)
+        # --floor=False → constant_from_calib : shift Y calculé sur les 20
+        #                 premières frames (assumées standing) appliqué constant.
+        #                 Évite que le mesh soit way below ground quand il y a
+        #                 pas de ground alignment per_frame.
+        _glb_ground_mode = "per_frame" if _apply_floor else "constant_from_calib"
+        # Compute shared calib offset depuis les kpts (= référence biomécanique
+        # pieds) pour assurer que mesh + kpts segments + joints partagent le
+        # même Y zero dans le GLB final. Utilisé en mode constant_from_calib
+        # (no --floor). Pour per_frame (--floor) l'override est ignoré.
+        _shared_offset_m = None
+        if not _apply_floor:
+            _kpts_no_offset = transformer.apply_pipeline_to_verts(
+                [k.copy() if k is not None else None for k in all_kpts_raw],
+                output_units="m",
+                ground_offset_mode="none")
+            _calib_ys = [w[:, 1].min() for w in _kpts_no_offset[:20] if w is not None]
+            if _calib_ys:
+                _shared_offset_m = float(min(_calib_ys))
+                print(f"  Mesh GLB: shared calib offset Y -= {_shared_offset_m:.3f} m "
+                      f"(from kpts on {len(_calib_ys)} calib frames)")
+        # Pass RAW points (no cam_t added) so apply_pipeline_to_verts mirrors
+        # exactly what transform() did for the canonical kpts_opensim — the
+        # only cam_t contribution goes through _last_xz_deltas_m (XZ delta
+        # from frame 0). This puts mesh + kpts + jcoords in the same frame
+        # as the anatomical GLB (which is driven by kpts_opensim → TRC → IK).
+        verts_world = transformer.apply_pipeline_to_verts(
+            all_verts, output_units="m",
+            ground_offset_mode=_glb_ground_mode,
+            override_constant_offset_m=_shared_offset_m)
+        kpts_world = transformer.apply_pipeline_to_verts(
+            [k.copy() if k is not None else None for k in all_kpts_raw],
+            output_units="m",
+            ground_offset_mode=_glb_ground_mode,
+            override_constant_offset_m=_shared_offset_m)
+        jc_world = transformer.apply_pipeline_to_verts(
+            [j.copy() if j is not None else None for j in all_joint_coords],
+            output_units="m",
+            ground_offset_mode=_glb_ground_mode,
+            override_constant_offset_m=_shared_offset_m)
+        # --feet_anchor : applique le même shift global XZ (en mètres) que
+        # celui appliqué aux kpts/markers/jcoords pour que le mesh GLB et
+        # l'anatomical/IK restent alignés au sol.
+        if feet_anchor_shifts_xz is not None:
+            for i, dxz in enumerate(feet_anchor_shifts_xz):
+                if verts_world[i] is not None:
+                    verts_world[i][:, 0] += dxz[0]
+                    verts_world[i][:, 2] += dxz[1]
+                if kpts_world[i] is not None:
+                    kpts_world[i][:, 0] += dxz[0]
+                    kpts_world[i][:, 2] += dxz[1]
+                if jc_world[i] is not None:
+                    jc_world[i][:, 0] += dxz[0]
+                    jc_world[i][:, 2] += dxz[1]
+        # Le writer attend des verts en frame caméra (il fait son X/Y flip).
+        # Nos verts sont DÉJÀ en world OpenSim → on signale verts_in_world=True
+        # pour que le writer skip son flip et ne touche pas notre repère.
+        write_mesh_glb(mesh_glb, timestamps, verts_world, estimator.faces,
+                       frames_kpts=kpts_world,
+                       frames_cam_t=[np.zeros(3, dtype=np.float32) if ct is not None else None
+                                     for ct in all_cam_t],
+                       frames_joint_coords=jc_world,
+                       body_only=body_only,
+                       verts_in_world=True)
+
+        # Separate anatomical-bone GLB (in OpenSim frame, animated by IK .mot)
+        if ik_ok and os.path.isfile(osim_path) and os.path.isfile(ik_mot_path):
+            anat_glb = os.path.join(args.output_dir, f"{prefix}_anatomical.glb")
+            print(f"  Writing anatomical GLB → {anat_glb}")
+            from sam_3d_body.export.opensim_exporter import write_anatomical_glb
+            write_anatomical_glb(anat_glb, osim_path, ik_mot_path)
+
+            # Derived clinical angles : ajoute 11 colonnes au .mot
+            # (knee_valgus, knee_rotation, ankle_rotation, foot_progression
+            # × R/L + trunk_flexion/lean_lateral/rotation). Réutilise le
+            # body_transforms.json déjà calculé pour l'anatomical GLB —
+            # négligeable en coût supplémentaire (juste de la géométrie).
+            from sam_3d_body.export.clinical_angles import add_clinical_angles_to_mot
+            body_tf_json = os.path.join(
+                args.output_dir,
+                f"{os.path.splitext(os.path.basename(osim_path))[0]}_body_transforms.json",
+            )
+            try:
+                n_added = add_clinical_angles_to_mot(ik_mot_path, body_tf_json)
+                if n_added:
+                    print(f"  Clinical angles    → {n_added} colonnes ajoutées au .mot")
+            except Exception as err:
+                print(f"  [clinical_angles] failed silently: {err}")
+        # gltfpack disabled: incompatible with viewer (KHR_mesh_quantization breaks morph targets)
+        # _compress_glb(mesh_glb)
+
+    # Write processing report (matches SAM3D-OpenSim convention)
+    report_path = os.path.join(args.output_dir, "processing_report.json")
+    total_time = time.time() - t_start
+    report = {
+        "input": os.path.abspath(args.video_path),
+        "output_dir": args.output_dir,
+        "subject": {"height": subject_height},
+        "video_info": {"fps": fps, "frame_count": total, "width": width, "height": height},
+        "processing": {
+            "fps": out_fps,
+            "num_frames": processed,
+            "num_markers": len(marker_names),
+            "ik_success": ik_ok,
+        },
+        "timings": {"total": total_time},
+        "outputs": {
+            "video": vid_path,
+            "trc": trc_path,
+            "mot": ik_mot_path if ik_ok else None,
+            "model": osim_path,
+            "mesh_glb": mesh_glb,
+            "per_person_trcs": per_person_trcs if len(per_person_trcs) > 0 else None,
+            "per_person_ik": per_person_ik_results if len(per_person_ik_results) > 0 else None,
+        },
+    }
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2)
+
+    print(f"\nOutput folder: {args.output_dir}")
+    print("\nOutput files:")
+    print(f"  Video:               {os.path.basename(vid_path)}")
+    print(f"  TRC (73 markers/mm): {os.path.basename(trc_path)}")
+    print(f"  IK MOT (40 DOF):     {os.path.basename(ik_mot_path)}" + (" ✓" if ik_ok else " (skipped)"))
+    print(f"  Body model:          {os.path.basename(osim_path)}")
+    if not args.no_mesh_glb:
+        print(f"  Mesh GLB:            {os.path.basename(mesh_glb)}")
+    print(f"  Processing report:   {os.path.basename(report_path)}")
+
+    print("""
+─────────────────────────────────────────────────────────────────
+OpenSim workflow:
+  1. Load markers_output_<name>_model.osim in OpenSim
+  2. Scale Tool → use TRC for static pose calibration
+  3. IK Tool → load TRC → IK MOT is already written if opensim env found
+  4. GLB files can be previewed in Blender / any glTF viewer (File → Import → glTF 2.0).
+─────────────────────────────────────────────────────────────────
+""")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fast SAM 3D Body – OpenSim Export")
@@ -1315,6 +1623,15 @@ if __name__ == "__main__":
                         help="Stop after this many input frames (0=all)")
     parser.add_argument("--no_mesh_glb", action="store_true",
                         help="Skip full body mesh GLB export (saves ~185 MB for long videos)")
+    parser.add_argument("--export_mesh_npz", action="store_true",
+                        help="Export raw MHR mesh d'UNE frame en .npz (verts/faces/"
+                             "joint_coords/keypoints + meta), repère estimator_camera_raw, "
+                             "unités mètres. Off par défaut. Frame choisie via "
+                             "--mesh_npz_frame. Force la collecte des verts mesh même si "
+                             "--no_mesh_glb est passé.")
+    parser.add_argument("--mesh_npz_frame", type=int, default=0,
+                        help="Index de la frame à exporter quand --export_mesh_npz est actif "
+                             "(défaut 0).")
     parser.add_argument("--no_lean_fix", action="store_true",
                         help="Skip automatic forward-lean correction (manual --lean_angle "
                              "or --lean_ref_frame still apply if set)")
@@ -1361,6 +1678,19 @@ if __name__ == "__main__":
                              "pour les mouvements non-standing (rameur, couché, suspension) "
                              "→ le mesh et squelette restent dans leur position 3D réelle "
                              "sans forcing au sol.")
+    parser.add_argument("--floor_seated", action="store_true",
+                        help="Variante de --floor pour les mouvements ASSIS (sit-to-stand, "
+                             "tests sur chaise, etc.) : pieds à Y=0 chaque frame, MAIS "
+                             "désactive le body-vertical correction qui force midfoot→neck "
+                             "vertical (faux quand le sujet est assis). Implique --floor.")
+    parser.add_argument("--feet_anchor", action="store_true",
+                        help="Shift global per-frame qui verrouille le midpoint des pieds "
+                             "(LCAL/RCAL ou LAJC/RAJC) à sa position médiane sur toute la "
+                             "vidéo. Translate solidairement mesh + anatomical + kpts + "
+                             "markers (XZ uniquement). À utiliser pour les exercices où "
+                             "le sujet garde les pieds au sol (5STS, tests sur chaise, "
+                             "Lasègue). À NE PAS utiliser si les pieds bougent vraiment "
+                             "(marche, course).")
     parser.add_argument("--fx", type=float, default=None,
                         help="Focal length x (pixels). Skips MoGe FOV estimation if set.")
     parser.add_argument("--fy", type=float, default=None)
