@@ -25,40 +25,39 @@ from pathlib import Path
 #   1.5  foot markers — important for ground contact
 #   0.5  head / hand kpts and armature spine joints — noisier, low priority
 MARKER_WEIGHTS_FLODELAPLACE: dict[str, float] = {
-    # Head: bumped HTOP, c_head, LEar/REar to ~2.0 so the IK pulls the head
-    # body to actually follow the cranial markers (was ~0.5–0.8, so the head
-    # body lagged behind the visible mesh during motion). Eye/Nose stay low
-    # because they're noisy MHR projections.
+    # Head: HTOP/Ears strong constraint, Eye/Nose noisy → low weight.
     "Nose":  0.5, "LEye": 0.3, "REye": 0.3, "LEar": 1.8, "REar": 1.8,
     "HTOP":  2.0,
-    # Spine armature (jcoord-direct, soft constraint)
-    "c_spine0": 0.5, "c_spine1": 0.5, "c_spine2": 0.5, "c_spine3": 0.5,
+    # Spine armature (jcoord-direct, soft constraint). c_spine1 removed
+    # from the XIPH model (not picked in Mesh2Marker).
+    "c_spine0": 0.5, "c_spine2": 0.5, "c_spine3": 0.5,
     "c_neck":   1.0, "c_head":   2.0,
     "RCLAV":    0.5, "LCLAV":    0.5,
-    # Torso bony + JC
-    "C7":   2.0,
+    # Torso bony — XIPH (xiphoid process, anterior sternum) added by
+    # Mesh2Marker, gives a real anterior landmark for torso_X.
+    "C7":   2.0, "XIPH": 1.5,
     "RACR": 2.0, "LACR": 2.0,
-    # RSJC/LSJC removed — MHR kpt 5/6 ("shoulder") don't reliably land on the
-    # glenohumeral joint center; acromion (bony, vertex-picked on mesh) is a
-    # more trustworthy handle for shoulder-segment IK.
-    # Upper limb
-    "REJC": 1.5, "LEJC": 1.5,
+    # Upper limb — surface clusters only (no more EJC virtual). Clusters
+    # RHTO/RHAP/RHBA/RHFR are placed mid-humerus → soft weight, they help
+    # the segment orientation but aren't strong distal constraints.
     "RLEL": 2.0, "RMEL": 2.0, "LLEL": 2.0, "LMEL": 2.0,
+    "RHTO": 1.0, "RHAP": 1.0, "RHBA": 1.0, "RHFR": 1.0,
+    "LHTO": 1.0, "LHAP": 1.0, "LHBA": 1.0, "LHFR": 1.0,
     "RFAradius": 2.0, "RFAulna": 2.0, "LFAradius": 2.0, "LFAulna": 2.0,
+    "RFRM": 1.0, "LFRM": 1.0,
     # Wrist + hand
     "RWrist_hand": 0.5, "LWrist_hand": 0.5,
     "RThumb":      0.5, "RIndex":      0.5, "RPinky":      0.5,
     "LThumb":      0.5, "LIndex":      0.5, "LPinky":      0.5,
     "RIndexTip":   0.5, "RPinkyTip":   0.5,
     "LIndexTip":   0.5, "LPinkyTip":   0.5,
-    # Pelvis bony + JC
+    # Pelvis bony (no more HJC virtual)
     "RASI": 2.0, "LASI": 2.0, "RPSI": 2.0, "LPSI": 2.0,
-    "RHJC": 1.5, "LHJC": 1.5,
-    # Lower limb
-    "RKJC": 1.5, "LKJC": 1.5,
-    "RAJC": 1.5, "LAJC": 1.5,
+    # Lower limb — surface clusters only (no more KJC/AJC virtual).
     "RLFC": 2.0, "RMFC": 2.0, "LLFC": 2.0, "LMFC": 2.0,
+    "RFLT": 1.0, "RFLB": 1.0, "LFLT": 1.0, "LFLB": 1.0,
     "RLMAL": 2.0, "RMMAL": 2.0, "LLMAL": 2.0, "LMMAL": 2.0,
+    "RSHN": 1.0, "RTIB": 1.0, "LSHN": 1.0, "LTIB": 1.0,
     # Foot (bony, high priority for ground contact)
     "RCAL": 1.5, "LCAL": 1.5,
     "RTOE": 1.5, "LTOE": 1.5,
@@ -71,53 +70,110 @@ MARKER_WEIGHTS_FLODELAPLACE: dict[str, float] = {
 # preferred for width scaling because they're deterministic vertex picks on
 # the mesh, whereas joint centers come from the MHR NN (more noise).
 _SCALE_MEASUREMENTS_FLODELAPLACE = [
-    # Pelvis: Z (width) from bony ASIS pair, X (AP depth) from ASIS-PSIS pairs.
-    ("pelvis_Z",    [("LASI", "RASI")],                                       ["pelvis", "sacrum"],                                                     "Z"),
+    # ─────────────────── Pelvis ───────────────────
+    # Z (largeur) : ASIS + PSIS pour robustesse (Florian).
+    # X (profondeur AP) : ASI↔PSI.
+    # Y (hauteur) : pas de mesure verticale intra-pelvis fiable (LASI↔LPSI
+    #   presque horizontal). On scale Y uniformément avec X et Z en
+    #   réutilisant les MÊMES paires sur l'axe Y → ratio Y = moyenne des
+    #   4 ratios largeur/profondeur. Sans ça (pelvis_Y = 1.000), le bassin
+    #   est trop court verticalement → tibia n'atteint pas la cheville,
+    #   genou trop haut, buste descendu (Florian, 2026-06).
+    ("pelvis_Z",    [("LASI", "RASI"), ("LPSI", "RPSI")],                     ["pelvis", "sacrum"],                                                     "Z"),
     ("pelvis_X",    [("RASI", "RPSI"), ("LASI", "LPSI")],                     ["pelvis", "sacrum"],                                                     "X"),
-    # Torso: Z (width) averaged from acromions AND ASIS so the trunk isn't
-    # systematically too wide. SAM3D's LACR/RACR markers are projected on the
-    # mesh surface and drift laterally past the bony acromion, inflating the
-    # torso_Z ratio. Mixing in the bony pelvic landmarks (LASI/RASI) gives a
-    # narrower, more anatomically plausible torso silhouette. Y (height) from
-    # ACR-ASI, X (AP depth) from CLAV→C7. Head has its OWN dedicated scale
-    # measurements below — it no longer inherits torso_Z/torso_X.
+    ("pelvis_Y",    [("LASI", "RASI"), ("LPSI", "RPSI"), ("RASI", "RPSI"), ("LASI", "LPSI")], ["pelvis", "sacrum"],                                     "Y"),
+
+    # ─────────────────── Torso ───────────────────
+    # Z (largeur) : acromions + ASIS averaged (compromis silhouette).
+    # Y (hauteur COMPLÈTE) : acromion → ASIS, des 2 côtés.
+    #   On corrige l'ancienne mesure XIPH↔CLAV qui ne capturait que la
+    #   moitié haute du tronc (~25 cm) et sous-scalait le torso (Y=1.04
+    #   sur straining_ced). ACR↔ASI ≈ 50 cm = vraie hauteur du tronc.
+    # X (profondeur AP) : CLAV-C7 (sup), XIPH-c_spine2 (mid). XIPH antérieur
+    #   à c_spine2 postérieur ≈ épaisseur du tronc.
+    # torso_Y : CLAV↔ASIS et CLAV↔PSIS (clavicules → crêtes iliaques).
+    #   Plus stable que ACR↔ASIS car les acromions bougent davantage avec
+    #   la flexion d'épaule et la posture (acromion mal estimé par MHR sur
+    #   certains sujets → torso sous-scalé, tête trop basse). Les CLAV sont
+    #   plus proches de l'axe vertébral et bougent moins. Validé sur straining
+    #   2026-06 (ACR-ASIS donnait 0.95 vs CLAV-ASIS plus cohérent).
     ("torso_Z",     [("LACR", "RACR"), ("LASI", "RASI")],                     ["torso"],                                                                "Z"),
-    # torso_Y averages ACR-ASI (anterior bony pair) with ACR-HJC (joint
-    # center). ACR-ASI alone tended to underscale torso height on subjects
-    # with low-sitting ASIS, pulling the shoulder bone down and putting the
-    # head visually 1-2 cm too low even after the head_offset compensation.
-    # Adding the joint-center pair gives a more representative average.
-    ("torso_Y",     [("RACR", "RASI"), ("LACR", "LASI"), ("RACR", "RHJC"), ("LACR", "LHJC")],  ["torso", "lumbar1", "lumbar2", "lumbar3", "lumbar4", "lumbar5"],         "Y"),
-    ("torso_X",     [("RCLAV", "C7"), ("LCLAV", "C7")],                       ["torso"],                                                                "X"),
-    # Head: ONE uniform measurement on all 3 axes preserves the anatomical
-    # proportions of the template skull mesh. Splitting axes (separate head_Y
-    # and head_Z) made K differ per axis and gave a tall/wide-but-flat head.
-    # c_head→HTOP captures cranium height (~25 cm) and gives K ~1.0 on most
-    # subjects → minimal inflation, proportions preserved.
-    ("head_size",   [("c_head", "HTOP")],                                     ["head"],                                                                 "X Y Z"),
-    # Right lower limb
-    ("femur_r_Y",   [("RHJC", "RKJC")],                                       ["femur_r", "patella_r"],                                                 "Y"),
+    ("torso_X",     [("RCLAV", "C7"), ("LCLAV", "C7"), ("XIPH", "c_spine2")], ["torso"],                                                                "X"),
+    ("torso_Y",     [("RCLAV", "RASI"), ("LCLAV", "LASI"),
+                     ("RCLAV", "RPSI"), ("LCLAV", "LPSI")],                   ["torso", "lumbar1", "lumbar2", "lumbar3", "lumbar4", "lumbar5"],         "Y"),
+
+    # ─────────────────── Head ───────────────────
+    # Splitté en 3 axes (anciennement uniforme X Y Z). Plus fidèle à la
+    # morphologie réelle (peut donner un crâne plus ou moins allongé).
+    # Y (hauteur) : HTOP → REar + HTOP → LEar (haut crâne → oreilles).
+    # Z (largeur) : REar ↔ LEar (largeur bi-auriculaire).
+    # X (profondeur AP) : Nose ↔ c_head (antérieur → centre crâne).
+    ("head_Y",      [("HTOP", "REar"), ("HTOP", "LEar")],                     ["head"],                                                                 "Y"),
+    ("head_Z",      [("REar", "LEar")],                                        ["head"],                                                                 "Z"),
+    ("head_X",      [("Nose", "c_head")],                                      ["head"],                                                                 "X"),
+
+    # ─────────────────── Right lower limb ───────────────────
+    # femur_Y : marqueurs ANATOMIQUES standards — ASIS/PSIS (pelvis) ↔
+    #   épicondyles fémoraux (RLFC/RMFC). Mesure cross-body qui inclut
+    #   l'offset pelvis → genou, c'est l'approche classique biomeca clinique
+    #   (Pose2Sim, OpenSim default). Plus robuste que les clusters cuisse
+    #   (RFLT/RFLB), qui dépendent du placement Mesh2Marker non standardisé.
+    #   En pratique le ratio reste cohérent quand la fenêtre statique est
+    #   prise en debout neutre (sujet vertical, hip non fléchie). Validé
+    #   visuellement par Florian (2026-06).
+    # femur_XZ : LFC ↔ MFC (largeur épicondyles fémoraux).
+    # tibia_Y : croise les 2 cotés genou × 2 cotés cheville (4 paires)
+    #   + MAL↔CAL pour inclure le talon (sinon tibia sous-scalé).
+    # tibia_XZ : LMAL ↔ MMAL (largeur malléoles).
+    ("femur_r_Y",   [("RASI", "RLFC"), ("RASI", "RMFC"),
+                     ("RPSI", "RLFC"), ("RPSI", "RMFC")],                     ["femur_r", "patella_r"],                                                 "Y"),
     ("femur_r_XZ",  [("RLFC", "RMFC")],                                       ["femur_r", "patella_r"],                                                 "X Z"),
-    ("tibia_r_Y",   [("RKJC", "RAJC")],                                       ["tibia_r"],                                                              "Y"),
+    # tibia_Y : couvre genou (LFC/MFC) → cheville (LMAL/MMAL) PLUS l'extension
+    #   vers le talon (LMAL/MMAL → CAL) — la malléole est ~3-4 cm au-dessus
+    #   du sol, ajouter MAL↔CAL compense le tibia_Y précédemment sous-scalé
+    #   (1.17× au lieu de 1.22× sur straining_ced).
+    ("tibia_r_Y",   [("RLFC", "RLMAL"), ("RLFC", "RMMAL"),
+                     ("RMFC", "RLMAL"), ("RMFC", "RMMAL"),
+                     ("RLMAL", "RCAL"), ("RMMAL", "RCAL")],                   ["tibia_r"],                                                              "Y"),
     ("tibia_r_XZ",  [("RLMAL", "RMMAL")],                                     ["tibia_r"],                                                              "X Z"),
     ("foot_r",      [("RCAL", "RTOE")],                                       ["talus_r", "calcn_r", "toes_r"],                                         "X Y Z"),
-    # Right upper limb
-    ("humerus_r_Y", [("RACR", "REJC")],                                       ["humerus_r"],                                                            "Y"),
+
+    # ─────────────────── Right upper limb ───────────────────
+    # humerus_Y : marqueurs ANATOMIQUES standards — acromion (RACR) ↔
+    #   épicondyles huméraux (RLEL/RMEL). Mesure cross-body qui inclut
+    #   l'offset acromion → tête humérale, c'est l'approche classique
+    #   biomeca clinique. Plus robuste que les clusters bras (RHTO/RHAP/
+    #   RHBA/RHFR), qui dépendent du placement Mesh2Marker non standardisé.
+    #   En pratique le ratio reste cohérent quand la fenêtre statique est
+    #   prise en debout neutre (bras le long du corps, pas d'élévation
+    #   glénohumérale). Validé visuellement par Florian (2026-06).
+    # humerus_XZ : LEL ↔ MEL (largeur épicondyles huméraux).
+    # forearm_Y : couvre les 2 côtés coude × 2 côtés poignet (4 paires).
+    # forearm_XZ : FAradius ↔ FAulna (largeur styloïdes).
+    ("humerus_r_Y", [("RACR", "RLEL"), ("RACR", "RMEL")],                     ["humerus_r"],                                                            "Y"),
     ("humerus_r_XZ",[("RLEL", "RMEL")],                                       ["humerus_r"],                                                            "X Z"),
-    ("forearm_r_Y", [("REJC", "RWrist_hand")],                                ["ulna_r", "radius_r"],                                                   "Y"),
+    ("forearm_r_Y", [("RLEL", "RFAradius"), ("RLEL", "RFAulna"),
+                     ("RMEL", "RFAradius"), ("RMEL", "RFAulna")],             ["ulna_r", "radius_r"],                                                   "Y"),
     ("forearm_r_XZ",[("RFAradius", "RFAulna")],                               ["ulna_r", "radius_r"],                                                   "X Z"),
-    # Left lower limb
-    ("femur_l_Y",   [("LHJC", "LKJC")],                                       ["femur_l", "patella_l"],                                                 "Y"),
+
+    # ─────────────────── Left lower limb ───────────────────
+    ("femur_l_Y",   [("LASI", "LLFC"), ("LASI", "LMFC"),
+                     ("LPSI", "LLFC"), ("LPSI", "LMFC")],                     ["femur_l", "patella_l"],                                                 "Y"),
     ("femur_l_XZ",  [("LLFC", "LMFC")],                                       ["femur_l", "patella_l"],                                                 "X Z"),
-    ("tibia_l_Y",   [("LKJC", "LAJC")],                                       ["tibia_l"],                                                              "Y"),
+    ("tibia_l_Y",   [("LLFC", "LLMAL"), ("LLFC", "LMMAL"),
+                     ("LMFC", "LLMAL"), ("LMFC", "LMMAL"),
+                     ("LLMAL", "LCAL"), ("LMMAL", "LCAL")],                   ["tibia_l"],                                                              "Y"),
     ("tibia_l_XZ",  [("LLMAL", "LMMAL")],                                     ["tibia_l"],                                                              "X Z"),
     ("foot_l",      [("LCAL", "LTOE")],                                       ["talus_l", "calcn_l", "toes_l"],                                         "X Y Z"),
-    # Left upper limb
-    ("humerus_l_Y", [("LACR", "LEJC")],                                       ["humerus_l"],                                                            "Y"),
+
+    # ─────────────────── Left upper limb ───────────────────
+    ("humerus_l_Y", [("LACR", "LLEL"), ("LACR", "LMEL")],                     ["humerus_l"],                                                            "Y"),
     ("humerus_l_XZ",[("LLEL", "LMEL")],                                       ["humerus_l"],                                                            "X Z"),
-    ("forearm_l_Y", [("LEJC", "LWrist_hand")],                                ["ulna_l", "radius_l"],                                                   "Y"),
+    ("forearm_l_Y", [("LLEL", "LFAradius"), ("LLEL", "LFAulna"),
+                     ("LMEL", "LFAradius"), ("LMEL", "LFAulna")],             ["ulna_l", "radius_l"],                                                   "Y"),
     ("forearm_l_XZ",[("LFAradius", "LFAulna")],                               ["ulna_l", "radius_l"],                                                   "X Z"),
-    # Hands (full length, uniform scale)
+
+    # ─────────────────── Hands (uniform) ───────────────────
     ("hand_r",      [("RWrist_hand", "RIndexTip")],                           ["hand_r"],                                                               "X Y Z"),
     ("hand_l",      [("LWrist_hand", "LIndexTip")],                           ["hand_l"],                                                               "X Y Z"),
 ]

@@ -51,9 +51,13 @@ ANATOMICAL_MESH_OFFSETS: dict[str, np.ndarray] = {
 # in the body's local frame). Use < 1.0 to shrink, > 1.0 to enlarge. Doesn't
 # affect the body origin or any joint, only the mesh appearance.
 ANATOMICAL_MESH_SCALE: dict[str, float | np.ndarray] = {
-    # Empty: head is now scaled uniformly via head_size=(c_head, HTOP) in the
-    # Scale Tool, which preserves the template's anatomical proportions.
-    # Visual scale overrides only used if a specific mesh needs cosmetic fix.
+    # head: réduction esthétique de 10% du mesh tête uniquement (pas de
+    # modification du squelette OpenSim ni des joints). Les kinés trouvent
+    # qu'une tête à pleine échelle "sort" un peu du mesh peau et donne un
+    # rendu visuel un peu effrayant (Florian, 2026-06). Le head reste
+    # scalé proportionnellement au sujet via les measurements head_X/Y/Z ;
+    # ce facteur s'applique APRES, en visuel uniquement.
+    "head": 0.90,
 }
 
 # Per-body axial stretch along the bone's main axis (body-local Y), anchored
@@ -62,8 +66,13 @@ ANATOMICAL_MESH_SCALE: dict[str, float | np.ndarray] = {
 # the humerus → stretching upward raises the proximal end (humeral head)
 # toward the shoulder joint while the elbow stays connected to the ulna.
 ANATOMICAL_MESH_AXIAL_STRETCH: dict[str, float] = {
-    "humerus_r": 1.10,
-    "humerus_l": 1.10,
+    # Empty pour le nouveau modèle Model_Flodelaplace_XIPH_synkro.osim :
+    # l'ancien stretch 1.10 sur humerus_r/l compensait un humerus visuellement
+    # trop court (le mesh humerus_rv.vtp a son origine au mid-bone alors que
+    # le body humerus_r a son origine à l'épaule → bone hangait ~10 cm trop bas).
+    # Avec le nouveau scaling qui prend RACR↔RLEL ET RACR↔RMEL pour humerus_Y
+    # (double constraint), la longueur visible devrait être correcte sans hack.
+    # Si humerus toujours trop court après visualisation → remettre 1.10.
 }
 
 # Bodies that sit downstream of the torso in the kinematic tree. When the
@@ -203,27 +212,21 @@ def load_geometry_meshes(
     out: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
     missing: list[str] = []
 
-    # Individual vertebrae meshes (cerv*, thoracic*_s) have vertex positions
-    # designed for PER-VERTEBRA body frames, not the consolidated torso body.
-    # Quand toutes les vertèbres sont attachées au même body (torso) sans
-    # chaîne d'offsets, les meshes s'empilent à l'origine du body (= base
-    # lombaire dans flodelaplace_mocap.osim). Donc dès qu'un composite mesh
-    # est présent (hat_ribs_scap ou hat_spine), on skip TOUTES les cerv*+
-    # thoracic* — quitte à avoir un trou visuel entre haut du composite et
-    # le crâne (cervicales non couvertes par hat_ribs_scap). Mieux qu'un amas
-    # de meshes à la mauvaise position.
-    _VERTEBRA_PREFIXES = ("cerv", "thoracic")
-
+    # Le skip historique des vertèbres individuelles (cerv*, thoracic*) quand
+    # hat_ribs_scap est présent existait pour compenser un bug du helper
+    # `_opensim_compute_body_transforms.py` qui ne lisait pas les translations
+    # des PhysicalOffsetFrame `<components>`. Du coup les 19 vertèbres
+    # s'empilaient à l'origine du body torso. Maintenant que le helper lit
+    # correctement les POF translations, chaque vertèbre arrive à sa position
+    # anatomique (cerv1sm à Y=+0.51, cerv7 à Y=+0.42, thoracic1_s à Y=+0.44…),
+    # donc on les charge toutes — le composite hat_ribs_scap continue d'être
+    # affiché en plus (côtes + scapulae + sternum).
     for body_name, body_data in bodies.items():
         mesh_list = body_data.get("meshes", [])
-        mesh_files = {Path(m["file"]).stem for m in mesh_list}
-        has_composite = "hat_ribs_scap" in mesh_files or "hat_spine" in mesh_files
         meshes_for_body = []
         for m in mesh_list:
             f = m["file"]
             stem = Path(f).stem
-            if has_composite and stem.startswith(_VERTEBRA_PREFIXES):
-                continue
             # Prefer .stl (loadable by trimesh alone, no vtk needed),
             # then .ply, then fall back to .vtp (requires vtk).
             candidates = [

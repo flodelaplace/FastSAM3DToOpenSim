@@ -1,20 +1,21 @@
 """
-MHR → Rajagopal mocap markerset converter.
+MHR → flodelaplace XIPH mocap markerset converter (v2).
 
-Produces 64 markers matching assets/rajagopal2015_mocap.osim:
-  - Direct 70-kpt indices        : head, body joint centers, acromions, feet,
-                                    wrists, hand (metacarpals + tips)
-  - Direct 127-jcoord indices    : spine (c_spine0..3, c_neck, c_head),
-                                    RCLAV/LCLAV, HTOP
-  - Cached mesh vertex indices   : ASIS/PSIS, femoral condyles (LFC/MFC),
-                                    malleoli (LMAL/MMAL), humeral epicondyles
-                                    (LEL/MEL), wrist styloids (FAradius/FAulna),
-                                    C7 (loaded from
-                                    assets/flodelaplace_anatomical_vertex_idx.json)
+Reads `assets/correspondence_synkro.json` (produced by Mesh2Marker) which maps
+each marker name to ONE MHR mesh vertex index (the anatomical landmark on the
+template mesh, frame-invariant via MHR's fixed topology).
 
-Vertex indices were chosen once on a reference frame (Squat.MP4) using
-tools/viz_rajagopal_markers.py. MHR mesh topology is deterministic so they
-transfer across subjects and frames.
+For each frame we just index `pred_vertices` at the configured indices — no
+more 3-source merge (kpts + jcoords + extra vertex picks). 73 markers, all
+from the mesh.
+
+Output marker names match Model_Flodelaplace_XIPH.osim MarkerSet, including
+the 19 clinical clusters added via Mesh2Marker (cuisse/jambe LFLT/LFLB/LSHN/
+LTIB, bras LHTO/LHAP/LHBA/LHFR + LFRM forearm) and the xiphoid process XIPH.
+
+The old joint-center markers (LHJC/RHJC/LKJC/RKJC/LAJC/RAJC/LEJC/REJC/c_spine1)
+are intentionally absent — they were virtual JC that we now constrain via
+real surface clusters (better IK).
 """
 from __future__ import annotations
 
@@ -25,130 +26,111 @@ from typing import List, Tuple
 import numpy as np
 
 _ASSETS = Path(__file__).resolve().parents[2] / "assets"
-_VERTEX_IDX_JSON = _ASSETS / "flodelaplace_anatomical_vertex_idx.json"
-
-# ── Direct MHR 70-kpt mappings ────────────────────────────────────────────────
-_KPT70: dict[str, int] = {
-    # Head
-    "Nose": 0, "LEye": 1, "REye": 2, "LEar": 3, "REar": 4,
-    # Body joint centers — LSJC/RSJC dropped: MHR kpt 5/6 labeled "shoulder"
-    # do not reliably land on the glenohumeral joint center (acromion is used
-    # instead for the shoulder segment in IK/scaling).
-    "LEJC": 7,  "REJC": 8,
-    "LHJC": 9,  "RHJC": 10,
-    "LKJC": 11, "RKJC": 12,
-    "LAJC": 13, "RAJC": 14,
-    # Feet
-    "LTOE": 15, "LMT5": 16, "LCAL": 17,
-    "RTOE": 18, "RMT5": 19, "RCAL": 20,
-    # Hand metacarpals (MCP, match the Coco133 positions set in the .osim).
-    # MHR labels kpt-X as the tip and kpt-X+3 as the most proximal joint
-    # (MCP). Verified empirically on Squat.MP4:
-    #   RThumb:  kpt 21 = tip 12.7cm from wrist, kpt 24 = MCP 4.1cm
-    #   RIndex:  kpt 25 = tip 16.1cm,            kpt 28 = MCP 8.5cm
-    #   RPinky:  kpt 37 = tip 13.6cm,            kpt 40 = MCP 7.5cm
-    "RThumb": 24, "RIndex": 28, "RPinky": 40,
-    "LThumb": 45, "LIndex": 49, "LPinky": 61,
-    # Hand fingertips (pose2sim-style distal positions).
-    "RIndexTip": 25, "RPinkyTip": 37,
-    "LIndexTip": 46, "LPinkyTip": 58,
-    # Wrists & acromions
-    "RWrist_hand": 41, "LWrist_hand": 62,
-    "LACR": 67, "RACR": 68,
-}
-
-# ── Direct MHR 127-joint armature mappings ────────────────────────────────────
-_JCOORD127: dict[str, int] = {
-    "c_spine0": 34,   # lower lumbar (L5-S1)
-    "c_spine1": 35,   # upper lumbar
-    "c_spine2": 36,   # lower thoracic
-    "c_spine3": 37,   # upper thoracic
-    "c_neck":   110,  # cervical
-    "c_head":   113,  # head joint
-    # Swap : vérifié le 2026-04-24 après analyse d'offset sur 5 sujets —
-    # RCLAV/LCLAV étaient bien inversés (validation visuelle + offsets
-    # ±60 mm anti-symétriques systématiques sur 5 sujets).
-    "RCLAV":    38,   # right clavicle (jcoord 38)
-    "LCLAV":    74,   # left clavicle  (jcoord 74)
-    "HTOP":     126,  # top of head (vertex of skull)
-}
+_CORRESPONDENCE_JSON = _ASSETS / "correspondence_synkro.json"
 
 
-def load_anatomical_vertex_indices() -> dict[str, int]:
-    with open(_VERTEX_IDX_JSON) as f:
-        return json.load(f)["vertex_indices"]
+def load_correspondence(path: Path | str | None = None) -> dict:
+    """Load the correspondence JSON. Returns the full file (markers + meta)."""
+    p = Path(path) if path is not None else _CORRESPONDENCE_JSON
+    with open(p) as f:
+        return json.load(f)
 
 
 class FlodelaplaceConverter:
-    """MHR inference outputs → Rajagopal mocap marker array."""
+    """MHR pred_vertices → flodelaplace XIPH marker array.
 
-    def __init__(self):
-        self.vertex_indices = load_anatomical_vertex_indices()
-        # Preserve grouping order in the output TRC: direct kpts first,
-        # then jcoord-direct, then vertex picks. Within each group the
-        # declaration order is kept.
-        self.marker_names: List[str] = (
-            list(_KPT70.keys())
-            + list(_JCOORD127.keys())
-            + list(self.vertex_indices.keys())
-        )
+    Each marker is the world position of one MHR mesh vertex (index defined in
+    the correspondence file). Frame-invariant because MHR topology is fixed.
+    """
+
+    def __init__(self, correspondence_path: Path | str | None = None):
+        data = load_correspondence(correspondence_path)
+        self._meta = {
+            "schema_version": data.get("schema_version"),
+            "mhr_topology_id": data.get("mhr_topology_id"),
+            "opensim_model": data.get("opensim_model"),
+            "marker_set": data.get("marker_set"),
+        }
+        # ordered list of (name, mhr_vertex_idx, opensim_body) — preserves
+        # the file's marker order, which we keep stable in the TRC output.
+        self._markers: List[Tuple[str, int, str]] = []
+        for m in data["markers"]:
+            verts = m["mhr_vertices"]
+            if not verts:
+                raise ValueError(f"Marker {m['name']!r} has empty mhr_vertices")
+            # Use the first listed vertex. If more than one is provided, the
+            # contract says the marker is the centroid; we keep it simple here
+            # because every entry in correspondence_synkro.json has exactly 1.
+            if len(verts) != 1:
+                raise NotImplementedError(
+                    f"Marker {m['name']!r} has {len(verts)} mhr_vertices — "
+                    "centroid mode not implemented yet."
+                )
+            self._markers.append((m["name"], int(verts[0]), m["opensim_body"]))
+
+        self.marker_names: List[str] = [n for n, _, _ in self._markers]
+        self.vertex_indices: dict[str, int] = {n: v for n, v, _ in self._markers}
+        self.opensim_body: dict[str, str] = {n: b for n, _, b in self._markers}
+
+    # ── API back-compat with the legacy converter ──────────────────────────
+    # The pipeline calls extract_anatomical(verts_world) to pre-stack the
+    # anatomical landmarks before the coordinate transform; then convert()
+    # arranges the final marker array. We keep both methods.
 
     def extract_anatomical(self, vertices_3d: np.ndarray) -> np.ndarray:
-        """Index the pre-picked anatomical vertices out of the full mesh.
+        """Index the configured marker vertices out of the full MHR mesh.
 
         Args:
             vertices_3d: (N, 18439, 3) or (18439, 3)
 
         Returns:
-            (N, N_anat, 3) or (N_anat, 3) where N_anat = len(vertex_indices).
-            Row order matches iteration order of self.vertex_indices (same as
-            the tail of self.marker_names).
+            (N, M, 3) or (M, 3) with M = len(marker_names). Row order matches
+            self.marker_names (and the future markers_array column order).
         """
         single = vertices_3d.ndim == 2
         if single:
             vertices_3d = vertices_3d[np.newaxis]
-        idxs = np.asarray(list(self.vertex_indices.values()), dtype=np.int64)
+        idxs = np.asarray([v for _, v, _ in self._markers], dtype=np.int64)
         out = vertices_3d[:, idxs, :]
         return out[0] if single else out
 
     def convert(
         self,
-        keypoints_3d:   np.ndarray,    # (N, 70, 3)  or (70, 3)
-        jcoords_3d:     np.ndarray,    # (N, 127, 3) or (127, 3)
-        anat_verts_3d:  np.ndarray,    # (N, N_anat, 3) — pre-extracted,
-                                       # already in the same world frame as kpts.
+        keypoints_3d: np.ndarray | None = None,   # unused (kept for API compat)
+        jcoords_3d:   np.ndarray | None = None,   # unused (kept for API compat)
+        anat_verts_3d: np.ndarray | None = None,  # (N, M, 3) — already extracted
+                                                   # via extract_anatomical()
+                                                   # then passed through the
+                                                   # coordinate transformer.
     ) -> Tuple[np.ndarray, List[str]]:
         """Return (markers, marker_names).
 
         markers shape: (N, M, 3) or (M, 3) matching the input dim, where
-        M = len(self.marker_names).  All three inputs must share the same
-        world frame.  The expected caller pattern is:
+        M = len(self.marker_names).
 
-            conv = FlodelaplaceConverter()
-            anat_raw   = conv.extract_anatomical(verts_world_cam)    # (N, 21, 3)
-            # concat anat_raw into jcoords_stack, run transformer.transform(),
-            # then split out the transformed anat_verts on return.
-            markers, names = conv.convert(kpts_opensim, jc_opensim, anat_opensim)
+        The old signature took kpts/jcoords/anat_verts to merge 3 sources.
+        We now only need anat_verts (all 73 markers come from mesh vertices).
+        kpts/jcoords are accepted but unused, for backwards-compatibility with
+        callers that still pass them.
         """
-        single = keypoints_3d.ndim == 2
-        if single:
-            keypoints_3d   = keypoints_3d[np.newaxis]
-            jcoords_3d     = jcoords_3d[np.newaxis]
-            anat_verts_3d  = anat_verts_3d[np.newaxis]
-
-        marker_list = []
-        for idx in _KPT70.values():
-            marker_list.append(keypoints_3d[:, idx, :])
-        for idx in _JCOORD127.values():
-            marker_list.append(jcoords_3d[:, idx, :])
-        # anat_verts_3d already ordered to match self.vertex_indices.
-        for i in range(anat_verts_3d.shape[1]):
-            marker_list.append(anat_verts_3d[:, i, :])
-
-        markers = np.stack(marker_list, axis=1)  # (N, M, 3)
-        if single:
-            markers = markers[0]
-        return markers, self.marker_names
+        if anat_verts_3d is None:
+            raise ValueError(
+                "anat_verts_3d is required (precompute via extract_anatomical())"
+            )
+        # Already in the correct (marker, 3) order — extract_anatomical returns
+        # rows aligned with marker_names. Caller just passed it through the
+        # coordinate transform unchanged.
+        return anat_verts_3d, list(self.marker_names)
 
     def get_marker_names(self) -> List[str]:
         return list(self.marker_names)
+
+
+# ── Back-compat shim ───────────────────────────────────────────────────────
+# Older code imports `load_anatomical_vertex_indices` from this module.
+# Keep a thin wrapper that returns {name: idx} for the new correspondence file.
+
+def load_anatomical_vertex_indices() -> dict[str, int]:
+    """Return {marker_name: mhr_vertex_idx} from correspondence_synkro.json."""
+    data = load_correspondence()
+    return {m["name"]: int(m["mhr_vertices"][0]) for m in data["markers"]}

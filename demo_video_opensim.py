@@ -268,15 +268,26 @@ def main(args):
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ── Markerset selection ──────────────────────────────────────────────────
-    # --markerset flodelaplace (default) : FlodelaplaceConverter + flodelaplace_mocap.osim
+    # --markerset flodelaplace (default) : FlodelaplaceConverter v2 + Model_Flodelaplace_XIPH.osim
+    #                                       (73 markers via Mesh2Marker correspondence)
+    # --markerset flodelaplace_legacy    : FlodelaplaceConverter v1 + flodelaplace_mocap.osim
+    #                                       (64 markers, KPT70+JCOORD127+vertex_idx merge — kept for back-compat)
     # --markerset pose2sim               : original KeypointConverter + pose2sim_wholebody_model.osim
     markerset = getattr(args, "markerset", "pose2sim")
     if markerset == "flodelaplace":
-        model_template = os.path.join(parent_dir, "assets", "flodelaplace_mocap.osim")
+        model_template = os.path.join(parent_dir, "assets", "Model_Flodelaplace_XIPH_synkro.osim")
         from sam_3d_body.export.flodelaplace_converter import FlodelaplaceConverter
         florian_converter = FlodelaplaceConverter()
         # Force vertex collection even when mesh GLB is disabled — the
-        # converter needs the 21 anatomical vertex positions per frame.
+        # converter needs the anatomical vertex positions per frame.
+        force_collect_verts = True
+    elif markerset == "flodelaplace_legacy":
+        model_template = os.path.join(parent_dir, "assets", "flodelaplace_mocap.osim")
+        # Legacy converter still lives in git history; import the current
+        # module (which is now v2). If you really need the old behavior,
+        # check out commit before this migration.
+        from sam_3d_body.export.flodelaplace_converter import FlodelaplaceConverter
+        florian_converter = FlodelaplaceConverter()
         force_collect_verts = True
     else:
         model_template = _POSE2SIM_MODEL_TEMPLATE
@@ -396,6 +407,15 @@ def main(args):
     all_verts       = []   # [N_frames] of [18439, 3] or None  (for mesh GLB)
     all_joint_coords = []  # [N_frames] of [127, 3] camera-space joint coords, or None
     all_raw_outputs = []   # for video_outputs.json
+    # Shape-lock per-frame raw sub-params (used to regenerate meshes with a
+    # locked subject morphology — see sam_3d_body/export/shape_lock.py).
+    # Stored as np.ndarray or None (frame failed).
+    all_shape_params     = []   # [N] of (45,) identity coeffs
+    all_scale_params     = []   # [N] of (28,) PCA-encoded segment scales
+    all_expr_params      = []   # [N] of (72,) face expr
+    all_body_pose_params = []   # [N] of (133,) body pose (positions 124..129 = shape modes)
+    all_global_rot       = []   # [N] of (3,)
+    all_hand_pose_params = []   # [N] of (108,) or None
     inference_times = []
     # Multi-person track storage — keyed by track ID
     tracks = {}  # {track_id: {'kpts': [...], 'cam_t': [...], 'jcoords': [...]}}
@@ -441,6 +461,9 @@ def main(args):
             all_verts.append(None)
             all_joint_coords.append(None)
             all_raw_outputs.append({"frame": f"frame_{frame_idx:06d}.jpg", "outputs": []})
+            all_shape_params.append(None); all_scale_params.append(None)
+            all_expr_params.append(None);  all_body_pose_params.append(None)
+            all_global_rot.append(None);   all_hand_pose_params.append(None)
             if getattr(args, 'multi_person', False):
                 for tr in tracks.values():
                     tr['kpts'].append(None)
@@ -572,6 +595,9 @@ def main(args):
                 all_verts.append(None)
                 all_joint_coords.append(None)
                 all_raw_outputs.append({"frame": f"frame_{frame_idx:06d}.jpg", "outputs": []})
+                all_shape_params.append(None); all_scale_params.append(None)
+                all_expr_params.append(None);  all_body_pose_params.append(None)
+                all_global_rot.append(None);   all_hand_pose_params.append(None)
                 frame_idx += 1
                 processed += 1
                 continue
@@ -673,10 +699,20 @@ def main(args):
                 all_joint_coords.append(jc.copy())
             else:
                 all_joint_coords.append(None)
+            # Shape-lock raw sub-params (always copied — None only if absent).
+            sp = person.get("shape_params");      all_shape_params.append(np.asarray(sp).copy() if sp is not None else None)
+            sc = person.get("scale_params");      all_scale_params.append(np.asarray(sc).copy() if sc is not None else None)
+            ep = person.get("expr_params");       all_expr_params.append(np.asarray(ep).copy() if ep is not None else None)
+            bp = person.get("body_pose_params");  all_body_pose_params.append(np.asarray(bp).copy() if bp is not None else None)
+            gr = person.get("global_rot");        all_global_rot.append(np.asarray(gr).copy() if gr is not None else None)
+            hp = person.get("hand_pose_params");  all_hand_pose_params.append(np.asarray(hp).copy() if hp is not None else None)
         else:
             all_kpts_raw.append(None)
             all_cam_t.append(None)
             all_joint_coords.append(None)
+            all_shape_params.append(None); all_scale_params.append(None)
+            all_expr_params.append(None);  all_body_pose_params.append(None)
+            all_global_rot.append(None);   all_hand_pose_params.append(None)
 
         timestamps.append(frame_idx / fps)
 
@@ -790,6 +826,68 @@ def main(args):
     if inference_times:
         avg = sum(inference_times) / len(inference_times)
         print(f"Avg inference: {avg:.2f}s/frame ({1/avg:.2f} fps)")
+
+    # ── Shape-lock : médiane des paramètres morpho sur tout l'essai, puis ─────
+    # régénération des vertices/joint_coords/keypoints avec ce shape locké +
+    # la pose conservée per-frame. Désactivable via --no_shape_lock.
+    # En multi-person on skip pour l'instant (un shape par track serait
+    # nécessaire ; pas implémenté).
+    _do_shape_lock = (
+        (not args.no_shape_lock)
+        and (not getattr(args, 'multi_person', False))
+    )
+    if _do_shape_lock:
+        try:
+            from sam_3d_body.export.shape_lock import (
+                aggregate_shape, regenerate_with_locked_shape,
+            )
+            n_valid = sum(1 for x in all_body_pose_params if x is not None)
+            if n_valid == 0:
+                print("[shape_lock] No valid frame to aggregate — skipping.")
+            else:
+                print(f"[shape_lock] Aggregating subject shape across {n_valid} frames (median)...")
+                locked = aggregate_shape(
+                    all_shape_params, all_scale_params,
+                    all_expr_params, all_body_pose_params,
+                )
+                per_frame_pose = []
+                for i in range(len(all_body_pose_params)):
+                    if (all_body_pose_params[i] is None
+                        or all_cam_t[i] is None
+                        or all_global_rot[i] is None):
+                        per_frame_pose.append(None)
+                    else:
+                        per_frame_pose.append({
+                            "global_trans":      all_cam_t[i],
+                            "global_rot":        all_global_rot[i],
+                            "body_pose_params":  all_body_pose_params[i],
+                            "hand_pose_params":  all_hand_pose_params[i],
+                        })
+                n_regen = sum(1 for x in per_frame_pose if x is not None)
+                print(f"[shape_lock] Regenerating {n_regen} frames via mhr_head._mhr_forward_core...")
+                regen = regenerate_with_locked_shape(
+                    estimator.model.head_pose, locked, per_frame_pose,
+                    device="cuda",
+                )
+                n_replaced = 0
+                for i, r in enumerate(regen):
+                    if r is None:
+                        continue
+                    if i < len(all_verts) and all_verts[i] is not None:
+                        all_verts[i] = r["pred_vertices"].astype(np.float32)
+                    if i < len(all_joint_coords) and all_joint_coords[i] is not None:
+                        all_joint_coords[i] = r["pred_joint_coords"].astype(np.float32)
+                    if (i < len(all_kpts_raw) and all_kpts_raw[i] is not None
+                        and r["pred_keypoints_3d"] is not None):
+                        new_k = r["pred_keypoints_3d"].astype(np.float32)
+                        if new_k.shape == all_kpts_raw[i].shape:
+                            all_kpts_raw[i] = new_k
+                    n_replaced += 1
+                print(f"[shape_lock] Replaced verts/jcoords/kpts on {n_replaced} frames.")
+        except Exception as e:
+            print(f"[shape_lock] FAILED: {e}. Falling back to raw per-frame shape.")
+            import traceback
+            traceback.print_exc()
 
     # ── Build raw keypoint and jcoords arrays (NaN for missing frames) ─────────
     N = len(timestamps)
@@ -1707,6 +1805,17 @@ if __name__ == "__main__":
                              "le sujet garde les pieds au sol (5STS, tests sur chaise, "
                              "Lasègue). À NE PAS utiliser si les pieds bougent vraiment "
                              "(marche, course).")
+    parser.add_argument("--no_shape_lock", action="store_true",
+                        help="Désactive le shape-lock SAM3D (ON par défaut). Par défaut, "
+                             "après inférence on agrège (médiane) les paramètres morpho "
+                             "shape/scale/expr/body_pose[124:130] sur toutes les frames de "
+                             "l'essai, puis on régénère les pred_vertices / pred_joint_coords "
+                             "/ pred_keypoints_3d via mhr_head._mhr_forward_core avec ce shape "
+                             "locké + la pose conservée per-frame. Résultat : le sujet a une "
+                             "morphologie constante sur tout l'essai (seul le mouvement varie). "
+                             "Évite que les marqueurs (= vertices indexés) fluctuent à cause "
+                             "des ré-estimations frame-à-frame du shape par le réseau. À OMETTRE "
+                             "uniquement pour débugger / comparer.")
     parser.add_argument("--fx", type=float, default=None,
                         help="Focal length x (pixels). Skips MoGe FOV estimation if set.")
     parser.add_argument("--fy", type=float, default=None)

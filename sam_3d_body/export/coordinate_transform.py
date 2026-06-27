@@ -525,23 +525,45 @@ class CoordinateTransformer:
 
         Bottom reference: min Y among foot keypoints (heels + big toes).
         """
+        # Utilise la NORME 3D ||c_head - foot|| au lieu de la projection Y.
+        # Sinon, sur les vidéos avec pitch caméra (e.g. MoGe +18°), le sujet
+        # raw est INCLINÉ → c_head_y - foot_y = vraie_taille × cos(pitch) <
+        # vraie_taille. Le scale = subject_height / (vraie_taille × cos) est
+        # trop grand. Après application du scale et de la rotation correctrice,
+        # le sujet apparait sur-scalé par 1/cos(pitch) (e.g. +5% à 18°). La
+        # norme 3D est invariante par rotation → scale correct quelle que soit
+        # l'inclinaison du sujet/sol dans le brut.
         heights = []
         N = kpts.shape[0]
         for i in range(N):
-            foot_y = np.min(kpts[i, _FOOT_INDICES, 1])
+            foot_idx = np.argmin(kpts[i, _FOOT_INDICES, 1])
+            foot = kpts[i, _FOOT_INDICES[foot_idx]]
 
             if jc is not None:
-                top_y = jc[i, _JCOORDS_HEAD_IDX, 1]
+                top = jc[i, _JCOORDS_HEAD_IDX]
             else:
-                top_y = kpts[i, 0, 1] / self._NOSE_HEIGHT_FRACTION
+                # Fallback nose (kpt 0). Project to "head top" via nose height ratio
+                # (kept on Y norm because the fallback is rarely used).
+                nose_y = kpts[i, 0, 1]
+                foot_y = foot[1]
+                h = (nose_y - foot_y) / self._NOSE_HEIGHT_FRACTION
+                if h > 0.1:
+                    heights.append(h)
+                continue
 
-            h = top_y - foot_y
+            h = float(np.linalg.norm(top - foot))
             if h > 0.1:
                 heights.append(h)
 
         if not heights:
             return 1.0
-        return self.subject_height / float(np.mean(heights))
+        # percentile 95 au lieu de mean : sur les vidéos avec flexion (squat,
+        # sit-to-stand, etc.) c_head_y descend pendant le mouvement et la
+        # moyenne sous-estime la vraie hauteur du sujet debout. Le 95ᵉ
+        # percentile approxime la hauteur "debout droit" (Pose2Sim utilise une
+        # static window pour le ScaleTool OpenSim, on fait l'équivalent ici
+        # côté CoordinateTransformer pour ne pas sur-scaler le sujet).
+        return self.subject_height / float(np.percentile(heights, 95))
 
     def _pelvis_shifts(self, kpts: np.ndarray) -> np.ndarray:
         """Per-frame XZ shift to centre the pelvis; Y component is zero."""
