@@ -651,6 +651,156 @@ except Exception as e:
 """
 
 
+# ---------------------------------------------------------------------------
+# Inline post-IK TRC script — recompute marker positions FROM the IK'd state
+# (each marker's getLocationInGround(state) after applying the .mot angles).
+# Output : un .trc avec les positions "vues" par le modèle, cohérentes à 100 %
+# avec le .mot (contraintes squelettiques respectées, soft-tissue artifact
+# absent, contrairement au .trc d'input qui contient les positions markers
+# brutes). En unités millimètres (convention OpenSim TRC).
+# ---------------------------------------------------------------------------
+_POST_IK_TRC_SCRIPT = """
+import sys, json, os, math
+model_path  = sys.argv[1]
+mot_path    = sys.argv[2]
+trc_path    = sys.argv[3]
+result_json = sys.argv[4]
+
+try:
+    import opensim
+    opensim.Logger.setLevelString('error')
+
+    model = opensim.Model(model_path)
+    state = model.initSystem()
+
+    # Charge le .mot
+    table = opensim.TimeSeriesTable(mot_path)
+    times = list(table.getIndependentColumn())
+    col_labels = list(table.getColumnLabels())
+    n_frames = len(times)
+
+    # Récupère les coordonnées du modèle et matche avec les colonnes du .mot
+    # Les coords translation du pelvis (pelvis_tx/ty/tz) sont en mètres dans
+    # le .mot ; toutes les autres sont en degrés. Inutile d'utiliser
+    # getMotionType() (renommé/inconsistant entre versions OpenSim).
+    _TRANS_NAMES = {'pelvis_tx', 'pelvis_ty', 'pelvis_tz'}
+    coord_set = model.getCoordinateSet()
+    n_coords = coord_set.getSize()
+    coord_info = []  # (coord_obj, col_index_in_mot, is_rotational)
+    for ci in range(n_coords):
+        c = coord_set.get(ci)
+        nm = c.getName()
+        if nm in col_labels:
+            col_idx = col_labels.index(nm)
+            is_rot = nm not in _TRANS_NAMES
+            coord_info.append((c, col_idx, is_rot))
+
+    # Liste des markers
+    markers = model.getMarkerSet()
+    n_markers = markers.getSize()
+    marker_names = [markers.get(mi).getName() for mi in range(n_markers)]
+
+    # Pour chaque frame, set coord values, realize, lire positions markers
+    # positions[fi][mi] = (x,y,z) en mètres
+    positions = []
+    for fi in range(n_frames):
+        row = table.getRowAtIndex(fi)
+        for c, col_idx, is_rot in coord_info:
+            val = row[col_idx]
+            if is_rot:
+                val = val * math.pi / 180.0   # deg → rad
+            c.setValue(state, val, False)  # no assemble
+        model.assemble(state)
+        model.realizePosition(state)
+        frame_pos = []
+        for mi in range(n_markers):
+            pos = markers.get(mi).getLocationInGround(state)
+            frame_pos.append((pos[0], pos[1], pos[2]))
+        positions.append(frame_pos)
+
+    # Écrit le TRC (en mm, convention OpenSim)
+    fps = (n_frames - 1) / (times[-1] - times[0]) if n_frames > 1 else 60.0
+    lines = []
+    lines.append(f"PathFileType\\t4\\t(X/Y/Z)\\t{os.path.basename(trc_path)}")
+    lines.append("DataRate\\tCameraRate\\tNumFrames\\tNumMarkers\\tUnits\\tOrigDataRate\\tOrigDataStartFrame\\tOrigNumFrames")
+    lines.append(f"{fps:.6f}\\t{fps:.6f}\\t{n_frames}\\t{n_markers}\\tmm\\t{fps:.6f}\\t1\\t{n_frames}")
+    header = ["Frame#", "Time"]
+    for nm in marker_names:
+        header += [nm, "", ""]
+    lines.append("\\t".join(header))
+    sub = ["", ""]
+    for k in range(n_markers):
+        sub += [f"X{k+1}", f"Y{k+1}", f"Z{k+1}"]
+    lines.append("\\t".join(sub))
+    lines.append("")  # blank line
+    for fi in range(n_frames):
+        row = [str(fi + 1), f"{times[fi]:.6f}"]
+        for x, y, z in positions[fi]:
+            row += [f"{x*1000:.4f}", f"{y*1000:.4f}", f"{z*1000:.4f}"]
+        lines.append("\\t".join(row))
+
+    with open(trc_path, "w") as f:
+        f.write("\\n".join(lines) + "\\n")
+
+    json.dump({"ok": True, "n_frames": n_frames, "n_markers": n_markers}, open(result_json, "w"))
+except Exception as e:
+    import traceback
+    json.dump({"ok": False, "error": str(e), "trace": traceback.format_exc()}, open(result_json, "w"))
+    sys.exit(1)
+"""
+
+
+def export_post_ik_trc(
+    model_path: str,
+    mot_path: str,
+    output_trc_path: str,
+) -> bool:
+    """Recompute marker positions from the IK'd model state, write a .trc.
+
+    Pour chaque timestep du `.mot`, applique les angles articulaires à l'état
+    du modèle scalé, puis lit la position de chaque marker dans le ground
+    frame. Le TRC produit est cohérent à 100 % avec le `.mot` (mêmes contraintes
+    squelettiques), à la différence du `.trc` d'input IK qui contient les
+    positions markers brutes (peau, soft-tissue artifact présent).
+
+    Returns True on success, False if opensim env unavailable or script fails.
+    """
+    opensim_python = _find_opensim_python()
+    if opensim_python is None:
+        print("  [post-IK TRC] opensim conda env not found – skipping")
+        return False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        script_path = os.path.join(tmp, "post_ik_trc.py")
+        result_json = os.path.join(tmp, "result.json")
+        Path(script_path).write_text(_POST_IK_TRC_SCRIPT, encoding="utf-8")
+
+        result = subprocess.run(
+            [opensim_python, script_path,
+             os.path.abspath(model_path),
+             os.path.abspath(mot_path),
+             os.path.abspath(output_trc_path),
+             result_json],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"  [post-IK TRC] failed (returncode={result.returncode}):")
+            print(f"    stderr: {result.stderr[:500]}")
+            if os.path.exists(result_json):
+                r = json.load(open(result_json))
+                print(f"    error: {r.get('error')}")
+                print(f"    trace: {r.get('trace', '')[:500]}")
+            return False
+        if os.path.exists(result_json):
+            r = json.load(open(result_json))
+            if not r.get("ok"):
+                print(f"  [post-IK TRC] error: {r.get('error')}")
+                return False
+            print(f"  [post-IK TRC] wrote {r.get('n_markers')} markers × "
+                  f"{r.get('n_frames')} frames → {os.path.basename(output_trc_path)}")
+    return True
+
+
 def run_ik(
     model_path: str,
     trc_path: str,

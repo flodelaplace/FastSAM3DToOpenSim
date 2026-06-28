@@ -1469,6 +1469,21 @@ def main(args):
     if not ik_ok:
         print("  WARNING: OpenSim IK failed or opensim env not found.")
 
+    # Export TRC post-IK : positions des markers RECALCULÉES depuis le modèle
+    # scalé + les angles du .mot. Cohérent à 100 % avec le .mot (mêmes
+    # contraintes squelettiques, pas de soft-tissue artifact), contrairement
+    # au .trc d'input IK qui contient les positions markers brutes.
+    # → consommé par synkro-analytics pour les métriques spatio-temporelles.
+    if ik_ok and os.path.isfile(osim_path) and os.path.isfile(ik_mot_path):
+        post_ik_trc_path = os.path.join(
+            args.output_dir, f"{prefix}_post_ik.trc")
+        from sam_3d_body.export.opensim_ik_runner import export_post_ik_trc
+        export_post_ik_trc(
+            model_path=osim_path,
+            mot_path=ik_mot_path,
+            output_trc_path=post_ik_trc_path,
+        )
+
     # Per-marker IK error analysis — computes mean/max distance in mm between
     # each TRC marker trajectory and the model's marker FK positions. Useful
     # to spot bony landmarks that fit poorly (bad vertex pick or bad .osim
