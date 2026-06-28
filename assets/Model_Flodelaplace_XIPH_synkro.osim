@@ -31426,300 +31426,300 @@
 				
 				<Marker name="Nose">
 					<socket_parent_frame>/bodyset/head</socket_parent_frame>
-					<location>0.10874635656378495 0.01426726618226725 0.00025718410261721316</location>
+					<location>0.1087463537076242 0.014267271064404962 0.00025719302848593487</location>
 				</Marker>
 				<Marker name="LEye">
 					<socket_parent_frame>/bodyset/head</socket_parent_frame>
-					<location>0.07738889015957828 0.05025280115798757 -0.03205555746648933</location>
+					<location>0.07738889345153499 0.05025279671833464 -0.032055543548337354</location>
 				</Marker>
 				<Marker name="REye">
 					<socket_parent_frame>/bodyset/head</socket_parent_frame>
-					<location>0.0781727871894661 0.05045052128709281 0.03223817690229814</location>
+					<location>0.07817278903503579 0.050450518777123664 0.032238177485934744</location>
 				</Marker>
 				<Marker name="LEar">
 					<socket_parent_frame>/bodyset/head</socket_parent_frame>
-					<location>-0.015616021245780376 0.024244589676753095 -0.06748380859011172</location>
+					<location>-0.015615997221876093 0.0242445869702439 -0.06748378837946296</location>
 				</Marker>
 				<Marker name="REar">
 					<socket_parent_frame>/bodyset/head</socket_parent_frame>
-					<location>-0.0158078597624786 0.02434684296018963 0.06762957768401932</location>
+					<location>-0.015807838387708113 0.024346844322692976 0.06762956984509405</location>
 				</Marker>
 				<Marker name="HTOP">
 					<socket_parent_frame>/bodyset/head</socket_parent_frame>
-					<location>-0.0012955234421753795 0.1468673316404321 5.917392101642731e-07</location>
+					<location>-0.0012955071481144387 0.1468673059282225 5.94511268082898e-07</location>
 				</Marker>
 				
 				<Marker name="c_spine0">
 					<socket_parent_frame>/bodyset/lumbar5</socket_parent_frame>
-					<location>-0.05334732503523433 0.02549557566382782 -1.5968904097710725e-05</location>
+					<location>-0.07035943807158933 0.028796497943316457 -1.539396093671672e-05</location>
 				</Marker>
 				<Marker name="XIPH">
 					<socket_parent_frame>/bodyset/torso</socket_parent_frame>
-					<location>0.09335023310832696 0.2196893903010483 -0.0011856351712869386</location>
+					<location>0.11268269618682894 0.22846745723794443 -0.0014365534567067858</location>
 				</Marker>
 				<Marker name="c_spine2">
 					<socket_parent_frame>/bodyset/torso</socket_parent_frame>
-					<location>-0.08298828255863855 0.16558761942761302 0.0008841542093371675</location>
+					<location>-0.08183305035471367 0.1663466308728385 0.0009642079924160918</location>
 				</Marker>
 				<Marker name="c_spine3">
 					<socket_parent_frame>/bodyset/torso</socket_parent_frame>
-					<location>-0.10156821698014021 0.3016413295161521 0.0011170221010692771</location>
+					<location>-0.10533503864441555 0.29905652254312554 0.0012191468616153346</location>
 				</Marker>
 				<Marker name="c_neck">
 					<socket_parent_frame>/bodyset/torso</socket_parent_frame>
-					<location>-0.03853647247025811 0.47719787219518384 0.0003908241141833246</location>
+					<location>-0.040283404976363735 0.47610208064431525 0.00037586513459616816</location>
 				</Marker>
 				<Marker name="c_head">
 					<socket_parent_frame>/bodyset/head</socket_parent_frame>
-					<location>-0.08763454086792824 0.04636717465319505 -4.593638516754578e-05</location>
+					<location>-0.08769422045700895 0.04634672713806201 -4.600159223316894e-05</location>
 				</Marker>
 				
 				<Marker name="RACR">
 					<socket_parent_frame>/bodyset/torso</socket_parent_frame>
-					<location>-0.007692724273242121 0.4174075747931439 0.14957792686123855</location>
+					<location>-0.006514494225298338 0.41665963249258897 0.14928068880244308</location>
 				</Marker>
 				<Marker name="LACR">
 					<socket_parent_frame>/bodyset/torso</socket_parent_frame>
-					<location>-0.01120608793454228 0.41748336708809886 -0.14946077086663923</location>
+					<location>-0.010173386128283689 0.41660399573726925 -0.1492683926300543</location>
 				</Marker>
 				<Marker name="C7">
 					<socket_parent_frame>/bodyset/torso</socket_parent_frame>
-					<location>-0.07292244323494618 0.43072024534630454 0.0007902618357946494</location>
+					<location>-0.07522696725046307 0.43131850906519004 0.0008154923581166623</location>
 				</Marker>
 				<Marker name="RCLAV">
 					<socket_parent_frame>/bodyset/torso</socket_parent_frame>
-					<location>0.04936892542664483 0.38023893987922375 0.01682737981409928</location>
+					<location>0.0525625711367323 0.3845039403308336 0.017107127687068555</location>
 				</Marker>
 				<Marker name="LCLAV">
 					<socket_parent_frame>/bodyset/torso</socket_parent_frame>
-					<location>0.048957507397965526 0.3802426852196402 -0.018124936734486414</location>
+					<location>0.05212496566301472 0.38449515624011166 -0.01857854855268299</location>
 				</Marker>
 				<Marker name="RLEL">
 					<socket_parent_frame>/bodyset/humerus_r</socket_parent_frame>
-					<location>0.03981197291233987 -0.26501311370323966 0.02298599726339451</location>
+					<location>0.04085740857055295 -0.26496768341729154 0.026285969609834592</location>
 				</Marker>
 				<Marker name="RMEL">
 					<socket_parent_frame>/bodyset/humerus_r</socket_parent_frame>
-					<location>0.011729902637126283 -0.28736893744656755 -0.054963161579548</location>
+					<location>0.010459224036310777 -0.28920709830434477 -0.05694761868079315</location>
 				</Marker>
 <Marker name="RFAradius">
 					<socket_parent_frame>/bodyset/radius_r</socket_parent_frame>
-					<location>0.019385022684771214 -0.22840700367264327 0.009101861716439896</location>
+					<location>0.019588339559609202 -0.2283708421526666 0.009216532180244597</location>
 				</Marker>
 				<Marker name="RFAulna">
 					<socket_parent_frame>/bodyset/radius_r</socket_parent_frame>
-					<location>-0.035159925896706995 -0.22901016611912273 0.017064832632649296</location>
+					<location>-0.03525902150986421 -0.22899859916515672 0.017113966616036314</location>
 				</Marker>
 				<Marker name="LLEL">
 					<socket_parent_frame>/bodyset/humerus_l</socket_parent_frame>
-					<location>0.02390869234887337 -0.2753345722358693 -0.02624276362177541</location>
+					<location>0.0237870065683648 -0.2757009431078925 -0.0295044026536333</location>
 				</Marker>
 				<Marker name="LMEL">
 					<socket_parent_frame>/bodyset/humerus_l</socket_parent_frame>
-					<location>0.027242044469102493 -0.28141995861180025 0.05928717416702589</location>
+					<location>0.02666636222960092 -0.28309716954947095 0.06162483131308508</location>
 				</Marker>
 				<Marker name="LFAradius">
 					<socket_parent_frame>/bodyset/radius_l</socket_parent_frame>
-					<location>0.019371356514570948 -0.22841346142994434 -0.009085576677611229</location>
+					<location>0.019574772836007226 -0.22837725016981672 -0.009200778511165075</location>
 				</Marker>
 				<Marker name="LFAulna">
 					<socket_parent_frame>/bodyset/radius_l</socket_parent_frame>
-					<location>-0.03523989079387521 -0.22397073519471933 -0.01616154681695614</location>
+					<location>-0.03545332380580954 -0.22395264914101448 -0.016238246981639337</location>
 				</Marker>
 				<Marker name="RASI">
 					<socket_parent_frame>/bodyset/pelvis</socket_parent_frame>
-					<location>0.010971979089365171 0.024791369916543207 0.13367955377326862</location>
+					<location>0.011390085270920055 0.024704598531934546 0.13069132706233771</location>
 				</Marker>
 				<Marker name="LASI">
 					<socket_parent_frame>/bodyset/pelvis</socket_parent_frame>
-					<location>0.010970736917275445 0.024797591811411283 -0.133681938418281</location>
+					<location>0.011389584769269458 0.024707026361162253 -0.1306922984949901</location>
 				</Marker>
 				<Marker name="RPSI">
 					<socket_parent_frame>/bodyset/pelvis</socket_parent_frame>
-					<location>-0.18834741235874009 0.022842718494714993 0.06432649715399373</location>
+					<location>-0.19041748691533125 0.02208207868732203 0.06385876609902606</location>
 				</Marker>
 				<Marker name="LPSI">
 					<socket_parent_frame>/bodyset/pelvis</socket_parent_frame>
-					<location>-0.18833961517822576 0.02284075454551178 -0.06431693805080116</location>
+					<location>-0.1904143450561848 0.02208137745451623 -0.06385491924303513</location>
 				</Marker>
 				<Marker name="RLFC">
 					<socket_parent_frame>/bodyset/femur_r</socket_parent_frame>
-					<location>-9.585245884140281e-05 -0.4062024951360881 0.04294243933810432</location>
+					<location>0.0018801754735091186 -0.405899927039175 0.04489664789888764</location>
 				</Marker>
 				<Marker name="RMFC">
 					<socket_parent_frame>/bodyset/femur_r</socket_parent_frame>
-					<location>-0.01167568274225652 -0.39543418469147373 -0.04273605012731335</location>
+					<location>-0.009850633523772412 -0.3961716864187331 -0.04665979943006185</location>
 				</Marker>
 				<Marker name="RLMAL">
 					<socket_parent_frame>/bodyset/tibia_r</socket_parent_frame>
-					<location>-0.009771517588934325 -0.41053028526179897 0.03484547453115583</location>
+					<location>-0.010121750587249081 -0.41065987980722507 0.035823003163735295</location>
 				</Marker>
 				<Marker name="RMMAL">
 					<socket_parent_frame>/bodyset/tibia_r</socket_parent_frame>
-					<location>0.004462872104796539 -0.40584205590626576 -0.03138116688353115</location>
+					<location>0.004398770636237823 -0.40597127621596524 -0.03275995677764551</location>
 				</Marker>
 				<Marker name="RCAL">
 					<socket_parent_frame>/bodyset/calcn_r</socket_parent_frame>
-					<location>-0.004581010179073586 0.014437411762932943 -0.009891384728587083</location>
+					<location>-0.0076555779184278305 0.003922242038582435 -0.010632368112168333</location>
 				</Marker>
 				<Marker name="RTOE">
 					<socket_parent_frame>/bodyset/calcn_r</socket_parent_frame>
-					<location>0.22187823894528447 0.020067612613403493 -0.005586156382747537</location>
+					<location>0.22247434136202932 0.020370629559109905 -0.005680012809388069</location>
 				</Marker>
 				<Marker name="RMT5">
 					<socket_parent_frame>/bodyset/calcn_r</socket_parent_frame>
-					<location>0.18063613300021714 0.007352553924818556 0.04808651541125167</location>
+					<location>0.18099843753940545 0.0074331517799468665 0.04845714515739313</location>
 				</Marker>
 				<Marker name="LLFC">
 					<socket_parent_frame>/bodyset/femur_l</socket_parent_frame>
-					<location>-0.007288319600387137 -0.40222786841729785 -0.046711880776285825</location>
+					<location>-0.005603848188751662 -0.40200355229177936 -0.04875145964730823</location>
 				</Marker>
 				<Marker name="LMFC">
 					<socket_parent_frame>/bodyset/femur_l</socket_parent_frame>
-					<location>-0.011705357514533575 -0.3954335502145863 0.04273318031518099</location>
+					<location>-0.00988277005187252 -0.396170994059484 0.04665830812070203</location>
 				</Marker>
 				<Marker name="LLMAL">
 					<socket_parent_frame>/bodyset/tibia_l</socket_parent_frame>
-					<location>-0.008241245126566835 -0.4217391323154627 -0.036089658218215914</location>
+					<location>-0.008930004469215616 -0.4218903682677163 -0.03703744912293233</location>
 				</Marker>
 				<Marker name="LMMAL">
 					<socket_parent_frame>/bodyset/tibia_l</socket_parent_frame>
-					<location>0.004432779559079253 -0.40584786320250144 0.03137232558074965</location>
+					<location>0.00437187249361512 -0.4059740647875988 0.032757977261242605</location>
 				</Marker>
 				<Marker name="LCAL">
 					<socket_parent_frame>/bodyset/calcn_l</socket_parent_frame>
-					<location>-0.004076830184338548 0.014548701206401234 0.01655002441260167</location>
+					<location>-0.006820108495872751 0.004454463716163849 0.018199941998064434</location>
 				</Marker>
 				<Marker name="LTOE">
 					<socket_parent_frame>/bodyset/calcn_l</socket_parent_frame>
-					<location>0.22187986138115773 0.02006719168976716 0.005714277578195592</location>
+					<location>0.22247587812506836 0.02037022127963399 0.005806859350779375</location>
 				</Marker>
 				<Marker name="LMT5">
 					<socket_parent_frame>/bodyset/calcn_l</socket_parent_frame>
-					<location>0.17810084958089753 0.004802038194633915 -0.05286121296262397</location>
+					<location>0.17843687550431245 0.00485024922024125 -0.05328536964403735</location>
 				</Marker>
 				
-				<Marker name="RWrist_hand">
-					<socket_parent_frame>/bodyset/hand_r</socket_parent_frame>
-					<location>0.01944273129634383 0.0017155206232976616 -0.004024638424489885</location>
-				</Marker>
 				<Marker name="RThumb">
 					<socket_parent_frame>/bodyset/hand_r</socket_parent_frame>
-					<location>0.010599060847300279 -0.05443701450345806 0.05068719424522669</location>
+					<location>0.009648719114206561 -0.06374456586835214 0.04950412642566751</location>
 				</Marker>
 				<Marker name="RIndex">
 					<socket_parent_frame>/bodyset/hand_r</socket_parent_frame>
-					<location>0.015842095721027072 -0.08258713487706748 0.01559016455845924</location>
+					<location>0.015550265136727748 -0.08731019146972291 0.016119580706435127</location>
 				</Marker>
 				<Marker name="RPinky">
 					<socket_parent_frame>/bodyset/hand_r</socket_parent_frame>
-					<location>0.0037790941117176735 -0.075340160565184 -0.03090230956717424</location>
+					<location>0.002522482144944549 -0.07970727778262682 -0.025509257911566996</location>
 				</Marker>
 				<Marker name="RIndexTip">
 					<socket_parent_frame>/bodyset/hand_r</socket_parent_frame>
-					<location>0.04344429568722358 -0.1444830415044695 0.011486185345520733</location>
+					<location>0.04546368503550147 -0.14098453248308196 0.008745338221431614</location>
 				</Marker>
 				<Marker name="RPinkyTip">
 					<socket_parent_frame>/bodyset/hand_r</socket_parent_frame>
-					<location>0.04202679994557629 -0.11583543171860433 -0.04619751963830068</location>
-				</Marker>
-				<Marker name="LWrist_hand">
-					<socket_parent_frame>/bodyset/hand_l</socket_parent_frame>
-					<location>0.01949322416168381 0.0017452057550957911 0.004048239608978155</location>
+					<location>0.04000594793908063 -0.11261342559294168 -0.04237662036307069</location>
 				</Marker>
 				<Marker name="LThumb">
 					<socket_parent_frame>/bodyset/hand_l</socket_parent_frame>
-					<location>0.01059864421031137 -0.05443696953947724 -0.050686961548712245</location>
+					<location>0.009648725867080765 -0.06374438624036449 -0.04950374600138724</location>
 				</Marker>
 				<Marker name="LIndex">
 					<socket_parent_frame>/bodyset/hand_l</socket_parent_frame>
-					<location>0.015841937405780326 -0.08258744243840599 -0.015590045961310806</location>
+					<location>0.015550351837199716 -0.08731037390997004 -0.01611935236549017</location>
 				</Marker>
 				<Marker name="LPinky">
 					<socket_parent_frame>/bodyset/hand_l</socket_parent_frame>
-					<location>0.00377988110595312 -0.07534001618114944 0.03090261697678101</location>
+					<location>0.002523701285218727 -0.07970679438016814 0.025509673548437584</location>
 				</Marker>
 				<Marker name="LIndexTip">
 					<socket_parent_frame>/bodyset/hand_l</socket_parent_frame>
-					<location>0.04344309904120003 -0.1444842667218389 -0.011486041068681924</location>
+					<location>0.045462138662677176 -0.14098598990862654 -0.008745228182265474</location>
 				</Marker>
 				<Marker name="LPinkyTip">
 					<socket_parent_frame>/bodyset/hand_l</socket_parent_frame>
-					<location>0.04202787559578797 -0.11583528557624523 0.04619646864419341</location>
+					<location>0.040007037603488005 -0.11261346896110269 0.04237560887723371</location>
 				</Marker>
 				
 				<Marker name="RHTO">
 					<socket_parent_frame>/bodyset/humerus_r</socket_parent_frame>
-					<location>0.012956054692301239 -0.12866644717197845 0.03261698351359149</location>
+					<location>0.012828871760432028 -0.1303114718804378 0.034862801129399684</location>
 				</Marker>
 				<Marker name="RHAP">
 					<socket_parent_frame>/bodyset/humerus_r</socket_parent_frame>
-					<location>0.03061574111192733 -0.1087278137996058 -0.056039306291587904</location>
+					<location>0.03231525278701651 -0.11330411811223748 -0.05653181360350673</location>
 				</Marker>
 				<Marker name="RHBA">
 					<socket_parent_frame>/bodyset/humerus_r</socket_parent_frame>
-					<location>-0.027469496937083726 -0.19093496942137395 -0.01580472555856724</location>
+					<location>-0.03203324659872253 -0.19368757830451588 -0.01611351381844303</location>
 				</Marker>
 				<Marker name="RHFR">
 					<socket_parent_frame>/bodyset/humerus_r</socket_parent_frame>
-					<location>0.0631676763430691 -0.17887750052522314 -0.006576182048472823</location>
+					<location>0.06636627740887413 -0.18110341404420646 -0.007033152593686837</location>
 				</Marker>
 				<Marker name="RFRM">
 					<socket_parent_frame>/bodyset/ulna_r</socket_parent_frame>
-					<location>-0.03914129293754426 -0.10391124447178246 0.012498761597492025</location>
+					<location>-0.04024444917066086 -0.10375010352718925 0.012906650053684632</location>
 				</Marker>
 				<Marker name="LHTO">
 					<socket_parent_frame>/bodyset/humerus_l</socket_parent_frame>
-					<location>0.012982739079810957 -0.12867058652097435 -0.032603957439934744</location>
+					<location>0.012857086902109391 -0.13031241976370347 -0.03485439329378487</location>
 				</Marker>
 				<Marker name="LHAP">
 					<socket_parent_frame>/bodyset/humerus_l</socket_parent_frame>
-					<location>0.030576916070296556 -0.1087289384556 0.0560582789301165</location>
+					<location>0.03227688622458583 -0.1133052028846585 0.05655151806578179</location>
 				</Marker>
 				<Marker name="LHBA">
 					<socket_parent_frame>/bodyset/humerus_l</socket_parent_frame>
-					<location>-0.027476456616505607 -0.19093616684231918 0.015777922538779215</location>
+					<location>-0.032040236167908936 -0.1936888749920119 0.01608379006261529</location>
 				</Marker>
 				<Marker name="LHFR">
 					<socket_parent_frame>/bodyset/humerus_l</socket_parent_frame>
-					<location>0.06316724492523595 -0.17887609511888963 0.0066169242351729884</location>
+					<location>0.06636557169282173 -0.18110198221132184 0.007075392930993435</location>
 				</Marker>
 				<Marker name="LFRM">
 					<socket_parent_frame>/bodyset/ulna_l</socket_parent_frame>
-					<location>-0.039144036929582876 -0.1039077004398836 -0.01252018735261995</location>
+					<location>-0.04024679397562514 -0.10374655063885202 -0.012928109969872481</location>
 				</Marker>
 				
 				<Marker name="RFLT">
 					<socket_parent_frame>/bodyset/femur_r</socket_parent_frame>
-					<location>-0.010145905051731505 -0.1540428539701285 0.09390331965438058</location>
+					<location>-0.011574636162086538 -0.155952751364404 0.09841741251625535</location>
 				</Marker>
 				<Marker name="RFLB">
 					<socket_parent_frame>/bodyset/femur_r</socket_parent_frame>
-					<location>-0.0029276047490124774 -0.3262356034623287 0.058413425104341526</location>
+					<location>-0.0022656213341124623 -0.32725704731777727 0.06152665234548663</location>
 				</Marker>
 				<Marker name="RSHN">
 					<socket_parent_frame>/bodyset/tibia_r</socket_parent_frame>
-					<location>-0.029209519164398054 -0.15483896323204635 0.07503712242160604</location>
+					<location>-0.028933147808903506 -0.15638171236001397 0.07724959003427956</location>
 				</Marker>
 				<Marker name="RTIB">
 					<socket_parent_frame>/bodyset/tibia_r</socket_parent_frame>
-					<location>0.017756655159136034 -0.20987566114489112 0.01374766951083406</location>
+					<location>0.020111208834957803 -0.21089117093105975 0.013963864420270589</location>
 				</Marker>
 				<Marker name="LFLT">
 					<socket_parent_frame>/bodyset/femur_l</socket_parent_frame>
-					<location>-0.010075407385817553 -0.1540442867354787 -0.09390855697186001</location>
+					<location>-0.011501783463996627 -0.1559542364029671 -0.0984235860613212</location>
 				</Marker>
 				<Marker name="LFLB">
 					<socket_parent_frame>/bodyset/femur_l</socket_parent_frame>
-					<location>-0.0028826163987451733 -0.32623635383986144 -0.05841081157877001</location>
+					<location>-0.0022189590137969284 -0.327257863393616 -0.06152357057825636</location>
 				</Marker>
 				<Marker name="LSHN">
 					<socket_parent_frame>/bodyset/tibia_l</socket_parent_frame>
-					<location>-0.029153144242445347 -0.15483769532020414 -0.07505497450834439</location>
+					<location>-0.028875909971548347 -0.15638042900482782 -0.07726702436558228</location>
 				</Marker>
 				<Marker name="LTIB">
 					<socket_parent_frame>/bodyset/tibia_l</socket_parent_frame>
-					<location>0.017767415657761083 -0.20987539342541306 -0.013731485834521884</location>
+					<location>0.020121984314403277 -0.2108909266325239 -0.013946188159505185</location>
+				</Marker>
+				<Marker name="RGTR">
+					<socket_parent_frame>/bodyset/femur_r</socket_parent_frame>
+					<location>0.012677789125030287 -0.014894207137095397 0.11994807826802527</location>
+				</Marker>
+				<Marker name="LGTR">
+					<socket_parent_frame>/bodyset/femur_l</socket_parent_frame>
+					<location>0.012765648043034372 -0.014895699351009678 -0.11993851952299799</location>
 				</Marker>
 			</objects>
 			<groups />

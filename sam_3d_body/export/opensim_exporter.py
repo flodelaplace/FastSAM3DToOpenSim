@@ -960,6 +960,12 @@ def write_mesh_glb(
     if not any(f is not None for f in filled):
         return
 
+    # Decimation FPS désactivée — elle réduit la topologie (18k → 8k) mais cause
+    # un rendu "à contretemps" car la projection nearest-neighbor n'est pas
+    # parfaitement frame-coherent sur les animations rapides. On garde le mesh
+    # full-res 18439 vertices et on laisse la compression Draco (post-process
+    # plus bas) gérer la taille. Florian 2026-06.
+
     N_verts = faces.max() + 1
     zero_v = np.zeros((N_verts, 3), dtype=np.float32)
     filled = [f if f is not None else zero_v for f in filled]
@@ -1599,6 +1605,15 @@ def write_mesh_glb(
     n_joints = len(joint_node_indices)
     n_bones  = len(bone_node_indices)
     print(f"  Mesh GLB: {n_joints} joint spheres, {n_bones} bone sticks, translucent skin")
+
+    # Compression GLB désactivée — tentée avec gltf-transform optimize
+    # --compress quantize (KHR_mesh_quantization), mais Florian observe un
+    # misalignment visuel vs le mesh anatomical malgré la matrice de transform
+    # ajoutée par l'extension. Probable cause : le scale matrix de
+    # KHR_mesh_quantization est appliqué sur la node mesh mais notre GLB a
+    # une structure node multi-niveaux (joints + bones + mesh principal),
+    # et le viewer n'applique pas la correction au bon niveau. Sujet remis
+    # à plat-froid pour une session dédiée (Florian, 2026-06).
 
 
 def write_combined_mesh_glb(

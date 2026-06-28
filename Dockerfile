@@ -34,6 +34,19 @@ RUN curl -fsSL "https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2
     | tar xz -C /usr/local/bin/ s5cmd && chmod +x /usr/local/bin/s5cmd && \
     /usr/local/bin/s5cmd version
 
+# Node.js 20 + @gltf-transform/cli — pour compresser les GLB animés avec
+# vrai Draco (extension KHR_draco_mesh_compression). gltfpack v1.1 ne fait
+# QUE meshopt (EXT_meshopt_compression) qui n'est pas supporté nativement
+# par Blender et cause des misalignments avec l'anatomical sur les meshes
+# animés à cause de la quantization vertex lossy. Draco via gltf-transform
+# préserve mieux l'alignement et est universellement reconnu (three.js,
+# model-viewer, Babylon, Blender natif…).
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/* && \
+    npm install -g @gltf-transform/cli && \
+    gltf-transform --version
+
 # --------------------------------------------------------------------------- #
 # Miniforge → /opt/conda                                                        #
 # --------------------------------------------------------------------------- #
@@ -80,8 +93,11 @@ RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
 # Step 4: TensorRT (~2 min)
 # Engines are GPU-specific AND TRT-version-specific. They are always regenerated
 # on first launch via docker/entrypoint.sh (GENERATE_TRT=1 by default).
+# Pin TRT to 10.7.0 — la 11.1 a retiré NetworkDefinitionCreationFlag.EXPLICIT_BATCH
+# et BuilderFlag.FP16, ce qui casse convert_backbone_tensorrt.py et
+# convert_moge_encoder_trt.py (TRT 11+ requirerait une refonte des scripts).
 RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
-        tensorrt-cu12 tensorrt-cu12-bindings tensorrt-cu12-libs
+        "tensorrt-cu12==10.7.0" "tensorrt-cu12-bindings==10.7.0" "tensorrt-cu12-libs==10.7.0"
 
 # Step 5: Application requirements (~5 min)
 COPY docker/requirements_docker.txt /tmp/requirements_docker.txt

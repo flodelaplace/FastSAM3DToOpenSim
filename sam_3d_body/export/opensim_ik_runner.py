@@ -45,14 +45,20 @@ MARKER_WEIGHTS_FLODELAPLACE: dict[str, float] = {
     "LHTO": 1.0, "LHAP": 1.0, "LHBA": 1.0, "LHFR": 1.0,
     "RFAradius": 2.0, "RFAulna": 2.0, "LFAradius": 2.0, "LFAulna": 2.0,
     "RFRM": 1.0, "LFRM": 1.0,
-    # Wrist + hand
-    "RWrist_hand": 0.5, "LWrist_hand": 0.5,
+    # Wrist + hand — RWrist_hand/LWrist_hand retirés (redondants avec les
+    # deux côtés du poignet RFAradius/RFAulna déjà au-dessus). Mesh2Marker
+    # 2026-06.
     "RThumb":      0.5, "RIndex":      0.5, "RPinky":      0.5,
     "LThumb":      0.5, "LIndex":      0.5, "LPinky":      0.5,
     "RIndexTip":   0.5, "RPinkyTip":   0.5,
     "LIndexTip":   0.5, "LPinkyTip":   0.5,
     # Pelvis bony (no more HJC virtual)
     "RASI": 2.0, "LASI": 2.0, "RPSI": 2.0, "LPSI": 2.0,
+    # Grand trochanters — ajoutés par Mesh2Marker (sur body femur_r/femur_l).
+    # Permettent une mesure femur_Y purement intra-fémur (GTR↔épicondyles
+    # fémoraux) au lieu de cross-body ASIS↔épicondyles qui traversait l'articu-
+    # lation hip et était biaisé par flexion (Florian, 2026-06).
+    "RGTR": 2.0, "LGTR": 2.0,
     # Lower limb — surface clusters only (no more KJC/AJC virtual).
     "RLFC": 2.0, "RMFC": 2.0, "LLFC": 2.0, "LMFC": 2.0,
     "RFLT": 1.0, "RFLB": 1.0, "LFLT": 1.0, "LFLB": 1.0,
@@ -113,20 +119,16 @@ _SCALE_MEASUREMENTS_FLODELAPLACE = [
     ("head_X",      [("Nose", "c_head")],                                      ["head"],                                                                 "X"),
 
     # ─────────────────── Right lower limb ───────────────────
-    # femur_Y : marqueurs ANATOMIQUES standards — ASIS/PSIS (pelvis) ↔
-    #   épicondyles fémoraux (RLFC/RMFC). Mesure cross-body qui inclut
-    #   l'offset pelvis → genou, c'est l'approche classique biomeca clinique
-    #   (Pose2Sim, OpenSim default). Plus robuste que les clusters cuisse
-    #   (RFLT/RFLB), qui dépendent du placement Mesh2Marker non standardisé.
-    #   En pratique le ratio reste cohérent quand la fenêtre statique est
-    #   prise en debout neutre (sujet vertical, hip non fléchie). Validé
-    #   visuellement par Florian (2026-06).
+    # femur_Y : PURE INTRA-FÉMUR — grand trochanter (RGTR) ↔ épicondyles
+    #   fémoraux (RLFC/RMFC). Tous les 3 markers sont sur le body femur_r,
+    #   donc la mesure n'est PAS biaisée par la flexion hip (contrairement à
+    #   l'ancienne mesure ASIS-épicondyles qui traversait l'articulation).
+    #   Le grand trochanter est ajouté par Mesh2Marker 2026-06.
     # femur_XZ : LFC ↔ MFC (largeur épicondyles fémoraux).
     # tibia_Y : croise les 2 cotés genou × 2 cotés cheville (4 paires)
     #   + MAL↔CAL pour inclure le talon (sinon tibia sous-scalé).
     # tibia_XZ : LMAL ↔ MMAL (largeur malléoles).
-    ("femur_r_Y",   [("RASI", "RLFC"), ("RASI", "RMFC"),
-                     ("RPSI", "RLFC"), ("RPSI", "RMFC")],                     ["femur_r", "patella_r"],                                                 "Y"),
+    ("femur_r_Y",   [("RGTR", "RLFC"), ("RGTR", "RMFC")],                     ["femur_r", "patella_r"],                                                 "Y"),
     ("femur_r_XZ",  [("RLFC", "RMFC")],                                       ["femur_r", "patella_r"],                                                 "X Z"),
     # tibia_Y : couvre genou (LFC/MFC) → cheville (LMAL/MMAL) PLUS l'extension
     #   vers le talon (LMAL/MMAL → CAL) — la malléole est ~3-4 cm au-dessus
@@ -157,8 +159,7 @@ _SCALE_MEASUREMENTS_FLODELAPLACE = [
     ("forearm_r_XZ",[("RFAradius", "RFAulna")],                               ["ulna_r", "radius_r"],                                                   "X Z"),
 
     # ─────────────────── Left lower limb ───────────────────
-    ("femur_l_Y",   [("LASI", "LLFC"), ("LASI", "LMFC"),
-                     ("LPSI", "LLFC"), ("LPSI", "LMFC")],                     ["femur_l", "patella_l"],                                                 "Y"),
+    ("femur_l_Y",   [("LGTR", "LLFC"), ("LGTR", "LMFC")],                     ["femur_l", "patella_l"],                                                 "Y"),
     ("femur_l_XZ",  [("LLFC", "LMFC")],                                       ["femur_l", "patella_l"],                                                 "X Z"),
     ("tibia_l_Y",   [("LLFC", "LLMAL"), ("LLFC", "LMMAL"),
                      ("LMFC", "LLMAL"), ("LMFC", "LMMAL"),
@@ -174,8 +175,11 @@ _SCALE_MEASUREMENTS_FLODELAPLACE = [
     ("forearm_l_XZ",[("LFAradius", "LFAulna")],                               ["ulna_l", "radius_l"],                                                   "X Z"),
 
     # ─────────────────── Hands (uniform) ───────────────────
-    ("hand_r",      [("RWrist_hand", "RIndexTip")],                           ["hand_r"],                                                               "X Y Z"),
-    ("hand_l",      [("LWrist_hand", "LIndexTip")],                           ["hand_l"],                                                               "X Y Z"),
+    # hand_r/l : RWrist_hand retiré (redondant avec RFAradius/RFAulna déjà
+    # sur radius/ulna). On utilise la largeur de la paume (Index↔Pinky aux
+    # MCPs) comme proxy de la taille de main — uniforme XYZ.
+    ("hand_r",      [("RIndex", "RPinky")],                                   ["hand_r"],                                                               "X Y Z"),
+    ("hand_l",      [("LIndex", "LPinky")],                                   ["hand_l"],                                                               "X Y Z"),
 ]
 
 

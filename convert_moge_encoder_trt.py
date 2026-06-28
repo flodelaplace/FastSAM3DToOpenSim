@@ -161,7 +161,12 @@ def convert_trt():
     # Create builder
     logger = trt.Logger(trt.Logger.INFO)
     builder = trt.Builder(logger)
-    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    # TRT 10+ : EXPLICIT_BATCH est le défaut, le flag a été retiré de
+    # NetworkDefinitionCreationFlag. Fallback sur l'API moderne.
+    if hasattr(trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH"):
+        network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    else:
+        network = builder.create_network()
     parser = trt.OnnxParser(network, logger)
 
     # Parse ONNX
