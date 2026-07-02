@@ -69,24 +69,35 @@ MAKEHUMAN_BONE_TARGETS: dict[str, tuple[str, str, str | None, str | None]] = {
     # Middle (metacarpal2) and ring (metacarpal3) are left at bind because the
     # TRC has no LMiddle/LRing markers — using LIndexTip/LPinky as proxies made
     # them splay weirdly. Will revisit when hand inference adds those markers.
+    # Wrist L : flexion/extension via (LWrist_hand, LMiddle). Roll fixé par
+    # LFAradius/LFAulna (mêmes aux que lowerarm02 et fingers → cohérent, pas
+    # de conflit d'orientation entre palm et fingers).
+    "wrist.L":      ("LWrist_hand", "LMiddle",    "LFAradius", "LFAulna"),
     "finger1-1.L":  ("LWrist_hand", "LThumb",     None, None),
-    # Metacarpals 1-4 : 3-DOF quand tips dispo (LIndexTip/LMiddleTip/LRingTip/
-    # LPinkyTip → axe finger = MCP→Tip, définit le roll → pas d'axe indéfini).
-    # LMiddle/LRing viennent de correspondence_synkro_avatar.json (avatar-only).
-    "metacarpal1.L":("LWrist_hand", "LIndex",  "LIndex",  "LIndexTip"),
-    "metacarpal2.L":("LWrist_hand", "LMiddle", "LMiddle", "LMiddleTip"),
-    "metacarpal3.L":("LWrist_hand", "LRing",   "LRing",   "LRingTip"),
-    "metacarpal4.L":("LWrist_hand", "LPinky",  "LPinky",  "LPinkyTip"),
+    # Metacarpals L 1-4 : gardés en bind pose (spread naturel du template
+    # MakeHuman). Le retarget du metacarpal donne un roll indéfini (2-DOF) ou
+    # nécessite un bind_aux calibré par bone (3-DOF, non trivial pour finger).
+    # À la place on rig UNIQUEMENT la proximal phalange (finger*-1) avec
+    # (MCP_marker, Tip_marker) : simple flexion/extension du doigt entier.
+    # Fingers en 2-DOF (pas d'aux) : le roll est hérité du wrist (déjà en 3-DOF
+    # avec LFAradius/LFAulna). Éviter de définir le roll 2 fois avec des mains
+    # axes différents (wrist main = LWrist→LMCP, finger main = LMCP→LTip) crée
+    # un décalage cumulé visible.
+    "finger2-1.L":  ("LIndex",  "LIndexTip",  None, None),
+    "finger3-1.L":  ("LMiddle", "LMiddleTip", None, None),
+    "finger4-1.L":  ("LRing",   "LRingTip",   None, None),
+    "finger5-1.L":  ("LPinky",  "LPinkyTip",  None, None),
     # Right arm
     "upperarm01.R": ("RACR",      "REJC",       "RLEL",       "RMEL"),
     "lowerarm01.R": ("REJC",      "RWrist_hand", None,        None),
     "lowerarm02.R": ("REJC",      "RWrist_hand", "RFAradius", "RFAulna"),
-    # Right hand
+    # Right hand — même stratégie : wrist flexion + metacarpals bind + phalanges flex/ext roll fixé.
+    "wrist.R":      ("RWrist_hand", "RMiddle",    "RFAradius", "RFAulna"),
     "finger1-1.R":  ("RWrist_hand", "RThumb",     None, None),
-    "metacarpal1.R":("RWrist_hand", "RIndex",  "RIndex",  "RIndexTip"),
-    "metacarpal2.R":("RWrist_hand", "RMiddle", "RMiddle", "RMiddleTip"),
-    "metacarpal3.R":("RWrist_hand", "RRing",   "RRing",   "RRingTip"),
-    "metacarpal4.R":("RWrist_hand", "RPinky",  "RPinky",  "RPinkyTip"),
+    "finger2-1.R":  ("RIndex",  "RIndexTip",  None, None),
+    "finger3-1.R":  ("RMiddle", "RMiddleTip", None, None),
+    "finger4-1.R":  ("RRing",   "RRingTip",   None, None),
+    "finger5-1.R":  ("RPinky",  "RPinkyTip",  None, None),
     # Left leg (3 DOF for upperleg + lowerleg, 2 DOF for foot)
     "upperleg01.L": ("LHJC",      "LKJC",       "LLFC",       "LMFC"),
     "lowerleg01.L": ("LKJC",      "LAJC",       "LLMAL",      "LMMAL"),
@@ -343,7 +354,9 @@ def _augment_trc_with_virtual_markers(
             if target not in name_to_idx:
                 continue
             op, srcs = spec[0], spec[1:]
-            if any(s not in name_to_idx for s in srcs):
+            # Ne check que les elements string (les autres = paramètres numériques).
+            str_srcs = [s for s in srcs if isinstance(s, str)]
+            if any(s not in name_to_idx for s in str_srcs):
                 continue
             if op == "midpoint":
                 new_pos = np.mean(
@@ -352,6 +365,10 @@ def _augment_trc_with_virtual_markers(
                 )
             elif op == "copy":
                 new_pos = positions[:, name_to_idx[srcs[0]], :].copy()
+            elif op == "blend":
+                a, b, w = srcs[0], srcs[1], float(srcs[2])
+                new_pos = (1.0 - w) * positions[:, name_to_idx[a], :] + \
+                          w * positions[:, name_to_idx[b], :]
             else:
                 raise ValueError(f"Unknown override op: {op!r}")
             positions[:, name_to_idx[target], :] = new_pos
@@ -486,15 +503,19 @@ def retarget_from_trc(
             return rig.bind_world[ji, :3, 1]
         return v / n
 
-    # bone_meta entries: (joint_idx, bind_dir, p_marker, c_marker, aux_lat, aux_med)
-    bone_meta: list[tuple[int, np.ndarray, str, str, str | None, str | None]] = []
+    # bone_meta entries: (joint_idx, bind_dir, p_marker, c_marker, aux_lat, aux_med, parent_rel_bone)
+    # parent_rel_bone (5e élément optionnel) : nom d'un bone ancêtre dont la
+    # rotation animée doit être appliquée sur le target du bone courant. Utile
+    # pour les phalanges qui doivent suivre la rotation du wrist retargeté.
+    bone_meta: list[tuple[int, np.ndarray, str, str, str | None, str | None, str | None]] = []
     for bone, target_def in bone_targets.items():
         if bone not in name_to_local:
             continue
-        pmark, cmark, aux_lat, aux_med = target_def
+        parent_rel = target_def[4] if len(target_def) > 4 else None
+        pmark, cmark, aux_lat, aux_med = target_def[:4]
         ji = name_to_local[bone]
         dir_bind = bind_direction(bone)
-        bone_meta.append((ji, dir_bind, pmark, cmark, aux_lat, aux_med))
+        bone_meta.append((ji, dir_bind, pmark, cmark, aux_lat, aux_med, parent_rel))
 
     # For each frame, walk top-down: compute target world rotation for each driven
     # bone, then convert to local via parent's target world rotation.
@@ -631,7 +652,7 @@ def retarget_from_trc(
             if ji == root_idx:
                 tw = target_root_world_rot
             elif ji in driven and ji in bone_bind_dir_avatar:
-                _ji, _dir_bind, pmark, cmark, aux_lat, aux_med = driven[ji]
+                _ji, _dir_bind, pmark, cmark, aux_lat, aux_med, parent_rel = driven[ji]
                 try:
                     p_pos = _marker_pos(pmark, frame_pos, name_to_idx)
                     c_pos = _marker_pos(cmark, frame_pos, name_to_idx)
@@ -661,14 +682,15 @@ def retarget_from_trc(
                                 aux_av = _vec_into_avatar(aux_subj)
                                 _name = rig.joint_names[ji]
                                 # Sign convention MakeHuman : local X = +lateral
-                                # pour upperarm/upperleg, MAIS lowerarm a un roll
-                                # bind inversé → besoin de flipper pour éviter un
-                                # twist de 180° quand LFAradius/LFAulna sont utilisés.
-                                lowerarm_flip = "lowerarm" in _name
+                                # pour upperarm/upperleg, MAIS lowerarm, wrist,
+                                # finger phalanges ont un roll bind inversé →
+                                # flip pour éviter un twist de 180° quand des
+                                # aux markers palmar/radial sont utilisés.
+                                flip = any(k in _name for k in ("lowerarm", "wrist", "finger"))
                                 if ".L" in _name:
-                                    bind_aux = np.array([-1.0 if lowerarm_flip else 1.0, 0.0, 0.0])
+                                    bind_aux = np.array([-1.0 if flip else 1.0, 0.0, 0.0])
                                 elif ".R" in _name:
-                                    bind_aux = np.array([1.0 if lowerarm_flip else -1.0, 0.0, 0.0])
+                                    bind_aux = np.array([1.0 if flip else -1.0, 0.0, 0.0])
                                 else:
                                     bind_aux = None
                                 if bind_aux is not None and np.linalg.norm(aux_av) > 1e-6:
@@ -686,6 +708,18 @@ def retarget_from_trc(
                             R_delta = R.from_quat(q_delta).as_matrix()
 
                         tw = R_delta @ _bind_world_rot_of(rig, ji)
+
+                        # parent_rel : mode "suivre le parent animé". Compose
+                        # tw avec la delta rotation du bone parent_rel de bind
+                        # vers son état animé courant. Utile pour phalanges qui
+                        # doivent suivre la rotation du wrist retargeté.
+                        if parent_rel is not None and parent_rel in name_to_local:
+                            ref_ji = name_to_local[parent_rel]
+                            animated_ref = target_world_rot[ref_ji]
+                            bind_ref = rig.bind_world[ref_ji, :3, :3]
+                            # Delta parent animé vs parent bind
+                            adjustment = animated_ref @ bind_ref.T
+                            tw = adjustment @ tw
                 except KeyError:
                     tw = parent_world @ R.from_quat(rig.bind_local_q[ji]).as_matrix()
             else:
