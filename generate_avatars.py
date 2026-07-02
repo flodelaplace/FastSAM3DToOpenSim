@@ -251,7 +251,17 @@ def main(args):
     if markerset == "flodelaplace":
         model_template = os.path.join(parent_dir, "assets", "flodelaplace_mocap.osim")
         from sam_3d_body.export.flodelaplace_converter import FlodelaplaceConverter
-        florian_converter = FlodelaplaceConverter()
+        # Pipeline avatar-only : correspondence étendue avec 4 markers finger
+        # médians/annulaires (LMiddle/LMiddleTip/LRing/LRingTip + côté R). Ces
+        # markers ne sont pas dans le modèle OpenSim → à ne PAS utiliser dans
+        # demo_video_opensim.py (IK) tant que le modèle .osim n'a pas de tags.
+        _correspondence_avatar_ext = os.path.join(
+            parent_dir, "assets", "correspondence_synkro_avatar.json")
+        if os.path.exists(_correspondence_avatar_ext):
+            florian_converter = FlodelaplaceConverter(_correspondence_avatar_ext)
+            print(f"  Using extended correspondence for avatar (+8 finger markers)")
+        else:
+            florian_converter = FlodelaplaceConverter()
         # Force vertex collection even when mesh GLB is disabled — the
         # converter needs the 21 anatomical vertex positions per frame.
         force_collect_verts = True

@@ -70,18 +70,23 @@ MAKEHUMAN_BONE_TARGETS: dict[str, tuple[str, str, str | None, str | None]] = {
     # TRC has no LMiddle/LRing markers — using LIndexTip/LPinky as proxies made
     # them splay weirdly. Will revisit when hand inference adds those markers.
     "finger1-1.L":  ("LWrist_hand", "LThumb",     None, None),
-    # Metacarpals 1-4 (index/middle/ring/pinky) tous laissés en bind pose : la
-    # rotation du poignet (via lowerarm01+02 avec twist LFAradius/LFAulna)
-    # oriente déjà la main entière ; retarger un metacarpal individuel avec
-    # shortest-arc _quat_from_two_vectors donne un roll indéfini qui casse
-    # l'alignement du wrist. Les 4 doigts suivent le wrist en bloc, fan
-    # naturel du template MakeHuman préservé.
+    # Metacarpals 1-4 : 3-DOF quand tips dispo (LIndexTip/LMiddleTip/LRingTip/
+    # LPinkyTip → axe finger = MCP→Tip, définit le roll → pas d'axe indéfini).
+    # LMiddle/LRing viennent de correspondence_synkro_avatar.json (avatar-only).
+    "metacarpal1.L":("LWrist_hand", "LIndex",  "LIndex",  "LIndexTip"),
+    "metacarpal2.L":("LWrist_hand", "LMiddle", "LMiddle", "LMiddleTip"),
+    "metacarpal3.L":("LWrist_hand", "LRing",   "LRing",   "LRingTip"),
+    "metacarpal4.L":("LWrist_hand", "LPinky",  "LPinky",  "LPinkyTip"),
     # Right arm
     "upperarm01.R": ("RACR",      "REJC",       "RLEL",       "RMEL"),
     "lowerarm01.R": ("REJC",      "RWrist_hand", None,        None),
     "lowerarm02.R": ("REJC",      "RWrist_hand", "RFAradius", "RFAulna"),
     # Right hand
     "finger1-1.R":  ("RWrist_hand", "RThumb",     None, None),
+    "metacarpal1.R":("RWrist_hand", "RIndex",  "RIndex",  "RIndexTip"),
+    "metacarpal2.R":("RWrist_hand", "RMiddle", "RMiddle", "RMiddleTip"),
+    "metacarpal3.R":("RWrist_hand", "RRing",   "RRing",   "RRingTip"),
+    "metacarpal4.R":("RWrist_hand", "RPinky",  "RPinky",  "RPinkyTip"),
     # Left leg (3 DOF for upperleg + lowerleg, 2 DOF for foot)
     "upperleg01.L": ("LHJC",      "LKJC",       "LLFC",       "LMFC"),
     "lowerleg01.L": ("LKJC",      "LAJC",       "LLMAL",      "LMMAL"),
