@@ -211,9 +211,12 @@ def step2_convert_tensorrt(batch_sizes=[1, 2, 4]):
         out = network.get_output(i)
         print(f"    {out.name}: {out.shape}")
 
-    # Build config
+    # Build config — workspace réduit à 1.5 GB pour fit sur T4 (16 GB VRAM).
+    # Le DINOv3 ONNX (~700 MB) + activations intermédiaires + workspace doivent
+    # tenir dans 16 GB. 4 GB workspace causait CUDA OOM sur T4 (3.3 GB add'l
+    # allocation requise échouait). 1.5 GB suffit pour l'optimisation.
     config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)  # 4GB
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(1.5 * (1 << 30)))  # 1.5 GB
 
     # Use FP16 precision for internal compute and I/O
     # (FP16 is better optimized in TensorRT than BF16)

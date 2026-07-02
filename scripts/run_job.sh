@@ -67,8 +67,16 @@ echo ">>> Syncing checkpoints from S3..."
 mkdir -p /app/checkpoints
 SYNC_OK=0
 SYNC_START=$(date +%s)
+# Exclure les ~500 fichiers de weights ONNX externes du backbone DINOv3 :
+# inutiles au runtime (seul le .engine est chargé), et le pré-sync
+# entrypoint a déjà pris .engine + .build_skipped. Si un rebuild devient
+# nécessaire, l'entrypoint re-sync full le dossier juste avant.
+# Nomenclature : les weights sont préfixés "encoder." ou "onnx__" — s5cmd
+# match par basename (pas par path), donc ces patterns filtrent bien les
+# ~500 fichiers weights sans toucher .onnx / .engine / .build_skipped.
 if command -v s5cmd >/dev/null 2>&1; then
-    if s5cmd sync "${CHECKPOINTS_S3_URI%/}/*" /app/checkpoints/; then
+    if s5cmd sync --exclude "*encoder.*" --exclude "*onnx__*" \
+        "${CHECKPOINTS_S3_URI%/}/*" /app/checkpoints/; then
         SYNC_OK=1
         echo ">>> Sync checkpoints OK via s5cmd ($(( $(date +%s) - SYNC_START )) s)"
     else
@@ -76,7 +84,8 @@ if command -v s5cmd >/dev/null 2>&1; then
     fi
 fi
 if [ "$SYNC_OK" = "0" ]; then
-    aws s3 sync "$CHECKPOINTS_S3_URI" /app/checkpoints/ --no-progress
+    aws s3 sync "$CHECKPOINTS_S3_URI" /app/checkpoints/ \
+        --exclude "*encoder.*" --exclude "*onnx__*" --no-progress
     echo ">>> Sync checkpoints OK via aws s3 sync ($(( $(date +%s) - SYNC_START )) s)"
 fi
 
@@ -200,6 +209,23 @@ if [ "$MODE" = "avatar" ]; then
     done
 else
     aws s3 cp "$OUTPUT_DIR" "$S3_OUTPUT_PATH" --recursive --no-progress
+fi
+
+# ---- Cache torch compile artifacts back to S3 ------------------------------
+# Persiste les caches compilés PyTorch pour les cold starts suivants
+# (Inductor FX graph + Triton CUDA kernels). L'entrypoint pré-sync au start.
+# `|| true` : upload best-effort, ne doit pas faire échouer le job.
+if [ -n "${TORCHINDUCTOR_CACHE_DIR:-}" ] && [ -d "$TORCHINDUCTOR_CACHE_DIR" ] && \
+   [ -n "$(ls -A "$TORCHINDUCTOR_CACHE_DIR" 2>/dev/null)" ]; then
+    echo ">>> Caching torch inductor artifacts to S3..."
+    aws s3 sync "$TORCHINDUCTOR_CACHE_DIR/" \
+        "${CHECKPOINTS_S3_URI%/}/torch_inductor_cache/" --no-progress || true
+fi
+if [ -n "${TRITON_CACHE_DIR:-}" ] && [ -d "$TRITON_CACHE_DIR" ] && \
+   [ -n "$(ls -A "$TRITON_CACHE_DIR" 2>/dev/null)" ]; then
+    echo ">>> Caching triton kernels to S3..."
+    aws s3 sync "$TRITON_CACHE_DIR/" \
+        "${CHECKPOINTS_S3_URI%/}/triton_cache/" --no-progress || true
 fi
 
 echo "=== Job complete -> $S3_OUTPUT_PATH ==="

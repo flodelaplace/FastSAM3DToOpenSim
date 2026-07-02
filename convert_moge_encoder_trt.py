@@ -179,7 +179,7 @@ def convert_trt():
 
     # Configure builder
     config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 4 << 30)  # 4GB
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, int(1.5 * (1 << 30)))  # 1.5 GB (fit T4)
     config.set_flag(trt.BuilderFlag.FP16)  # Enable FP16
 
     # Build engine
