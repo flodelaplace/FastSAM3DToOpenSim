@@ -62,20 +62,26 @@ MAKEHUMAN_BONE_TARGETS: dict[str, tuple[str, str, str | None, str | None]] = {
     # LFAulna markers — using the axial reference there produces a ~180° twist.
     "upperarm01.L": ("LACR",      "LEJC",       "LLEL",       "LMEL"),
     "lowerarm01.L": ("LEJC",      "LWrist_hand", None,        None),
+    # lowerarm02 = twist bone MakeHuman : capture uniquement la pronation via
+    # LFAradius/LFAulna, sans changer la direction (héritée de lowerarm01).
+    "lowerarm02.L": ("LEJC",      "LWrist_hand", "LFAradius", "LFAulna"),
     # Left hand (2 DOF, only fingers with real markers in body-only TRC).
     # Middle (metacarpal2) and ring (metacarpal3) are left at bind because the
     # TRC has no LMiddle/LRing markers — using LIndexTip/LPinky as proxies made
     # them splay weirdly. Will revisit when hand inference adds those markers.
     "finger1-1.L":  ("LWrist_hand", "LThumb",     None, None),
-    "metacarpal1.L":("LWrist_hand", "LIndex",     None, None),
-    "metacarpal4.L":("LWrist_hand", "LPinky",     None, None),
+    # Metacarpals 1-4 (index/middle/ring/pinky) tous laissés en bind pose : la
+    # rotation du poignet (via lowerarm01+02 avec twist LFAradius/LFAulna)
+    # oriente déjà la main entière ; retarger un metacarpal individuel avec
+    # shortest-arc _quat_from_two_vectors donne un roll indéfini qui casse
+    # l'alignement du wrist. Les 4 doigts suivent le wrist en bloc, fan
+    # naturel du template MakeHuman préservé.
     # Right arm
     "upperarm01.R": ("RACR",      "REJC",       "RLEL",       "RMEL"),
     "lowerarm01.R": ("REJC",      "RWrist_hand", None,        None),
+    "lowerarm02.R": ("REJC",      "RWrist_hand", "RFAradius", "RFAulna"),
     # Right hand
     "finger1-1.R":  ("RWrist_hand", "RThumb",     None, None),
-    "metacarpal1.R":("RWrist_hand", "RIndex",     None, None),
-    "metacarpal4.R":("RWrist_hand", "RPinky",     None, None),
     # Left leg (3 DOF for upperleg + lowerleg, 2 DOF for foot)
     "upperleg01.L": ("LHJC",      "LKJC",       "LLFC",       "LMFC"),
     "lowerleg01.L": ("LKJC",      "LAJC",       "LLMAL",      "LMMAL"),
@@ -203,6 +209,150 @@ def load_trc(path: str | Path) -> tuple[np.ndarray, list[str], float]:
     return positions, marker_names, rate
 
 
+# XIPH markerset (Model_Flodelaplace_XIPH.osim) volontairement ne fournit
+# plus les joint-center virtuels — ils sont reconstruits ici depuis les
+# markers de surface pour rester compatible avec le retarget avatar.
+_VIRTUAL_MARKERS: dict[str, tuple] = {
+    "LHJC":        ("bell_brand", "L"),                   # Bell-Brand from ASIS/PSIS
+    "RHJC":        ("bell_brand", "R"),
+    "LKJC":        ("midpoint", "LLFC", "LMFC"),          # knee JC = midpoint condyles
+    "RKJC":        ("midpoint", "RLFC", "RMFC"),
+    "LAJC":        ("midpoint", "LLMAL", "LMMAL"),        # ankle JC = midpoint malleoli
+    "RAJC":        ("midpoint", "RLMAL", "RMMAL"),
+    "LEJC":        ("midpoint", "LLEL", "LMEL"),          # elbow JC = midpoint epicondyles
+    "REJC":        ("midpoint", "RLEL", "RMEL"),
+    "LWrist_hand": ("midpoint", "LFAradius", "LFAulna"),  # wrist = midpoint radius/ulna
+    "RWrist_hand": ("midpoint", "RFAradius", "RFAulna"),
+    "c_spine1":    ("midpoint", "c_spine0", "c_spine2"),
+}
+
+# Marker positions to OVERRIDE (not add) — used quand un marker existant
+# du TRC n'est pas au bon endroit anatomique pour le retarget avatar.
+# Ex: c_head vertex placé à l'arrière du crâne côté MHR → besoin d'un
+# centre tête recalé sur le midpoint des oreilles.
+_MARKER_OVERRIDES: dict[str, tuple] = {
+    "c_head": ("midpoint", "LEar", "REar"),  # head center = midpoint of ears
+}
+
+
+def _bell_brand_hjc(positions: np.ndarray, name_to_idx: dict[str, int],
+                    side: str) -> np.ndarray:
+    """Estimate LHJC/RHJC from pelvic landmarks (Bell-Brand 1990).
+
+    Uses LASI, RASI, LPSI, RPSI to build a pelvis coordinate frame, then
+    places HJC per Bell-Brand regression (in mm relative to midASIS):
+        posterior:  -0.19 * pelvis_width
+        inferior:   -0.30 * pelvis_width
+        lateral:    +0.36 * pelvis_width   (toward the queried side)
+    """
+    lasi = positions[:, name_to_idx["LASI"], :]
+    rasi = positions[:, name_to_idx["RASI"], :]
+    lpsi = positions[:, name_to_idx["LPSI"], :]
+    rpsi = positions[:, name_to_idx["RPSI"], :]
+
+    midasi = 0.5 * (lasi + rasi)
+    midpsi = 0.5 * (lpsi + rpsi)
+
+    # ML axis: points from RASI to LASI (i.e. positive = left)
+    ml_vec = lasi - rasi
+    width = np.linalg.norm(ml_vec, axis=-1, keepdims=True)
+    ml_axis = ml_vec / (width + 1e-9)
+    # AP axis (posterior direction): midPSI - midASI, orthogonalized
+    ap_raw = midpsi - midasi
+    ap_axis = ap_raw - (ap_raw * ml_axis).sum(-1, keepdims=True) * ml_axis
+    ap_axis = ap_axis / (np.linalg.norm(ap_axis, axis=-1, keepdims=True) + 1e-9)
+    # SI axis (inferior direction): completes right-handed frame such that
+    # ml × ap points superior; therefore inferior = -(ml × ap).
+    si_axis = -np.cross(ml_axis, ap_axis)
+    si_axis = si_axis / (np.linalg.norm(si_axis, axis=-1, keepdims=True) + 1e-9)
+
+    lateral_sign = 1.0 if side == "L" else -1.0
+    return midasi + width * (
+        +0.19 * ap_axis          # posterior (ap_axis points posterior)
+        + 0.30 * si_axis         # inferior (si_axis points inferior)
+        + 0.36 * ml_axis * lateral_sign
+    )
+
+
+def _augment_trc_with_virtual_markers(
+    positions: np.ndarray, marker_names: list[str],
+) -> tuple[np.ndarray, list[str]]:
+    """Add virtual JC markers derived from surface landmarks when absent."""
+    name_to_idx = {n: i for i, n in enumerate(marker_names)}
+    extra_pos, extra_names = [], []
+    for vname, spec in _VIRTUAL_MARKERS.items():
+        if vname in name_to_idx:
+            continue
+        op = spec[0]
+        if op == "bell_brand":
+            required = ("LASI", "RASI", "LPSI", "RPSI")
+            if any(m not in name_to_idx for m in required):
+                continue
+            new_pos = _bell_brand_hjc(positions, name_to_idx, side=spec[1])
+        elif op == "midpoint":
+            srcs = spec[1:]
+            if any(s not in name_to_idx for s in srcs):
+                continue
+            new_pos = np.mean(
+                np.stack([positions[:, name_to_idx[s], :] for s in srcs], axis=0),
+                axis=0,
+            )
+        elif op == "copy":
+            src = spec[1]
+            if src not in name_to_idx:
+                continue
+            new_pos = positions[:, name_to_idx[src], :].copy()
+        elif op == "interp":
+            a, b, t = spec[1], spec[2], float(spec[3])
+            if a not in name_to_idx or b not in name_to_idx:
+                continue
+            new_pos = (1.0 - t) * positions[:, name_to_idx[a], :] + \
+                      t * positions[:, name_to_idx[b], :]
+        elif op == "interp_forward":
+            # Latéral entre mcp_a/mcp_b à lat_t, puis shift vers tips à forward_frac.
+            mcp_a, mcp_b, tip_a, tip_b = spec[1], spec[2], spec[3], spec[4]
+            lat_t, forward_frac = float(spec[5]), float(spec[6])
+            required = (mcp_a, mcp_b, tip_a, tip_b)
+            if any(m not in name_to_idx for m in required):
+                continue
+            mcp_pos = (1.0 - lat_t) * positions[:, name_to_idx[mcp_a], :] + \
+                      lat_t * positions[:, name_to_idx[mcp_b], :]
+            tip_pos = (1.0 - lat_t) * positions[:, name_to_idx[tip_a], :] + \
+                      lat_t * positions[:, name_to_idx[tip_b], :]
+            new_pos = mcp_pos + forward_frac * (tip_pos - mcp_pos)
+        else:
+            raise ValueError(f"Unknown virtual marker op: {op!r}")
+        extra_pos.append(new_pos)
+        extra_names.append(vname)
+    if extra_names:
+        augmented = np.concatenate([positions, np.stack(extra_pos, axis=1)], axis=1)
+        marker_names = marker_names + extra_names
+        positions = augmented
+        name_to_idx = {n: i for i, n in enumerate(marker_names)}
+
+    # Apply overrides (replace existing marker positions in-place, only for the
+    # retarget copy — the underlying TRC file on disk is untouched).
+    if _MARKER_OVERRIDES:
+        positions = positions.copy()
+        for target, spec in _MARKER_OVERRIDES.items():
+            if target not in name_to_idx:
+                continue
+            op, srcs = spec[0], spec[1:]
+            if any(s not in name_to_idx for s in srcs):
+                continue
+            if op == "midpoint":
+                new_pos = np.mean(
+                    np.stack([positions[:, name_to_idx[s], :] for s in srcs], axis=0),
+                    axis=0,
+                )
+            elif op == "copy":
+                new_pos = positions[:, name_to_idx[srcs[0]], :].copy()
+            else:
+                raise ValueError(f"Unknown override op: {op!r}")
+            positions[:, name_to_idx[target], :] = new_pos
+    return positions, marker_names
+
+
 def _marker_pos(name: str, frame_pos: np.ndarray, name_to_idx: dict[str, int],
                 left: str = "LHJC", right: str = "RHJC") -> np.ndarray:
     if name == ":midhip":
@@ -270,6 +420,9 @@ def retarget_from_trc(
     marker_names: list[str],
     bone_targets: dict[str, tuple[str, str]] = MAKEHUMAN_BONE_TARGETS,
 ) -> RetargetResult:
+    trc_positions, marker_names = _augment_trc_with_virtual_markers(
+        trc_positions, marker_names,
+    )
     name_to_idx = {n: i for i, n in enumerate(marker_names)}
     T = trc_positions.shape[0]
     J = len(rig.joint_names)
@@ -502,10 +655,15 @@ def retarget_from_trc(
                                 aux_subj = lat_pos - med_pos
                                 aux_av = _vec_into_avatar(aux_subj)
                                 _name = rig.joint_names[ji]
+                                # Sign convention MakeHuman : local X = +lateral
+                                # pour upperarm/upperleg, MAIS lowerarm a un roll
+                                # bind inversé → besoin de flipper pour éviter un
+                                # twist de 180° quand LFAradius/LFAulna sont utilisés.
+                                lowerarm_flip = "lowerarm" in _name
                                 if ".L" in _name:
-                                    bind_aux = np.array([1.0, 0.0, 0.0])
+                                    bind_aux = np.array([-1.0 if lowerarm_flip else 1.0, 0.0, 0.0])
                                 elif ".R" in _name:
-                                    bind_aux = np.array([-1.0, 0.0, 0.0])
+                                    bind_aux = np.array([1.0 if lowerarm_flip else -1.0, 0.0, 0.0])
                                 else:
                                     bind_aux = None
                                 if bind_aux is not None and np.linalg.norm(aux_av) > 1e-6:
@@ -738,6 +896,7 @@ def generate_avatar_from_trc(
 ) -> Path:
     rig = load_avatar_glb(avatar_glb_path)
     positions, marker_names, fps = load_trc(trc_path)
+    positions, marker_names = _augment_trc_with_virtual_markers(positions, marker_names)
     if stretch_torso:
         stretch_torso_to_subject(rig, positions, marker_names)
     result = retarget_from_trc(rig, positions, marker_names)
