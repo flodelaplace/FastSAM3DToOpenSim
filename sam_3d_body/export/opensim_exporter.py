@@ -668,12 +668,19 @@ def write_anatomical_glb(
     osim_path: str | Path,
     mot_path: str | Path,
     geometry_dir: str | Path | None = None,
+    y_offset_m: float = 0.0,
 ) -> bool:
     """Write a standalone GLB with the OpenSim anatomical skeleton.
 
     Loads the .vtp/.stl meshes referenced by the .osim model and animates each
     body using the per-frame transform read from the IK .mot. Output is in
     OpenSim native frame (X=anterior, Y=up, Z=lateral, meters).
+
+    `y_offset_m` : shift Y appliqué à toutes les translations avant écriture.
+    À utiliser pour aligner l'anatomical GLB sur la même origine Y que le mesh
+    GLB (typiquement `-_shared_offset_m` : min Y des kpts sur calib window,
+    ancre "sol" à Y=0). Sans cet offset, l'anatomical est ~5-10 cm au-dessus
+    du mesh dans les viewers glTF.
 
     Returns True on success, False otherwise (e.g. opensim env unavailable).
     """
@@ -777,6 +784,8 @@ def write_anatomical_glb(
         # Per-frame world transform (already in OpenSim native frame)
         W = np.asarray(body_data_b["world_transforms"], dtype=np.float32)
         trans = W[:, :3, 3].astype(np.float32)
+        if y_offset_m != 0.0:
+            trans[:, 1] += float(y_offset_m)
         rot = np.zeros((W.shape[0], 4), dtype=np.float32)
         for i in range(W.shape[0]):
             rot[i] = _mat_to_quat_xyzw(W[i, :3, :3])

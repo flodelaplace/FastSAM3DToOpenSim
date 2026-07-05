@@ -972,6 +972,7 @@ def main(args):
         correct_floor_lean=_correct_lean,
         floor_angle=moge_floor_angle,
         apply_body_vertical=_apply_body_vertical,
+        lock_vertical=args.lock_vertical,
     )
 
     # 2b. Spine-based forward-lean correction (runs after floor-plane rotation above).
@@ -1227,6 +1228,7 @@ def main(args):
                 correct_floor_lean=not args.no_lean_fix,
                 floor_angle=moge_floor_angle,
                 apply_body_vertical=not args.floor_seated,
+                lock_vertical=args.lock_vertical,
             )
 
             # Spine lean correction
@@ -1640,7 +1642,13 @@ def main(args):
             anat_glb = os.path.join(args.output_dir, f"{prefix}_anatomical.glb")
             print(f"  Writing anatomical GLB → {anat_glb}")
             from sam_3d_body.export.opensim_exporter import write_anatomical_glb
-            write_anatomical_glb(anat_glb, osim_path, ik_mot_path)
+            # Aligner le anatomical GLB sur le même origin Y que le mesh GLB :
+            # le mesh reçoit `-_shared_offset_m` (min Y kpts calib → sol=0),
+            # l'anatomical doit recevoir le même décalage sinon il apparaît
+            # ~5-10 cm plus haut dans Blender.
+            _anat_y_offset = (-_shared_offset_m) if _shared_offset_m is not None else 0.0
+            write_anatomical_glb(anat_glb, osim_path, ik_mot_path,
+                                 y_offset_m=_anat_y_offset)
 
             # Derived clinical angles : ajoute 11 colonnes au .mot
             # (knee_valgus, knee_rotation, ankle_rotation, foot_progression
@@ -1771,6 +1779,13 @@ if __name__ == "__main__":
                         help="Disable global XZ translation — keeps the person centred at "
                              "origin with feet fixed to the ground. Use for exercises where "
                              "the subject does not walk (squat, CMJ, deadlift, etc.).")
+    parser.add_argument("--lock-vertical", dest="lock_vertical", action="store_true",
+                        help="Lock aussi la composante Y (verticale) du pelvis — skip "
+                             "l'injection cam_t_Y appliquée sinon en mode --stationary. "
+                             "Mesh + anatomical restent ainsi tous deux verrouillés en Y et "
+                             "parfaitement alignés (même code path). Utiliser pour rendu "
+                             "bikefit indoor / home-trainer où l'oscillation du pédalage "
+                             "doit rester invisible.")
     parser.add_argument("--compute_com", action="store_true",
                         help="Compute whole-body centre of mass (COM) trajectory from the "
                              "scaled model and IK motion. Writes a _com.sto file with "

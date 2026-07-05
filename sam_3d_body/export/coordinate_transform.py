@@ -59,6 +59,7 @@ class CoordinateTransformer:
         correct_floor_lean: bool = True,
         floor_angle: Optional[float] = None,
         apply_body_vertical: Optional[bool] = None,
+        lock_vertical: bool = False,
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
         Transform keypoints (and optionally jcoords) to OpenSim world space.
@@ -122,7 +123,7 @@ class CoordinateTransformer:
             # ajouté), donc on stocke cam_t.Y pour qu'il puisse ré-appliquer
             # exactement la même injection verticale que les kpts (et ainsi
             # rester aligné avec l'anatomical, qui lui suit kpts via TRC/IK).
-            if camera_translation is not None:
+            if camera_translation is not None and not lock_vertical:
                 ct_os = (camera_translation @ self.CAMERA_TO_OPENSIM.T * scale
                          ).astype(np.float64)  # (N, 3) in meters
                 # Inject cam_t_Y aux kpts pour préserver vertical motion
@@ -131,6 +132,13 @@ class CoordinateTransformer:
                     jc[:, :, 1] += ct_os[:, 1:2]
                 # Stocker la Y-injection pour la rejouer côté mesh.
                 self._last_stationary_cam_t_y_m = ct_os[:, 1].copy()
+            # lock_vertical=True → on skip complètement l'injection cam_t_Y.
+            # Résultat : pelvis reste à Y=0 canonical (invariant en Y frame par
+            # frame). Comme apply_pipeline_to_verts consulte le même
+            # `_last_stationary_cam_t_y_m` (qui reste None), le mesh ne reçoit
+            # PAS d'injection Y non plus → mesh + anatomical restent alignés
+            # ET tous deux verrouillés verticalement. Idéal pour rendu bikefit
+            # indoor / home-trainer où on ne veut pas l'oscillation du pédalage.
 
         # 3b. Floor-plane lean correction — must run BEFORE per-frame align_to_ground,
         #     which destroys the global floor-tilt signal by independently shifting
