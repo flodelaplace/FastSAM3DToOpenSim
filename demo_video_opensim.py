@@ -1642,11 +1642,20 @@ def main(args):
             anat_glb = os.path.join(args.output_dir, f"{prefix}_anatomical.glb")
             print(f"  Writing anatomical GLB → {anat_glb}")
             from sam_3d_body.export.opensim_exporter import write_anatomical_glb
-            # Aligner le anatomical GLB sur le même origin Y que le mesh GLB :
-            # le mesh reçoit `-_shared_offset_m` (min Y kpts calib → sol=0),
-            # l'anatomical doit recevoir le même décalage sinon il apparaît
-            # ~5-10 cm plus haut dans Blender.
-            _anat_y_offset = (-_shared_offset_m) if _shared_offset_m is not None else 0.0
+            # Aligner le anatomical GLB sur le même origin Y que le mesh GLB.
+            # Cas bikefit (`_shared_offset_m` ~5-10 cm) : anatomical natif est
+            # légèrement plus haut que le mesh shifté → appliquer -_shared
+            # aligne. Cas jump/CMJ où SMPL-X place le sujet loin (-1m+ en Y),
+            # l'anatomical natif est DÉJÀ à Y=0 (modèle OSim) et n'a PAS
+            # besoin d'un shift compensateur. Safety threshold : n'appliquer
+            # que si l'offset est <30 cm en magnitude — sinon on ferait
+            # monter/descendre l'anatomical d'un mètre.
+            _anat_y_offset = 0.0
+            if _shared_offset_m is not None and abs(_shared_offset_m) < 0.30:
+                _anat_y_offset = -_shared_offset_m
+            elif _shared_offset_m is not None:
+                print(f"  [anatomical GLB] _shared_offset_m={_shared_offset_m:+.3f} m "
+                      "hors seuil ±30cm → anatomical laissé natif (évite décalage aberrant)")
             write_anatomical_glb(anat_glb, osim_path, ik_mot_path,
                                  y_offset_m=_anat_y_offset)
 
