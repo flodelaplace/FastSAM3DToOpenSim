@@ -18,6 +18,13 @@ Tokens:
                          pour mouvements debout type squat/marche. Omettre pour
                          rameur, couché, suspension, etc. où le sujet ne doit
                          pas être forcé au sol.)
+    lv                   --lock-vertical  (fige aussi la composante Y du pelvis
+                         en mode --stationary. Utile pour bikefit indoor /
+                         home-trainer où l'oscillation du pédalage ne doit pas
+                         faire monter/descendre le mesh.)
+    bikefit              MACRO = --stationary + --lock-vertical + --no_lean_fix
+                         Raccourci pour bikefit indoor / home-trainer sans
+                         sol visible. Ne pas combiner avec `floor`.
 
 Examples:
     squat_jean__h185.mp4              single, full video
@@ -25,6 +32,7 @@ Examples:
     violon__h185_s3_e12.mp4           single, trim 3-12s
     groupe__h185-170-180.mp4          multi-person (auto)
     groupe__h185-170_st_com.mp4       multi, stationary, CoM
+    bikefit_alex__h180_bikefit.mp4    bikefit home-trainer (bike-fit macro)
 """
 import json
 import os
@@ -46,7 +54,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 HEIGHT_RE = re.compile(r"^h(\d{2,3}(?:-\d{2,3})*)$")
 START_RE = re.compile(r"^s(\d+)$")
 END_RE = re.compile(r"^e(\d+)$")
-FLAG_TOKENS = {"st", "com", "floor"}
+FLAG_TOKENS = {"st", "com", "floor", "lv", "bikefit"}
 
 _SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
@@ -89,6 +97,8 @@ def parse_filename(basename):
     stationary = False
     compute_com = False
     floor = False
+    lock_vertical = False
+    bikefit = False
 
     for t in tokens:
         m = HEIGHT_RE.match(t)
@@ -118,6 +128,12 @@ def parse_filename(basename):
         if t == "floor":
             floor = True
             continue
+        if t == "lv":
+            lock_vertical = True
+            continue
+        if t == "bikefit":
+            bikefit = True
+            continue
         raise FilenameParseError(f"Unknown token: '{t}'")
 
     if heights is None:
@@ -126,6 +142,16 @@ def parse_filename(basename):
         raise FilenameParseError(
             f"start ({trim_start}s) must be < end ({trim_end}s)"
         )
+    # Macro `bikefit` = --stationary + --lock-vertical + --no_lean_fix.
+    # Développée AVANT la sérialisation en flags CLI.
+    if bikefit:
+        stationary = True
+        lock_vertical = True
+        if floor:
+            raise FilenameParseError(
+                "Token 'bikefit' incompatible avec 'floor' — sur home-trainer "
+                "il n'y a pas de sol libre à détecter."
+            )
 
     extra = []
     if len(heights) == 1:
@@ -143,6 +169,12 @@ def parse_filename(basename):
         extra.append("--compute_com")
     if floor:
         extra.append("--floor")
+    if lock_vertical:
+        extra.append("--lock-vertical")
+    if bikefit:
+        # Macro : ajoute --no_lean_fix (les autres flags ont déjà été activés
+        # dans la section normalisation ci-dessus).
+        extra.append("--no_lean_fix")
 
     return {
         "raw_name": raw_name,
