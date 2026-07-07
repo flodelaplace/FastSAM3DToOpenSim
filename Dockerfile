@@ -116,13 +116,24 @@ RUN conda clean -afy && \
 
 # --------------------------------------------------------------------------- #
 # Env 2: opensim (Python 3.10, opensim-org channel)                            #
+#   + deps opencap-processing (muscle-driven GRF pour squat/STS/CMJ,           #
+#     Uhlrich 2023). Voir synkro-analytics/core/grf_muscle_driven.py           #
 # --------------------------------------------------------------------------- #
 RUN conda create -y -n opensim -c opensim-org -c conda-forge python=3.10 opensim && \
     conda clean -afy
 
+# Deps opencap-processing (Uhlrich 2023 muscle-driven simulation)
+# scipy 1.10 pinned pour compat casadi + opencap-processing scripts
+RUN /opt/conda/envs/opensim/bin/pip install --no-cache-dir \
+        scipy==1.10.0 pandas matplotlib ipython python-decouple \
+        maskpass==0.3.6 requests casadi pyyaml joblib cmake seaborn && \
+    find /opt/conda -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+
 # Set an environment variable to the exact path of the opensim python interpreter
 # This makes it easy for the main script to find it without relying on `conda run`
 ENV OPENSIM_PYTHON_PATH /opt/conda/envs/opensim/bin/python
+# Path vers opencap-processing (cloné dans le repo, muscle-driven GRF)
+ENV OPENCAP_PROCESSING_PATH /app/opencap-processing
 
 # --------------------------------------------------------------------------- #
 # Application code                                                              #
