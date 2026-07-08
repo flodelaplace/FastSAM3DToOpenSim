@@ -31,10 +31,39 @@ services:
       - DEBUG_NAN=0
       - PARALLEL_DECODERS=0
       - COMPILE_WARMUP_BATCH_SIZES=1
+      # Redirige tous les caches (HuggingFace, Torch, XDG) vers /tmp
+      # Nécessaire quand user: != root car / n'est pas writeable
+      - HOME=/tmp
+      - HF_HOME=/tmp/hf
+      - HUGGINGFACE_HUB_CACHE=/tmp/hf
+      - TORCH_HOME=/tmp/torch
+      - XDG_CACHE_HOME=/tmp/xdg-cache
+      - TRANSFORMERS_CACHE=/tmp/hf/transformers
+      # PYTHONPATH pour que l'env opensim voie synkro-analytics via volume mount
+      # (dev local). En prod, remplacé par pip install dans le Dockerfile.
+      - PYTHONPATH=/app/synkro-analytics
     volumes:
       - ./checkpoints:/app/checkpoints
       - ./videos:/app/videos:ro
       - ./outputs:/outputs
+      # Cache persistent : évite recompilation torch.compile (~30-60s) à chaque
+      # docker compose run. Persist entre runs sans polluer le repo (dans /tmp host).
+      - /tmp/synkro-docker-cache:/tmp
+      # /etc/passwd + /etc/group readonly pour que getpwuid(1000) résolve → fdela.
+      # Sans ça, torch.compile/inductor crash: "KeyError: getpwuid(): uid not found: 1000".
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
+      # Dev mount : le code Python host override celui baké dans l'image →
+      # pas besoin de rebuild après modif .py. Read-only pour éviter d'écrire
+      # dans /app depuis le container. AWS Batch ignore compose donc pas d'impact.
+      - ./demo_video_opensim.py:/app/demo_video_opensim.py:ro
+      - ./sam_3d_body:/app/sam_3d_body:ro
+      # synkro-analytics : mount le repo host pour auto-analytics local sans
+      # rebuild. AWS : le package sera pip installé dans l'image (Dockerfile).
+      - /home/fdela/synkro-analytics:/app/synkro-analytics:ro
+    # Ecrit les artefacts /outputs avec l'UID/GID de l'utilisateur host (WSL2 fdela = 1000:1000)
+    # Evite le "sudo chown" après chaque run local. Sur AWS Batch : root reste OK (pas de host mount).
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
     stdin_open: true
     tty: true
     # Default: runs the demo configured in docker/entrypoint.sh.

@@ -14,8 +14,11 @@ CMD_ARGS=("$@")
 #   - TRITON_CACHE_DIR        : compiled CUDA kernels (le plus gros gain)
 # Le TORCHINDUCTOR_FX_GRAPH_CACHE=1 active explicitement le cache FX (défaut
 # on récent PyTorch mais safe). Caches GPU-spécifiques, invalidation auto.
-export TORCHINDUCTOR_CACHE_DIR=/app/torch_inductor_cache
-export TRITON_CACHE_DIR=/app/triton_cache
+# /tmp au lieu de /app car container tourne en user 1000 (fdela) qui ne peut
+# pas écrire dans /app (root-owned). /tmp est mounté depuis /tmp/synkro-docker-cache
+# host donc persist entre runs.
+export TORCHINDUCTOR_CACHE_DIR=/tmp/torch_inductor_cache
+export TRITON_CACHE_DIR=/tmp/triton_cache
 export TORCHINDUCTOR_FX_GRAPH_CACHE=1
 mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 if [ -n "$CHECKPOINTS_S3_URI" ]; then

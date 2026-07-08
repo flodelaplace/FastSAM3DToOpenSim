@@ -11,6 +11,15 @@ output_*/
 *.pt
 *.ckpt
 *.onnx
+# Exceptions : garder les checkpoints GaitDynamics (bundlés dans synkro-analytics)
+!synkro-analytics/external/GaitDynamics/example_usage/*.pt
+# Exclure gros dossiers de synkro-analytics inutiles au container
+synkro-analytics/outputs/
+synkro-analytics/tests/
+synkro-analytics/docs/
+synkro-analytics/examples/
+synkro-analytics/.git/
+synkro-analytics/.venv/
 *.pem
 *.bak*
 mhr2smpl/experiments/

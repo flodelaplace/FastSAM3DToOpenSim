@@ -10,29 +10,39 @@ Filename convention (strict — files not matching are rejected):
 Tokens:
     h<cm>                required, e.g. h185 -> person_height=1.85m
     h<cm>-<cm>[-...]     multi-person, e.g. h185-170 -> 2 persons 1.85m + 1.70m
+    m<kg>                masse sujet en kg (e.g. m75). Optionnel mais requis
+                         pour analytics auto (--module).
+    a<age>               âge sujet en années (e.g. a30). Requis pour STS
+                         (normes stratifiées par âge).
+    sxM / sxF            sexe biologique (default: non renseigné). Pour
+                         normes stratifiées.
+    tr / re / cl / el    niveau : trained, recreational, clinical, elite
+                         (default: trained).
     s<sec>               trim start in seconds (integer, default 0)
     e<sec>               trim end   in seconds (integer, default video end)
-    st                   --stationary
+
+Module tokens (activent l'auto-analytics post-SAM3D) :
+    run                  --module d3.running
+    gait                 --module d3.gait
+    sprint               --module d3.sprint_start
+    squat                --module d3.squat
+    cmj / jump           --module d3.jump
+    sts                  --module d3.sit_to_stand
+    cycling              --module d3.cycling
+
+Flags avancés (auto-dispatch par --module rend ces flags souvent redondants) :
+    st                   --stationary   (auto pour cmj/squat/sts/cycling)
     com                  --compute_com
-    floor                --floor  (mise au sol + redressement caméra : à utiliser
-                         pour mouvements debout type squat/marche. Omettre pour
-                         rameur, couché, suspension, etc. où le sujet ne doit
-                         pas être forcé au sol.)
-    lv                   --lock-vertical  (fige aussi la composante Y du pelvis
-                         en mode --stationary. Utile pour bikefit indoor /
-                         home-trainer où l'oscillation du pédalage ne doit pas
-                         faire monter/descendre le mesh.)
-    bikefit              MACRO = --stationary + --lock-vertical + --no_lean_fix
-                         Raccourci pour bikefit indoor / home-trainer sans
-                         sol visible. Ne pas combiner avec `floor`.
+    floor                --floor        (mode aggressive : per-frame ground align)
+    lv                   --lock-vertical
+    bikefit              MACRO = st + lv + no_lean_fix (home-trainer)
 
 Examples:
-    squat_jean__h185.mp4              single, full video
-    cmj__h185_st_com.mp4              single, stationary, compute CoM
-    violon__h185_s3_e12.mp4           single, trim 3-12s
-    groupe__h185-170-180.mp4          multi-person (auto)
-    groupe__h185-170_st_com.mp4       multi, stationary, CoM
-    bikefit_alex__h180_bikefit.mp4    bikefit home-trainer (bike-fit macro)
+    squat_jean__h185_m85_a30_squat.mp4                     → auto d3.squat
+    cmj_athlete__h180_m75_a25_sxF_tr_cmj.mp4               → auto d3.jump
+    running_cedric__h178_m70_a35_sxM_run.mp4               → auto d3.running
+    sts_diane__h165_m82_a65_sxF_cl_sts.mp4                 → auto d3.sit_to_stand
+    bikefit_alex__h180_m75_a40_bikefit_cycling.mp4         → bikefit + cycling
 """
 import json
 import os
@@ -52,9 +62,25 @@ SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 HEIGHT_RE = re.compile(r"^h(\d{2,3}(?:-\d{2,3})*)$")
+MASS_RE = re.compile(r"^m(\d{2,3})$")
+AGE_RE = re.compile(r"^a(\d{1,3})$")
+SEX_RE = re.compile(r"^sx([MF])$")
 START_RE = re.compile(r"^s(\d+)$")
 END_RE = re.compile(r"^e(\d+)$")
 FLAG_TOKENS = {"st", "com", "floor", "lv", "bikefit"}
+LEVEL_TOKENS = {"tr": "trained", "re": "recreational",
+                "cl": "clinical", "el": "elite"}
+# Module token → --module value (d3 par défaut pour SAM3D 3D pipeline)
+MODULE_TOKENS = {
+    "run": "d3.running",
+    "gait": "d3.gait",
+    "sprint": "d3.sprint_start",
+    "squat": "d3.squat",
+    "cmj": "d3.jump",
+    "jump": "d3.jump",
+    "sts": "d3.sit_to_stand",
+    "cycling": "d3.cycling",
+}
 
 _SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
@@ -92,6 +118,11 @@ def parse_filename(basename):
         raise FilenameParseError("Empty meta block after '__'")
 
     heights = None
+    mass_kg = None
+    age = None
+    sex = None
+    level = None
+    module = None
     trim_start = None
     trim_end = None
     stationary = False
@@ -107,6 +138,24 @@ def parse_filename(basename):
                 raise FilenameParseError(f"Duplicate height token: '{t}'")
             heights = [int(v) / 100.0 for v in m.group(1).split("-")]
             continue
+        m = MASS_RE.match(t)
+        if m:
+            if mass_kg is not None:
+                raise FilenameParseError(f"Duplicate mass token: '{t}'")
+            mass_kg = int(m.group(1))
+            continue
+        m = AGE_RE.match(t)
+        if m:
+            if age is not None:
+                raise FilenameParseError(f"Duplicate age token: '{t}'")
+            age = int(m.group(1))
+            continue
+        m = SEX_RE.match(t)
+        if m:
+            if sex is not None:
+                raise FilenameParseError(f"Duplicate sex token: '{t}'")
+            sex = m.group(1)
+            continue
         m = START_RE.match(t)
         if m:
             if trim_start is not None:
@@ -118,6 +167,16 @@ def parse_filename(basename):
             if trim_end is not None:
                 raise FilenameParseError(f"Duplicate end token: '{t}'")
             trim_end = int(m.group(1))
+            continue
+        if t in LEVEL_TOKENS:
+            if level is not None:
+                raise FilenameParseError(f"Duplicate level token: '{t}'")
+            level = LEVEL_TOKENS[t]
+            continue
+        if t in MODULE_TOKENS:
+            if module is not None:
+                raise FilenameParseError(f"Duplicate module token: '{t}'")
+            module = MODULE_TOKENS[t]
             continue
         if t == "st":
             stationary = True
@@ -175,6 +234,28 @@ def parse_filename(basename):
         # Macro : ajoute --no_lean_fix (les autres flags ont déjà été activés
         # dans la section normalisation ci-dessus).
         extra.append("--no_lean_fix")
+
+    # Auto-analytics : ajoute --module + --mass_kg + --age + --sex + --level
+    # si le nom de fichier fournit ces tokens. Le pipeline SAM3D relaie ces
+    # args à synkro-analytics en post-processing.
+    if module is not None:
+        if mass_kg is None:
+            raise FilenameParseError(
+                f"Module token '{module}' nécessite m<kg> (ex: m75) pour analytics."
+            )
+        extra += ["--module", module,
+                   "--mass_kg", str(mass_kg)]
+        if age is not None:
+            extra += ["--age", str(age)]
+        if sex is not None:
+            extra += ["--sex", sex]
+        if level is not None:
+            extra += ["--level", level]
+
+    # Toujours activer --floor_moge (fix Y-DOWN 2026-07 : marche pour tous les
+    # cas standard, auto-skip si MoGe échoue).
+    if "--floor_moge" not in extra and not floor:
+        extra.append("--floor_moge")
 
     return {
         "raw_name": raw_name,

@@ -129,6 +129,25 @@ RUN /opt/conda/envs/opensim/bin/pip install --no-cache-dir \
         maskpass==0.3.6 requests casadi pyyaml joblib cmake seaborn && \
     find /opt/conda -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
 
+# --------------------------------------------------------------------------- #
+# Env opensim : deps synkro-analytics (auto-analytics module + reports).      #
+# Torch CPU-only (GaitDynamics inference sur CPU, ~10-15s per video, fine     #
+# pour prod async). Nimblephysics pour GaitDynamics. weasyprint+jinja2 pour   #
+# rapport v2. pygltflib pour GRF GLB. reportlab pour rapport v1 legacy.       #
+# --------------------------------------------------------------------------- #
+RUN /opt/conda/envs/opensim/bin/pip install --no-cache-dir \
+        torch --index-url https://download.pytorch.org/whl/cpu && \
+    /opt/conda/envs/opensim/bin/pip install --no-cache-dir \
+        nimblephysics accelerate einops \
+        weasyprint jinja2 pygltflib reportlab && \
+    find /opt/conda -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+
+# synkro-analytics : le package Python (bundle du repo dans l'image pour AWS).
+# Pour dev local, le volume mount override /app/synkro-analytics (cf. docker-compose.yml).
+COPY synkro-analytics /app/synkro-analytics
+RUN /opt/conda/envs/opensim/bin/pip install --no-cache-dir -e /app/synkro-analytics && \
+    find /opt/conda -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+
 # Set an environment variable to the exact path of the opensim python interpreter
 # This makes it easy for the main script to find it without relying on `conda run`
 ENV OPENSIM_PYTHON_PATH /opt/conda/envs/opensim/bin/python

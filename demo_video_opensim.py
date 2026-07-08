@@ -322,40 +322,107 @@ def main(args):
     # Optionally estimate floor tilt from MoGe on frame 0 and skip spine correction
     # when MoGe estimation is active (avoids overcorrection).
     moge_floor_angle = None
+    moge_floor_quality = None
+    # Flag : True = MoGe a essayé et confirme que le sol est indétectable → skip
+    # tout fix. False = MoGe pas encore essayé OU a foiré techniquement → fallback OK.
+    moge_all_rejected = False
     if getattr(args, "floor_moge", False) and not args.no_lean_fix:
         fov_est = getattr(estimator, "fov_estimator", None)
         if fov_est is not None:
-            print("\nEstimating floor plane from MoGe depth (frame 0)...")
+            # MULTI-FRAME robust estimation : sample N frames dispersées,
+            # filtre par netteté (Laplacien variance), RANSAC → median.
+            # Env var MOGE_MULTI_FRAME=0 pour revenir à l'ancien mode single-frame.
+            multi_frame = bool(int(os.environ.get("MOGE_MULTI_FRAME", "1")))
+            n_samples = int(os.environ.get("MOGE_N_SAMPLES", "8"))
             t_moge = time.time()
-            # Read first frame from the video file
-            cap_m = cv2.VideoCapture(args.video_path)
-            ret_m, first_frame = cap_m.read()
-            cap_m.release()
-            if ret_m and first_frame is not None:
-                try:
-                    pts, mask = fov_est.get_depth_points(cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB))
-                    # Try to get a person bbox on the first frame to exclude from floor fit
-                    first_bbox = None
+            if multi_frame:
+                print(f"\nEstimating floor plane from MoGe (multi-frame, N={n_samples})...")
+                # Use YOLO detector directly (rapide, ~10x plus léger que
+                # process_one_image qui refait tout le pipeline SAM3D). Le sol
+                # a pas besoin de précision millimétrique sur le bbox — juste
+                # exclure grossièrement la zone sujet.
+                _yolo = getattr(estimator, "detector", None)
+                def _bbox_fn(frame_rgb):
+                    if _yolo is None:
+                        return None
                     try:
-                        outs = estimator.process_one_image(
-                            cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB),
-                            hand_box_source=args.hand_box_source,
-                            inference_type=args.inference_type,
-                            bbox_thr=getattr(args, 'bbox_thr', None),
-                            nms_thr=getattr(args, 'nms_thr', None),
-                        )
-                        if outs and "bbox" in outs[0]:
-                            first_bbox = tuple(outs[0]["bbox"])
+                        # Passe direct au détecteur YOLO (bypass SAM3D backbone)
+                        results = _yolo.predict(frame_rgb, verbose=False)
+                        if not results or len(results[0].boxes) == 0:
+                            return None
+                        # Premier bbox (le plus confiant)
+                        b = results[0].boxes.xyxy[0].cpu().numpy()
+                        return (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
                     except Exception:
-                        first_bbox = None
-                    moge_floor_angle = CoordinateTransformer.floor_angle_from_moge_points(
-                        pts, mask, person_bbox=first_bbox, orig_hw=(first_frame.shape[0], first_frame.shape[1])
+                        return None
+                try:
+                    pitch, roll, quality = CoordinateTransformer.robust_floor_angle_multi_frame(
+                        args.video_path,
+                        depth_estimator_fn=fov_est.get_depth_points,
+                        person_bbox_fn=_bbox_fn,
+                        n_samples=n_samples,
                     )
-                    _p, _r = moge_floor_angle
-                    print(f"  MoGe floor tilt: pitch={_p:+.2f}° roll={_r:+.2f}° "
+                    moge_floor_angle = (pitch, roll)
+                    moge_floor_quality = quality
+                    print(f"  MoGe floor tilt: pitch={pitch:+.2f}° roll={roll:+.2f}° "
+                          f"[{quality['status']}, {quality['n_used']}/{quality['n_requested']} frames, "
+                          f"pitch_std={quality.get('pitch_std_deg', 0):.2f}°] "
                           f"(took {time.time() - t_moge:.2f}s)")
-                except Exception:
-                    print("  [floor_moge] MoGe floor estimation failed — skipping.")
+                    # Debug détail par frame
+                    n_aberrant = sum(1 for pf in quality.get("per_frame", [])
+                                     if pf.get("status") == "rejected_aberrant_plane")
+                    n_blurry = sum(1 for pf in quality.get("per_frame", [])
+                                   if pf.get("status") == "skipped_blurry")
+                    if n_aberrant or n_blurry:
+                        print(f"  [floor_moge] rejects: aberrant={n_aberrant} blurry={n_blurry}")
+                    if quality.get("status") == "unstable":
+                        print(f"  [floor_moge] ⚠ unstable estimation (std > threshold). "
+                              f"Consider --floor + --lean_ref_frame N for manual correction.")
+                    elif quality.get("status") == "insufficient_samples":
+                        # SKIP entièrement le lean fix — mieux que corriger avec un mauvais angle.
+                        # moge_all_rejected empêche le fallback single-frame (mêmes bugs).
+                        print(f"  [floor_moge] ⚠ MoGe unreliable ({quality['n_used']}/{quality['n_requested']} "
+                              f"clean frames, aberrant={n_aberrant}, blurry={n_blurry}). "
+                              f"Skipping camera-pitch correction — skeleton kept as-is. "
+                              f"Use --lean_ref_frame N to correct manually if needed.")
+                        moge_floor_angle = None
+                        moge_all_rejected = True
+                except Exception as e:
+                    print(f"  [floor_moge] multi-frame failed ({e}) — fallback single frame.")
+                    multi_frame = False
+            if (not multi_frame or moge_floor_angle is None) and not moge_all_rejected:
+                # Fallback single-frame (ancien comportement) — uniquement si le
+                # multi-frame a foiré techniquement, PAS si MoGe a rejeté toutes
+                # les frames (dans ce cas, ne pas insister avec un mauvais angle).
+                print("Estimating floor plane from MoGe depth (frame 0)...")
+                cap_m = cv2.VideoCapture(args.video_path)
+                ret_m, first_frame = cap_m.read()
+                cap_m.release()
+                if ret_m and first_frame is not None:
+                    try:
+                        pts, mask = fov_est.get_depth_points(cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB))
+                        first_bbox = None
+                        try:
+                            outs = estimator.process_one_image(
+                                cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB),
+                                hand_box_source=args.hand_box_source,
+                                inference_type=args.inference_type,
+                                bbox_thr=getattr(args, 'bbox_thr', None),
+                                nms_thr=getattr(args, 'nms_thr', None),
+                            )
+                            if outs and "bbox" in outs[0]:
+                                first_bbox = tuple(outs[0]["bbox"])
+                        except Exception:
+                            first_bbox = None
+                        moge_floor_angle = CoordinateTransformer.floor_angle_from_moge_points(
+                            pts, mask, person_bbox=first_bbox,
+                            orig_hw=(first_frame.shape[0], first_frame.shape[1]),
+                        )
+                        _p, _r = moge_floor_angle
+                        print(f"  MoGe floor tilt (frame 0): pitch={_p:+.2f}° roll={_r:+.2f}° "
+                              f"(took {time.time() - t_moge:.2f}s)")
+                    except Exception:
+                        print("  [floor_moge] MoGe floor estimation failed — skipping.")
         else:
             print("  [floor_moge] No FOV estimator available — skipping.")
 
@@ -962,17 +1029,43 @@ def main(args):
     #   mode défaut (--floor_moge sans --floor), sans forcer la mise au sol
     #   per_frame qui est l'objet propre de --floor.
     _correct_lean = (moge_floor_angle is not None or _apply_floor) and not args.no_lean_fix
+    # Auto-détection selon --module :
+    # - running/gait/sprint : subject avance en ligne droite → --lock_lateral
+    # - squat/STS : feet stables → --feet_anchor + clamp (feet à Y≥0 auto)
+    # - CMJ/jump : feet peuvent lever pendant vol → --feet_anchor SANS clamp
+    #   (le clamp shift everybody up quand MHR bugge le crouch → inverse la
+    #    biomeca du saut). NO_FLOOR_CLAMP=1 propagé.
+    # - cycling : assis pédale → --stationary + --lock_vertical
+    _auto_lock_lateral = args.module in ("d3.running", "d3.gait", "d3.sprint_start")
+    # Activités "en place" (subject bouge peu en XZ globalement) :
+    # combo --stationary + --feet_anchor + clamp Y≥0.
+    #   • --stationary → active injection cam_t.Y (nécessaire pour capter la
+    #     motion verticale que MHR sous-reconstruit sur CMJ/squat/STS).
+    #   • --feet_anchor → shift XZ post pour que le midpoint pieds reste au
+    #     médian → effectivement les PIEDS sont locked (pas le pelvis).
+    #   • clamp Y≥0 (défaut floor_moge) → empêche traversée sol.
+    _auto_feet_anchor = args.module in ("d3.squat", "d3.sit_to_stand",
+                                          "d3.jump")
+    _auto_stationary = args.module in ("d3.squat", "d3.sit_to_stand",
+                                          "d3.jump", "d3.cycling")
+    _auto_lock_vertical = args.module == "d3.cycling"
+    _stationary_effective = args.stationary or _auto_stationary
+    # Running/gait/sprint : feet peuvent lever naturellement → clamp désactivé
+    if args.module in ("d3.running", "d3.gait", "d3.sprint_start"):
+        os.environ["NO_FLOOR_CLAMP"] = "1"
+
     kpts_opensim, jcoords_opensim = transformer.transform(
         kpts_processed,
         jcoords_3d=jcoords_processed,
         camera_translation=cam_t_processed,
         center_pelvis=True,
         align_to_ground=_apply_floor,
-        apply_global_translation=not args.stationary,
+        apply_global_translation=not _stationary_effective,
         correct_floor_lean=_correct_lean,
         floor_angle=moge_floor_angle,
         apply_body_vertical=_apply_body_vertical,
         lock_vertical=args.lock_vertical,
+        lock_lateral=args.lock_lateral or _auto_lock_lateral,
     )
 
     # 2b. Spine-based forward-lean correction (runs after floor-plane rotation above).
@@ -1058,7 +1151,7 @@ def main(args):
     # le corps (mesh + kpts + jcoords + markers) du même delta XZ par frame.
     # Effet : pieds collés au sol, le reste du corps articule autour.
     feet_anchor_shifts_xz = None  # (N, 2) array, [dx, dz] per frame, or None
-    if args.feet_anchor:
+    if args.feet_anchor or _auto_feet_anchor:
         # Référence : midpoint LCAL/RCAL (talons) si dispo, sinon LAJC/RAJC
         name_to_idx = {n: i for i, n in enumerate(marker_names)}
         ref_pair = None
@@ -1224,11 +1317,12 @@ def main(args):
                 camera_translation=cam_proc,
                 center_pelvis=True,
                 align_to_ground=True,
-                apply_global_translation=not args.stationary,
+                apply_global_translation=not _stationary_effective,
                 correct_floor_lean=not args.no_lean_fix,
                 floor_angle=moge_floor_angle,
                 apply_body_vertical=not args.floor_seated,
                 lock_vertical=args.lock_vertical,
+                lock_lateral=args.lock_lateral or _auto_lock_lateral,
             )
 
             # Spine lean correction
@@ -1584,15 +1678,13 @@ def main(args):
         # (no --floor). Pour per_frame (--floor) l'override est ignoré.
         _shared_offset_m = None
         if not _apply_floor:
-            _kpts_no_offset = transformer.apply_pipeline_to_verts(
-                [k.copy() if k is not None else None for k in all_kpts_raw],
-                output_units="m",
-                ground_offset_mode="none")
-            _calib_ys = [w[:, 1].min() for w in _kpts_no_offset[:20] if w is not None]
-            if _calib_ys:
-                _shared_offset_m = float(min(_calib_ys))
+            # Fix Y offset mesh vs anatomical (2026-07-08) : on réutilise
+            # EXACTEMENT la valeur calculée par transform() (stockée dans
+            # _last_constant_offset_m). Zéro écart mesh/anatomical.
+            _shared_offset_m = getattr(transformer, "_last_constant_offset_m", None)
+            if _shared_offset_m is not None:
                 print(f"  Mesh GLB: shared calib offset Y -= {_shared_offset_m:.3f} m "
-                      f"(from kpts on {len(_calib_ys)} calib frames)")
+                      f"(reuses transform()'s exact value → alignment guaranteed)")
         # Pass RAW points (no cam_t added) so apply_pipeline_to_verts mirrors
         # exactly what transform() did for the canonical kpts_opensim — the
         # only cam_t contribution goes through _last_xz_deltas_m (XZ delta
@@ -1642,20 +1734,15 @@ def main(args):
             anat_glb = os.path.join(args.output_dir, f"{prefix}_anatomical.glb")
             print(f"  Writing anatomical GLB → {anat_glb}")
             from sam_3d_body.export.opensim_exporter import write_anatomical_glb
-            # Aligner le anatomical GLB sur le même origin Y que le mesh GLB.
-            # Cas bikefit (`_shared_offset_m` ~5-10 cm) : anatomical natif est
-            # légèrement plus haut que le mesh shifté → appliquer -_shared
-            # aligne. Cas jump/CMJ où SMPL-X place le sujet loin (-1m+ en Y),
-            # l'anatomical natif est DÉJÀ à Y=0 (modèle OSim) et n'a PAS
-            # besoin d'un shift compensateur. Safety threshold : n'appliquer
-            # que si l'offset est <30 cm en magnitude — sinon on ferait
-            # monter/descendre l'anatomical d'un mètre.
-            _anat_y_offset = 0.0
-            if _shared_offset_m is not None and abs(_shared_offset_m) < 0.30:
-                _anat_y_offset = -_shared_offset_m
-            elif _shared_offset_m is not None:
-                print(f"  [anatomical GLB] _shared_offset_m={_shared_offset_m:+.3f} m "
-                      "hors seuil ±30cm → anatomical laissé natif (évite décalage aberrant)")
+            # Alignement anatomical/mesh (fix 2026-07-08) :
+            # L'anatomical est natif (via IK sur TRC déjà shifté par transform()).
+            # Le mesh est shifté par override_constant_offset_m = _last_constant_offset_m.
+            # Ces deux références se retrouvent au MÊME repère si on n'ajoute PAS
+            # de y_offset supplémentaire à l'anatomical.
+            # L'ancien y_offset = -_shared_offset_m compensait un bug de rotation
+            # MoGe (Y-UP conv) qui n'existe plus depuis le fix Y-DOWN.
+            # Env var ANAT_Y_OFFSET_M pour override manuel si régression.
+            _anat_y_offset = float(os.environ.get("ANAT_Y_OFFSET_M", "0.0"))
             write_anatomical_glb(anat_glb, osim_path, ik_mot_path,
                                  y_offset_m=_anat_y_offset)
 
@@ -1726,6 +1813,70 @@ OpenSim workflow:
 ─────────────────────────────────────────────────────────────────
 """)
 
+    # ─── Auto-analytics via synkro-analytics ─────────────────────────
+    # Après SAM3D, si --module fourni, on lance synkro-analytics.cli en
+    # subprocess dans l'env opensim (qui a torch + nimble + opensim + reports).
+    # Output : metrics.json + report.html + report.pdf dans args.output_dir.
+    if getattr(args, "module", None) and args.mass_kg:
+        import subprocess as _sp
+        opensim_py = os.environ.get("OPENSIM_PYTHON_PATH",
+                                     "/opt/conda/envs/opensim/bin/python")
+        if not os.path.isfile(opensim_py):
+            # Local dev fallback
+            for _p in ("/home/fdela/miniconda3/envs/opensim/bin/python",
+                       "/home/fdela/miniconda3/envs/fast_sam_3d_body/bin/python"):
+                if os.path.isfile(_p):
+                    opensim_py = _p
+                    break
+        # Build subject_info.json
+        subj_info = {
+            "mass_kg": float(args.mass_kg),
+            "height_cm": float(args.person_height) * 100 if args.person_height else 175,
+            "level": args.level,
+            "osim_path": osim_path,
+            "geometry_folder": os.path.join(
+                os.path.dirname(osim_path), "Geometry")
+            if os.path.isdir(os.path.join(os.path.dirname(osim_path), "Geometry"))
+            else None,
+            "enable_grf": True,
+            "video_path": args.video_path,
+        }
+        if args.age is not None:
+            subj_info["age"] = args.age
+        if args.sex is not None:
+            subj_info["sex"] = args.sex
+        subj_json = os.path.join(args.output_dir, "subject_info.json")
+        with open(subj_json, "w") as f:
+            json.dump(subj_info, f, indent=2)
+        # Call synkro-analytics CLI
+        out_dir = os.path.join(args.output_dir, "analytics")
+        cli_cmd = [opensim_py, "-m", "synkro_analytics.cli",
+                   "--module", args.module,
+                   "--mot", ik_mot_path,
+                   "--trc", os.path.join(args.output_dir, f"{prefix}_post_ik.trc"),
+                   "--subject", subj_json,
+                   "--out", out_dir,
+                   "--export-pdf"]
+        if args.treadmill_speed is not None:
+            cli_cmd += ["--treadmill-speed", str(args.treadmill_speed)]
+        print(f"\n[analytics] Running: {' '.join(cli_cmd)}")
+        try:
+            _sp.run(cli_cmd, check=True)
+            print(f"[analytics] ✓ Metrics + report in {out_dir}/")
+            # Move GRF GLB to parent output dir (à côté du mesh/anatomical GLB)
+            # avec le nom cohérent avec la convention pipeline.
+            _grf_glb_src = os.path.join(out_dir, "report_grf.glb")
+            if os.path.isfile(_grf_glb_src):
+                _grf_glb_dst = os.path.join(args.output_dir,
+                                              f"{prefix}_grf.glb")
+                import shutil as _sh
+                _sh.move(_grf_glb_src, _grf_glb_dst)
+                print(f"[analytics] ✓ GRF GLB → {_grf_glb_dst}")
+        except _sp.CalledProcessError as e:
+            print(f"[analytics] ⚠ Failed (exit {e.returncode}). Skipping.")
+        except FileNotFoundError as e:
+            print(f"[analytics] ⚠ Python env not found ({opensim_py}). Skipping. {e}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fast SAM 3D Body – OpenSim Export")
@@ -1795,6 +1946,13 @@ if __name__ == "__main__":
                              "parfaitement alignés (même code path). Utiliser pour rendu "
                              "bikefit indoor / home-trainer où l'oscillation du pédalage "
                              "doit rester invisible.")
+    parser.add_argument("--lock_lateral", action="store_true",
+                        help="Détecte l'axe d'avance via PCA sur la trajectoire XZ du sujet "
+                             "et ne garde QUE la composante longitudinale (avance). Élimine "
+                             "le zig-zag latéral dû au bruit monoculaire sur la profondeur. "
+                             "Idéal pour running / marche / sprint en ligne droite (l'axe "
+                             "peut être mix X-Z selon orientation caméra). Combine avec "
+                             "--floor_moge pour un rendu propre 3D.")
     parser.add_argument("--compute_com", action="store_true",
                         help="Compute whole-body centre of mass (COM) trajectory from the "
                              "scaled model and IK motion. Writes a _com.sto file with "
@@ -1915,5 +2073,25 @@ if __name__ == "__main__":
                              "the standard outputs. Use the opaque-patched variant "
                              "(assets/avatars/*_opaque.glb) to avoid the MakeHuman BLEND "
                              "alpha default.")
+    # ── Auto-analytics (synkro-analytics) ────────────────────────────────
+    parser.add_argument("--module", default=None,
+                        choices=[None, "d3.running", "d3.gait", "d3.squat",
+                                 "d3.jump", "d3.sit_to_stand", "d3.cycling",
+                                 "d3.sprint_start"],
+                        help="Après SAM3D, appelle synkro-analytics avec ce module. "
+                             "d3.running/gait → GaitDynamics GRF. Autres → Newton-CoM GRF. "
+                             "Écrit metrics.json + report.html/pdf dans le dossier output.")
+    parser.add_argument("--mass_kg", type=float, default=None,
+                        help="Masse sujet (kg) — requis pour --module (GRF + normes).")
+    parser.add_argument("--age", type=int, default=None,
+                        help="Âge sujet (années) — requis par certains modules (STS).")
+    parser.add_argument("--sex", default=None, choices=[None, "M", "F"],
+                        help="Sexe biologique — pour normes stratifiées.")
+    parser.add_argument("--level", default="trained",
+                        choices=["trained", "recreational", "clinical", "elite"],
+                        help="Niveau sujet — pour normes stratifiées (défaut trained).")
+    parser.add_argument("--treadmill_speed", type=float, default=None,
+                        help="Vitesse tapis (m/s) — pour --module d3.running/gait sur tapis. "
+                             "Laisser vide pour overground.")
     args = parser.parse_args()
     main(args)

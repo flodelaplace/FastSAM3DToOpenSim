@@ -19,6 +19,9 @@ echo "  Extra:   $EXTRA_ARGS"
 echo "  Output:  ./outputs/$OUTPUT_NAME"
 echo ""
 
+# Assure que docker-compose écrit les outputs avec ton UID:GID (voir docker-compose.yml)
+export DOCKER_UID="$(id -u)" DOCKER_GID="$(id -g)"
+
 # shellcheck disable=SC2086
 docker compose run --rm fast-sam-opensim python demo_video_opensim.py \
     --video_path "/app/videos/${VIDEO}" \

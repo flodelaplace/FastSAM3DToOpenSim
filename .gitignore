@@ -49,3 +49,9 @@ assets/opensim.log
 # Per-clip retargeted avatar GLB outputs (intermediate POCs kept locally only)
 assets/avatars/*pocA*.glb
 assets/avatars/avatar_*_animated_*.glb
+# Bundle synkro-analytics for Docker build (rsync)
+synkro-analytics/
+GaitDynamics/
+opencap-core/
+opencap-processing/
+upstream-sam3d/

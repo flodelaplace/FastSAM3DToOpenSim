@@ -60,6 +60,7 @@ class CoordinateTransformer:
         floor_angle: Optional[float] = None,
         apply_body_vertical: Optional[bool] = None,
         lock_vertical: bool = False,
+        lock_lateral: bool = False,
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
         Transform keypoints (and optionally jcoords) to OpenSim world space.
@@ -102,7 +103,8 @@ class CoordinateTransformer:
         self._last_pelvis_shifts_m = None
         self._last_stationary_cam_t_y_m = None
         if apply_global_translation and camera_translation is not None:
-            kpts, xz_deltas = self._apply_global_translation(kpts, camera_translation, scale)
+            kpts, xz_deltas = self._apply_global_translation(
+                kpts, camera_translation, scale, lock_lateral=lock_lateral)
             if jc is not None:
                 jc[:, :, 0] += xz_deltas[:, 0:1]
                 jc[:, :, 2] += xz_deltas[:, 2:3]
@@ -185,6 +187,8 @@ class CoordinateTransformer:
 
         # 4. Align feet to Y=0
         self._last_ground_offsets_m = None
+        self._last_constant_offset_m = None
+        self._last_penetration_clamp_m = None  # (N,) per-frame safety-net shift
         if align_to_ground:
             # --floor : per-frame ground align (feet à Y=0 chaque frame)
             kpts, ground_offsets = self._align_to_ground(kpts, return_offsets=True)
@@ -210,6 +214,43 @@ class CoordinateTransformer:
                 kpts[:, :, 1] -= constant_offset
                 if jc is not None:
                     jc[:, :, 1] -= constant_offset
+                # Store for exact replay in apply_pipeline_to_verts (alignement
+                # mesh vs anatomical à zéro écart).
+                self._last_constant_offset_m = constant_offset
+
+            # 4b. Ground-penetration one-directional clamp (fix STS + bug MHR
+            # sur mouvements assis). Per-frame safety : si min_foot_Y < 0
+            # (pieds sous le sol) → shift UP pour min_foot_Y = 0. Ne shift
+            # PAS DOWN si feet > 0 (préserve phase de vol running/CMJ).
+            # Env var NO_FLOOR_CLAMP=1 pour désactiver (edge case descente
+            # d'escalier / pente descendante).
+            import os as _os_local
+            if not bool(int(_os_local.environ.get("NO_FLOOR_CLAMP", "0"))):
+                clamp_shifts = np.zeros(kpts.shape[0], dtype=np.float64)
+                n_clamped = 0
+                all_min_y = []
+                for i in range(kpts.shape[0]):
+                    foot = kpts[i, _FOOT_INDICES]
+                    if np.any(np.isnan(foot)):
+                        continue
+                    min_y = float(np.min(foot[:, 1]))
+                    all_min_y.append(min_y)
+                    if min_y < 0.0:
+                        clamp_shifts[i] = -min_y  # shift UP by |min_y|
+                        n_clamped += 1
+                if all_min_y:
+                    print(f"  [floor clamp] foot markers Y range = "
+                          f"[{min(all_min_y)*100:+.1f}, {max(all_min_y)*100:+.1f}] cm "
+                          f"across {len(all_min_y)} frames "
+                          f"({n_clamped} needed clamp)")
+                if n_clamped > 0:
+                    kpts[:, :, 1] += clamp_shifts[:, None]
+                    if jc is not None:
+                        jc[:, :, 1] += clamp_shifts[:, None]
+                    max_clamp = float(np.max(clamp_shifts))
+                    print(f"  [floor clamp] ground-penetration clamp APPLIED to "
+                          f"{n_clamped}/{kpts.shape[0]} frames (max shift +{max_clamp*100:.1f} cm)")
+                    self._last_penetration_clamp_m = clamp_shifts.copy()
 
         # 5. Unit conversion (m → mm if requested)
         kpts = kpts * self.scale_factor
@@ -358,6 +399,12 @@ class CoordinateTransformer:
             for w in pre_ground:
                 if w is not None:
                     w[:, 1] -= constant_offset
+            # Rejoue le penetration clamp per-frame (fix STS pieds au sol)
+            if self._last_penetration_clamp_m is not None:
+                for i, w in enumerate(pre_ground):
+                    if w is None or i >= len(self._last_penetration_clamp_m):
+                        continue
+                    w[:, 1] += self._last_penetration_clamp_m[i]
         # ground_offset_mode == "none" : pas de shift Y
 
         # Étape 6 — Unit conversion + float32
@@ -639,6 +686,69 @@ class CoordinateTransformer:
         return float(np.clip(angle, -20.0, 20.0))
 
     @staticmethod
+    def _frame_sharpness(frame_bgr) -> float:
+        """Variance du Laplacien = mesure de netteté monoculaire.
+
+        Empiriquement : > 100 net, 60-100 acceptable, < 60 flou (motion blur,
+        autofocus non convergé, compression H.264 keyframe médiocre).
+        """
+        import cv2
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    @staticmethod
+    def _ransac_plane_normal(
+        pts: np.ndarray,
+        n_iter: int = 100,
+        dist_thresh: float = 0.05,
+        min_inliers: int = 50,
+    ) -> tuple:
+        """RANSAC plane fit → (normal_refined_or_None, n_inliers).
+
+        Fait N itérations : sample 3 points → plan → count inliers within
+        `dist_thresh` meters. Le meilleur set d'inliers est ensuite raffiné
+        par SVD pour un normal stable.
+
+        Résistant aux outliers (jusqu'à ~40-50% de points hors sol).
+        """
+        N = len(pts)
+        if N < 3:
+            return None, 0
+        rng = np.random.default_rng(seed=42)
+        best_normal = None
+        best_inliers = 0
+        best_pt = None
+        for _ in range(n_iter):
+            idx = rng.choice(N, 3, replace=False)
+            p1, p2, p3 = pts[idx]
+            v1 = p2 - p1
+            v2 = p3 - p1
+            normal = np.cross(v1, v2)
+            norm = float(np.linalg.norm(normal))
+            if norm < 1e-9:
+                continue
+            normal = normal / norm
+            if normal[1] < 0:
+                normal = -normal
+            d = np.abs((pts - p1) @ normal)
+            inliers = int((d < dist_thresh).sum())
+            if inliers > best_inliers:
+                best_inliers = inliers
+                best_normal = normal
+                best_pt = p1
+        if best_normal is None or best_inliers < min_inliers:
+            return None, best_inliers
+        # Refine with SVD on inliers set for stable normal
+        d = np.abs((pts - best_pt) @ best_normal)
+        inlier_pts = pts[d < dist_thresh]
+        centroid = inlier_pts.mean(axis=0)
+        _, _, Vt = np.linalg.svd(inlier_pts - centroid, full_matrices=False)
+        refined = Vt[-1]
+        if refined[1] < 0:
+            refined = -refined
+        return refined, best_inliers
+
+    @staticmethod
     def floor_angle_from_moge_points(
         points: np.ndarray,
         mask: np.ndarray,
@@ -646,6 +756,7 @@ class CoordinateTransformer:
         orig_hw=None,
         floor_frac: float = 0.25,
         n_samples: int = 4000,
+        return_raw: bool = False,
     ) -> tuple:
         """
         Estimate floor lean angles (pitch, roll) from MoGe 3D points.
@@ -692,7 +803,12 @@ class CoordinateTransformer:
         # Build per-pixel valid mask (H, W)
         valid_mask = mask.astype(bool)  # (H, W)
 
-        # Exclude person bounding box pixels
+        # STRATÉGIE "sous-bbox" (idée Florian 2026-07-08) : si bbox dispo, on
+        # restreint les candidats sol à la bande de pixels SOUS le sujet, pas
+        # juste "bottom 25% de l'image". Physiquement : les pieds touchent le
+        # sol donc les pixels immédiatement sous la bbox = sol garanti.
+        # Fallback (pas de bbox) : ancien comportement "bottom floor_frac".
+        floor_row_min = None   # ligne min (exclusive) du floor band ; None = pas de contrainte pixel
         if person_bbox is not None and orig_hw is not None:
             oh, ow = orig_hw
             x1, y1, x2, y2 = person_bbox
@@ -701,14 +817,27 @@ class CoordinateTransformer:
             gy1 = int(y1 / oh * H)
             gx2 = int(x2 / ow * W)
             gy2 = int(y2 / oh * H)
-            # Add margin: expand bbox by 10% on each side
+            # Exclude bbox area (subject) + 10% margin
             margin_x = max(1, int((gx2 - gx1) * 0.10))
             margin_y = max(1, int((gy2 - gy1) * 0.10))
-            gx1 = max(0, gx1 - margin_x)
-            gy1 = max(0, gy1 - margin_y)
-            gx2 = min(W - 1, gx2 + margin_x)
-            gy2 = min(H - 1, gy2 + margin_y)
-            valid_mask[gy1:gy2+1, gx1:gx2+1] = False
+            gx1_e = max(0, gx1 - margin_x)
+            gy1_e = max(0, gy1 - margin_y)
+            gx2_e = min(W - 1, gx2 + margin_x)
+            gy2_e = min(H - 1, gy2 + margin_y)
+            valid_mask[gy1_e:gy2_e+1, gx1_e:gx2_e+1] = False
+            # Band candidats sol = lignes SOUS la bbox (pieds → sol garanti).
+            # On garde une marge de 5% sous la bbox pour éviter les artefacts
+            # de chaussures / ombre. Env var MOGE_BBOX_FLOOR=0 pour désactiver.
+            use_bbox_floor = bool(int(_os.environ.get("MOGE_BBOX_FLOOR", "1")))
+            if use_bbox_floor:
+                below_margin = max(1, int((gy2 - gy1) * 0.05))
+                floor_row_min = min(H - 1, gy2 + below_margin)
+
+        # Restreint le mask aux lignes SOUS la bbox si applicable
+        if floor_row_min is not None:
+            floor_band_mask = np.zeros_like(valid_mask)
+            floor_band_mask[floor_row_min:, :] = True
+            valid_mask = valid_mask & floor_band_mask
 
         # Flatten to valid points
         pts_flat = points.reshape(-1, 3).astype(np.float64)
@@ -717,11 +846,23 @@ class CoordinateTransformer:
         if len(valid) < 50:
             return (0.0, 0.0)
 
-        # Floor candidates: depth-normalized image-row position Y/Z = -(v-cy)/fy
-        # Depth-independent — bottom floor_frac of image rows regardless of distance
-        y_norm = valid[:, 1] / valid[:, 2]  # Y_cam / Z_cam
-        thresh = np.percentile(y_norm, floor_frac * 100)
-        floor_pts = valid[y_norm <= thresh]
+        if floor_row_min is not None:
+            # En mode "sous-bbox" : tous les points restants sont candidats sol.
+            floor_pts = valid
+        else:
+            # Fallback : sélection depth-independent par ligne image.
+            # BUG DÉCOUVERT 2026-07-08 : le comment initial disait "Y-UP" mais
+            # MoGe utilise en fait Y-DOWN (OpenCV convention). Avec Y-UP on
+            # sélectionnait le haut de l'image (mur/ciel), pas le sol.
+            # Y-DOWN par défaut. Env var MOGE_Y_DOWN=0 pour revenir à l'ancien.
+            y_norm = valid[:, 1] / valid[:, 2]  # Y_cam / Z_cam
+            if bool(int(_os.environ.get("MOGE_Y_DOWN", "1"))):
+                # Y down (OpenCV) : sol = Y_cam > 0 → top of y_norm
+                thresh = np.percentile(y_norm, (1.0 - floor_frac) * 100)
+                floor_pts = valid[y_norm >= thresh]
+            else:
+                thresh = np.percentile(y_norm, floor_frac * 100)
+                floor_pts = valid[y_norm <= thresh]
 
         if len(floor_pts) < 20:
             return (0.0, 0.0)
@@ -731,14 +872,28 @@ class CoordinateTransformer:
             idx = np.random.choice(len(floor_pts), n_samples, replace=False)
             floor_pts = floor_pts[idx]
 
-        # SVD plane fit in camera space
-        centroid = floor_pts.mean(axis=0)
-        _, _, Vt = np.linalg.svd(floor_pts - centroid, full_matrices=False)
-        normal = Vt[-1]   # smallest singular value → plane normal
-
-        # Ensure normal points upward in camera space (positive Y_cam)
-        if normal[1] < 0:
-            normal = -normal
+        # Plane fit : RANSAC par défaut (robuste aux outliers), SVD en fallback.
+        # Env var MOGE_PLANE_FIT=svd pour forcer l'ancien comportement si régression.
+        import os as _os
+        fit_method = _os.environ.get("MOGE_PLANE_FIT", "ransac").lower()
+        if fit_method == "ransac":
+            ransac_normal, n_inl = CoordinateTransformer._ransac_plane_normal(
+                floor_pts, n_iter=200, dist_thresh=0.05, min_inliers=50)
+            if ransac_normal is not None:
+                normal = ransac_normal
+            else:
+                # RANSAC failed → SVD fallback
+                centroid = floor_pts.mean(axis=0)
+                _, _, Vt = np.linalg.svd(floor_pts - centroid, full_matrices=False)
+                normal = Vt[-1]
+                if normal[1] < 0:
+                    normal = -normal
+        else:
+            centroid = floor_pts.mean(axis=0)
+            _, _, Vt = np.linalg.svd(floor_pts - centroid, full_matrices=False)
+            normal = Vt[-1]
+            if normal[1] < 0:
+                normal = -normal
 
         # Camera pitch: angle dans plan YZ (rotation autour axe X cam = lateral)
         # θ_pitch = arctan(n_z / n_y): positive when n_z > 0 (caméra penche bas)
@@ -756,10 +911,149 @@ class CoordinateTransformer:
         # Roll négé pour matcher la convention de _rotate_around_pelvis_x.
         # Env var MOGE_DISABLE_ROLL=1 pour tester sans roll si suspicion.
         DISABLE_ROLL = bool(int(_os.environ.get("MOGE_DISABLE_ROLL", "0")))
-        return (
-            float(np.clip(correction_pitch, -60.0, 60.0)),
-            0.0 if DISABLE_ROLL else float(np.clip(-correction_roll, -60.0, 60.0)),
-        )
+        clipped_pitch = float(np.clip(correction_pitch, -60.0, 60.0))
+        clipped_roll = 0.0 if DISABLE_ROLL else float(np.clip(-correction_roll, -60.0, 60.0))
+        if return_raw:
+            return (clipped_pitch, clipped_roll, float(raw_pitch), float(raw_roll))
+        return (clipped_pitch, clipped_roll)
+
+    @staticmethod
+    def robust_floor_angle_multi_frame(
+        video_path: str,
+        depth_estimator_fn,
+        person_bbox_fn=None,
+        n_samples: int = 8,
+        sharpness_min: float = 30.0,
+        max_std_deg: float = 5.0,
+        max_raw_pitch_deg: float = 45.0,
+        max_raw_roll_deg: float = 45.0,
+    ) -> tuple:
+        """Estime le plan sol de manière robuste sur multi-frames.
+
+        Sample N frames dispersées, filtre par netteté (variance Laplacien),
+        fit RANSAC → median pitch/roll + std check.
+
+        Args:
+            video_path : chemin vidéo à échantillonner
+            depth_estimator_fn : callable(frame_rgb) -> (pts, mask) pour MoGe
+            person_bbox_fn : callable(frame_rgb) -> bbox or None (exclut sujet).
+                Optionnel — si None, aucune exclusion (léger biais si sujet visible
+                en bas d'image).
+            n_samples : nb de frames à échantillonner (dispersées uniformément)
+            sharpness_min : seuil Laplacien variance (< = frame skippée)
+            max_std_deg : si std des N pitchs > ce seuil, considère "unstable"
+
+        Returns:
+            (pitch_deg, roll_deg, quality_dict) où quality_dict contient :
+              - status : "ok" | "unstable" | "insufficient_samples"
+              - n_used : nb de frames retenues
+              - pitch_std_deg, roll_std_deg
+              - per_frame : liste des estimations (debug)
+        """
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return 0.0, 0.0, {"status": "cannot_open_video"}
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        if total < 2:
+            cap.release()
+            return 0.0, 0.0, {"status": "video_too_short"}
+
+        # Sample n_samples frames uniformly, skipping first/last 5% (motion
+        # blur + freeze frames)
+        margin = max(1, int(total * 0.05))
+        sample_idx = np.linspace(margin, total - margin - 1, n_samples).astype(int)
+        sample_idx = np.unique(sample_idx)
+
+        per_frame = []
+        pitches, rolls, weights = [], [], []
+        for idx in sample_idx:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ret, frame_bgr = cap.read()
+            if not ret or frame_bgr is None:
+                continue
+
+            sharp = CoordinateTransformer._frame_sharpness(frame_bgr)
+            if sharp < sharpness_min:
+                per_frame.append({"frame": int(idx), "sharpness": sharp,
+                                  "status": "skipped_blurry"})
+                continue
+
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            try:
+                pts, mask = depth_estimator_fn(frame_rgb)
+            except Exception as e:
+                per_frame.append({"frame": int(idx), "sharpness": sharp,
+                                  "status": f"depth_fail:{str(e)[:60]}"})
+                continue
+
+            person_bbox = None
+            if person_bbox_fn is not None:
+                try:
+                    person_bbox = person_bbox_fn(frame_rgb)
+                except Exception:
+                    person_bbox = None
+
+            orig_hw = (frame_bgr.shape[0], frame_bgr.shape[1])
+            try:
+                p, r, raw_p, raw_r = CoordinateTransformer.floor_angle_from_moge_points(
+                    pts, mask, person_bbox=person_bbox, orig_hw=orig_hw,
+                    return_raw=True)
+            except Exception as e:
+                per_frame.append({"frame": int(idx), "sharpness": sharp,
+                                  "status": f"floor_fail:{str(e)[:60]}"})
+                continue
+
+            # Sanity check : un smartphone tenu à hauteur d'homme donne un raw
+            # pitch < 30-40°. > 45° = MoGe a détecté un mur, un panneau, ou une
+            # surface non-sol. Frame rejetée.
+            if abs(raw_p) > max_raw_pitch_deg or abs(raw_r) > max_raw_roll_deg:
+                per_frame.append({
+                    "frame": int(idx), "sharpness": sharp,
+                    "raw_pitch": raw_p, "raw_roll": raw_r,
+                    "status": "rejected_aberrant_plane",
+                })
+                continue
+
+            per_frame.append({
+                "frame": int(idx), "sharpness": sharp,
+                "pitch": p, "roll": r,
+                "raw_pitch": raw_p, "raw_roll": raw_r,
+                "status": "ok",
+            })
+            pitches.append(p)
+            rolls.append(r)
+            weights.append(sharp)
+
+        cap.release()
+
+        if len(pitches) < 3:
+            return 0.0, 0.0, {
+                "status": "insufficient_samples",
+                "n_used": len(pitches),
+                "n_requested": len(sample_idx),
+                "per_frame": per_frame,
+            }
+
+        pitches_arr = np.array(pitches)
+        rolls_arr = np.array(rolls)
+        pitch_med = float(np.median(pitches_arr))
+        roll_med = float(np.median(rolls_arr))
+        pitch_std = float(np.std(pitches_arr))
+        roll_std = float(np.std(rolls_arr))
+
+        status = "ok" if pitch_std <= max_std_deg else "unstable"
+
+        return pitch_med, roll_med, {
+            "status": status,
+            "n_used": len(pitches),
+            "n_requested": len(sample_idx),
+            "pitch_median": pitch_med,
+            "roll_median": roll_med,
+            "pitch_std_deg": pitch_std,
+            "roll_std_deg": roll_std,
+            "per_frame": per_frame,
+        }
 
     def _rotate_around_pelvis_z(
         self,
@@ -871,20 +1165,53 @@ class CoordinateTransformer:
         self._last_roll_pivots_m = pivots
         return kpts, jc
 
-    def _apply_global_translation(self, keypoints, camera_translation, scale):
+    def _apply_global_translation(self, keypoints, camera_translation, scale,
+                                    lock_lateral: bool = False):
+        """Apply per-frame XZ translation from cam_t.
+
+        Args:
+            lock_lateral : si True, détecte l'axe d'avance principal via PCA
+                sur la trajectoire XZ du sujet, ne garde que la composante
+                longitudinale (= avance), zéro la composante latérale. Idéal
+                pour running/marche/sprint filmés en ligne droite où le bruit
+                monoculaire fait "zig-zag" le sujet perpendiculairement.
+        """
         num_frames = keypoints.shape[0]
         if camera_translation.ndim == 1:
             camera_translation = np.tile(camera_translation, (num_frames, 1))
         cam_t_opensim = camera_translation @ self.CAMERA_TO_OPENSIM.T * scale
         cam_t_smoothed = self._smooth_cam_t(cam_t_opensim)
         first_frame_t = cam_t_smoothed[0].copy()
+
+        deltas_xz = cam_t_smoothed[:, [0, 2]] - first_frame_t[[0, 2]]  # (N, 2)
+
+        if lock_lateral and num_frames >= 3:
+            # PCA 2D sur la trajectoire XZ pour détecter l'axe d'avance
+            centered = deltas_xz - deltas_xz.mean(axis=0, keepdims=True)
+            cov = centered.T @ centered
+            eigvals, eigvecs = np.linalg.eigh(cov)
+            fwd_axis = eigvecs[:, -1]  # eigenvector du plus grand eigenvalue
+            fwd_var = float(eigvals[-1])
+            lat_var = float(eigvals[0])
+            # Aligner le signe pour que fwd_axis matche le sens de progression
+            # (fin - début doit avoir une projection positive sur fwd_axis)
+            traj_vec = deltas_xz[-1] - deltas_xz[0]
+            if np.dot(traj_vec, fwd_axis) < 0:
+                fwd_axis = -fwd_axis
+            # Ratio variance longitudinale / latérale
+            ratio = fwd_var / (lat_var + 1e-9)
+            print(f"  [lock_lateral] fwd_axis=({fwd_axis[0]:+.3f}, {fwd_axis[1]:+.3f}) "
+                  f"in (X, Z), fwd_var/lat_var={ratio:.1f} (>10 = ligne droite claire)")
+            # Projet chaque delta sur fwd_axis, ne garde que cette composante
+            proj = deltas_xz @ fwd_axis  # (N,)
+            deltas_xz = proj[:, None] * fwd_axis[None, :]  # (N, 2)
+
         xz_deltas = np.zeros((num_frames, 3))
         for i in range(num_frames):
-            delta_t = cam_t_smoothed[i] - first_frame_t
-            keypoints[i, :, 0] += delta_t[0]
-            keypoints[i, :, 2] += delta_t[2]
-            xz_deltas[i, 0] = delta_t[0]
-            xz_deltas[i, 2] = delta_t[2]
+            keypoints[i, :, 0] += deltas_xz[i, 0]
+            keypoints[i, :, 2] += deltas_xz[i, 1]
+            xz_deltas[i, 0] = deltas_xz[i, 0]
+            xz_deltas[i, 2] = deltas_xz[i, 1]
         return keypoints, xz_deltas
 
     def _smooth_cam_t(self, cam_t, window_size=5):
