@@ -67,6 +67,7 @@ AGE_RE = re.compile(r"^a(\d{1,3})$")
 SEX_RE = re.compile(r"^sx([MF])$")
 START_RE = re.compile(r"^s(\d+)$")
 END_RE = re.compile(r"^e(\d+)$")
+TREADMILL_RE = re.compile(r"^tm(\d+)$")  # vitesse tapis en km/h (tm12 = 12 km/h)
 FLAG_TOKENS = {"st", "com", "floor", "lv", "bikefit"}
 LEVEL_TOKENS = {"tr": "trained", "re": "recreational",
                 "cl": "clinical", "el": "elite"}
@@ -123,6 +124,7 @@ def parse_filename(basename):
     sex = None
     level = None
     module = None
+    treadmill_mps = None
     trim_start = None
     trim_end = None
     stationary = False
@@ -155,6 +157,13 @@ def parse_filename(basename):
             if sex is not None:
                 raise FilenameParseError(f"Duplicate sex token: '{t}'")
             sex = m.group(1)
+            continue
+        m = TREADMILL_RE.match(t)
+        if m:
+            if treadmill_mps is not None:
+                raise FilenameParseError(f"Duplicate treadmill token: '{t}'")
+            # km/h → m/s (÷3.6). tm12 = 12 km/h = 3.33 m/s.
+            treadmill_mps = round(int(m.group(1)) / 3.6, 2)
             continue
         m = START_RE.match(t)
         if m:
@@ -251,6 +260,8 @@ def parse_filename(basename):
             extra += ["--sex", sex]
         if level is not None:
             extra += ["--level", level]
+        if treadmill_mps is not None:
+            extra += ["--treadmill_speed", str(treadmill_mps)]
 
     # Toujours activer --floor_moge (fix Y-DOWN 2026-07 : marche pour tous les
     # cas standard, auto-skip si MoGe échoue).
