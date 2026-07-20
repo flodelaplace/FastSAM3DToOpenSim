@@ -55,3 +55,19 @@ GaitDynamics/
 opencap-core/
 opencap-processing/
 upstream-sam3d/
+
+# --- Docs privés Synkro (business + infra AWS) — jamais sur le fork PUBLIC ---
+# Purgés de l'historique le 2026-07 ; conservés en local + repo privé synkro.
+/SYNKRO_OVERVIEW.md
+/SYNKRO_AWS_COST_STRATEGY.md
+/DOCKER.md
+/aws/AWS_DEPLOYMENT.md
+/aws/batch-job-definition.json
+/aws/deploy_avatar_pipeline.sh
+/aws/deploy_notifications.sh
+/docs/FILMING_GUIDE.md
+/docs/ANGLES_REFERENCE.md
+/docs/ANGLES_REFERENCE.html
+/docs/ANGLE_CONVENTIONS.md
+/docs/CROSS_MODAL_ANGLES.md
+/docs/FILENAME_TOKENS.html
