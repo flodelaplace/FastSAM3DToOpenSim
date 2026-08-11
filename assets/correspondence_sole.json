@@ -1,0 +1,1420 @@
+{
+  "schema_version": "0.1.0",
+  "mhr_topology_id": "mhr_v1",
+  "opensim_model": "Pose2Sim_Wholebody",
+  "marker_set": "mesh2marker",
+  "frame_alignment": {
+    "rotation": [
+      [
+        0.0003642465291051352,
+        0.03009329345882178,
+        -0.9995470279147786
+      ],
+      [
+        -5.9782117300512536e-05,
+        -0.9995470917810666,
+        -0.03009331716693657
+      ],
+      [
+        -0.99999993187528,
+        7.071642399740325e-05,
+        -0.000362282518058819
+      ]
+    ],
+    "translation": [
+      -0.029045693150092006,
+      -1.0183239279928689,
+      0.00010179009038272654
+    ],
+    "scale": 1.0312690076114257
+  },
+  "markers": [
+    {
+      "name": "Nose",
+      "mhr_vertices": [
+        2767
+      ],
+      "opensim_body": "head",
+      "local_offset": [
+        0.1087463537076242,
+        0.014267271064404962,
+        0.00025719302848593487
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LEye",
+      "mhr_vertices": [
+        1547
+      ],
+      "opensim_body": "head",
+      "local_offset": [
+        0.07738889345153499,
+        0.05025279671833464,
+        -0.032055543548337354
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "REye",
+      "mhr_vertices": [
+        4815
+      ],
+      "opensim_body": "head",
+      "local_offset": [
+        0.07817278903503579,
+        0.050450518777123664,
+        0.032238177485934744
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LEar",
+      "mhr_vertices": [
+        234
+      ],
+      "opensim_body": "head",
+      "local_offset": [
+        -0.015615997221876093,
+        0.0242445869702439,
+        -0.06748378837946296
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "REar",
+      "mhr_vertices": [
+        3120
+      ],
+      "opensim_body": "head",
+      "local_offset": [
+        -0.015807838387708113,
+        0.024346844322692976,
+        0.06762956984509405
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "HTOP",
+      "mhr_vertices": [
+        2810
+      ],
+      "opensim_body": "head",
+      "local_offset": [
+        -0.0012955071481144387,
+        0.1468673059282225,
+        5.94511268082898e-07
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "c_spine0",
+      "mhr_vertices": [
+        5747
+      ],
+      "opensim_body": "lumbar5",
+      "local_offset": [
+        -0.07035943807158933,
+        0.028796497943316457,
+        -1.539396093671672e-05
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "XIPH",
+      "mhr_vertices": [
+        5699
+      ],
+      "opensim_body": "torso",
+      "local_offset": [
+        0.11268269618682894,
+        0.22846745723794443,
+        -0.0014365534567067858
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "c_spine2",
+      "mhr_vertices": [
+        5753
+      ],
+      "opensim_body": "torso",
+      "local_offset": [
+        -0.08183305035471367,
+        0.1663466308728385,
+        0.0009642079924160918
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "c_spine3",
+      "mhr_vertices": [
+        5759
+      ],
+      "opensim_body": "torso",
+      "local_offset": [
+        -0.10533503864441555,
+        0.29905652254312554,
+        0.0012191468616153346
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "c_neck",
+      "mhr_vertices": [
+        2826
+      ],
+      "opensim_body": "torso",
+      "local_offset": [
+        -0.040283404976363735,
+        0.47610208064431525,
+        0.00037586513459616816
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "c_head",
+      "mhr_vertices": [
+        2818
+      ],
+      "opensim_body": "head",
+      "local_offset": [
+        -0.08769422045700895,
+        0.04634672713806201,
+        -4.600159223316894e-05
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RACR",
+      "mhr_vertices": [
+        7878
+      ],
+      "opensim_body": "torso",
+      "local_offset": [
+        -0.006514494225298338,
+        0.41665963249258897,
+        0.14928068880244308
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LACR",
+      "mhr_vertices": [
+        6620
+      ],
+      "opensim_body": "torso",
+      "local_offset": [
+        -0.010173386128283689,
+        0.41660399573726925,
+        -0.1492683926300543
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "C7",
+      "mhr_vertices": [
+        5768
+      ],
+      "opensim_body": "torso",
+      "local_offset": [
+        -0.07522696725046307,
+        0.43131850906519004,
+        0.0008154923581166623
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RCLAV",
+      "mhr_vertices": [
+        7022
+      ],
+      "opensim_body": "torso",
+      "local_offset": [
+        0.0525625711367323,
+        0.3845039403308336,
+        0.017107127687068555
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LCLAV",
+      "mhr_vertices": [
+        5787
+      ],
+      "opensim_body": "torso",
+      "local_offset": [
+        0.05212496566301472,
+        0.38449515624011166,
+        -0.01857854855268299
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RLEL",
+      "mhr_vertices": [
+        13494
+      ],
+      "opensim_body": "humerus_r",
+      "local_offset": [
+        0.023663,
+        -0.275988,
+        0.032047
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RMEL",
+      "mhr_vertices": [
+        13511
+      ],
+      "opensim_body": "humerus_r",
+      "local_offset": [
+        0.026258,
+        -0.284399,
+        -0.063432
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RFAradius",
+      "mhr_vertices": [
+        14022
+      ],
+      "opensim_body": "radius_r",
+      "local_offset": [
+        0.019588339559609202,
+        -0.2283708421526666,
+        0.009216532180244597
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RFAulna",
+      "mhr_vertices": [
+        14035
+      ],
+      "opensim_body": "radius_r",
+      "local_offset": [
+        -0.03525902150986421,
+        -0.22899859916515672,
+        0.017113966616036314
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LLEL",
+      "mhr_vertices": [
+        8346
+      ],
+      "opensim_body": "humerus_l",
+      "local_offset": [
+        0.0237870065683648,
+        -0.2757009431078925,
+        -0.0295044026536333
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LMEL",
+      "mhr_vertices": [
+        8329
+      ],
+      "opensim_body": "humerus_l",
+      "local_offset": [
+        0.02666636222960092,
+        -0.28309716954947095,
+        0.06162483131308508
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LFAradius",
+      "mhr_vertices": [
+        8842
+      ],
+      "opensim_body": "radius_l",
+      "local_offset": [
+        0.019574772836007226,
+        -0.22837725016981672,
+        -0.009200778511165075
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LFAulna",
+      "mhr_vertices": [
+        8854
+      ],
+      "opensim_body": "radius_l",
+      "local_offset": [
+        -0.03545332380580954,
+        -0.22395264914101448,
+        -0.016238246981639337
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RASI",
+      "mhr_vertices": [
+        7835
+      ],
+      "opensim_body": "pelvis",
+      "local_offset": [
+        0.011390085270920055,
+        0.024704598531934546,
+        0.13069132706233771
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LASI",
+      "mhr_vertices": [
+        6663
+      ],
+      "opensim_body": "pelvis",
+      "local_offset": [
+        0.011389584769269458,
+        0.024707026361162253,
+        -0.1306922984949901
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RPSI",
+      "mhr_vertices": [
+        7318
+      ],
+      "opensim_body": "pelvis",
+      "local_offset": [
+        -0.19041748691533125,
+        0.02208207868732203,
+        0.06385876609902606
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LPSI",
+      "mhr_vertices": [
+        6217
+      ],
+      "opensim_body": "pelvis",
+      "local_offset": [
+        -0.1904143450561848,
+        0.02208137745451623,
+        -0.06385491924303513
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RLFC",
+      "mhr_vertices": [
+        16741
+      ],
+      "opensim_body": "femur_r",
+      "local_offset": [
+        0.0018801754735091186,
+        -0.405899927039175,
+        0.04489664789888764
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RMFC",
+      "mhr_vertices": [
+        16760
+      ],
+      "opensim_body": "femur_r",
+      "local_offset": [
+        -0.009850633523772412,
+        -0.3961716864187331,
+        -0.04665979943006185
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RLMAL",
+      "mhr_vertices": [
+        17370
+      ],
+      "opensim_body": "tibia_r",
+      "local_offset": [
+        -0.010121750587249081,
+        -0.41065987980722507,
+        0.035823003163735295
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RMMAL",
+      "mhr_vertices": [
+        17357
+      ],
+      "opensim_body": "tibia_r",
+      "local_offset": [
+        0.004398770636237823,
+        -0.40597127621596524,
+        -0.03275995677764551
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RCAL",
+      "mhr_vertices": [
+        17455
+      ],
+      "opensim_body": "calcn_r",
+      "local_offset": [
+        -0.0076555779184278305,
+        0.003922242038582435,
+        -0.010632368112168333
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RTOE",
+      "mhr_vertices": [
+        18166
+      ],
+      "opensim_body": "calcn_r",
+      "local_offset": [
+        0.22247434136202932,
+        0.020370629559109905,
+        -0.005680012809388069
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RMT5",
+      "mhr_vertices": [
+        18048
+      ],
+      "opensim_body": "calcn_r",
+      "local_offset": [
+        0.18099843753940545,
+        0.0074331517799468665,
+        0.04845714515739313
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LLFC",
+      "mhr_vertices": [
+        11547
+      ],
+      "opensim_body": "femur_l",
+      "local_offset": [
+        -0.005603848188751662,
+        -0.40200355229177936,
+        -0.04875145964730823
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LMFC",
+      "mhr_vertices": [
+        11593
+      ],
+      "opensim_body": "femur_l",
+      "local_offset": [
+        -0.00988277005187252,
+        -0.396170994059484,
+        0.04665830812070203
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LLMAL",
+      "mhr_vertices": [
+        12201
+      ],
+      "opensim_body": "tibia_l",
+      "local_offset": [
+        -0.010367,
+        -0.41076,
+        -0.03659
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LMMAL",
+      "mhr_vertices": [
+        12187
+      ],
+      "opensim_body": "tibia_l",
+      "local_offset": [
+        0.00437187249361512,
+        -0.4059740647875988,
+        0.032757977261242605
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LCAL",
+      "mhr_vertices": [
+        12302
+      ],
+      "opensim_body": "calcn_l",
+      "local_offset": [
+        -0.006820108495872751,
+        0.004454463716163849,
+        0.018199941998064434
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LTOE",
+      "mhr_vertices": [
+        13007
+      ],
+      "opensim_body": "calcn_l",
+      "local_offset": [
+        0.22247587812506836,
+        0.02037022127963399,
+        0.005806859350779375
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LMT5",
+      "mhr_vertices": [
+        12866
+      ],
+      "opensim_body": "calcn_l",
+      "local_offset": [
+        0.17843687550431245,
+        0.00485024922024125,
+        -0.05328536964403735
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RThumb",
+      "mhr_vertices": [
+        14328
+      ],
+      "opensim_body": "hand_r",
+      "local_offset": [
+        0.009648719114206561,
+        -0.06374456586835214,
+        0.04950412642566751
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RIndex",
+      "mhr_vertices": [
+        14867
+      ],
+      "opensim_body": "hand_r",
+      "local_offset": [
+        0.015550265136727748,
+        -0.08731019146972291,
+        0.016119580706435127
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RPinky",
+      "mhr_vertices": [
+        14834
+      ],
+      "opensim_body": "hand_r",
+      "local_offset": [
+        0.002522482144944549,
+        -0.07970727778262682,
+        -0.025509257911566996
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RIndexTip",
+      "mhr_vertices": [
+        16326
+      ],
+      "opensim_body": "hand_r",
+      "local_offset": [
+        0.04546368503550147,
+        -0.14098453248308196,
+        0.008745338221431614
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RPinkyTip",
+      "mhr_vertices": [
+        16011
+      ],
+      "opensim_body": "hand_r",
+      "local_offset": [
+        0.04000594793908063,
+        -0.11261342559294168,
+        -0.04237662036307069
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LThumb",
+      "mhr_vertices": [
+        9177
+      ],
+      "opensim_body": "hand_l",
+      "local_offset": [
+        0.009648725867080765,
+        -0.06374438624036449,
+        -0.04950374600138724
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LIndex",
+      "mhr_vertices": [
+        9520
+      ],
+      "opensim_body": "hand_l",
+      "local_offset": [
+        0.015550351837199716,
+        -0.08731037390997004,
+        -0.01611935236549017
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LPinky",
+      "mhr_vertices": [
+        9431
+      ],
+      "opensim_body": "hand_l",
+      "local_offset": [
+        0.002523701285218727,
+        -0.07970679438016814,
+        0.025509673548437584
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LIndexTip",
+      "mhr_vertices": [
+        10314
+      ],
+      "opensim_body": "hand_l",
+      "local_offset": [
+        0.045462138662677176,
+        -0.14098598990862654,
+        -0.008745228182265474
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LPinkyTip",
+      "mhr_vertices": [
+        10955
+      ],
+      "opensim_body": "hand_l",
+      "local_offset": [
+        0.040007037603488005,
+        -0.11261346896110269,
+        0.04237560887723371
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RHTO",
+      "mhr_vertices": [
+        13303
+      ],
+      "opensim_body": "humerus_r",
+      "local_offset": [
+        0.012828871760432028,
+        -0.1303114718804378,
+        0.034862801129399684
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RHAP",
+      "mhr_vertices": [
+        13294
+      ],
+      "opensim_body": "humerus_r",
+      "local_offset": [
+        0.03231525278701651,
+        -0.11330411811223748,
+        -0.05653181360350673
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RHBA",
+      "mhr_vertices": [
+        13356
+      ],
+      "opensim_body": "humerus_r",
+      "local_offset": [
+        -0.03203324659872253,
+        -0.19368757830451588,
+        -0.01611351381844303
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RHFR",
+      "mhr_vertices": [
+        13367
+      ],
+      "opensim_body": "humerus_r",
+      "local_offset": [
+        0.06636627740887413,
+        -0.18110341404420646,
+        -0.007033152593686837
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RFRM",
+      "mhr_vertices": [
+        13712
+      ],
+      "opensim_body": "ulna_r",
+      "local_offset": [
+        -0.04024444917066086,
+        -0.10375010352718925,
+        0.012906650053684632
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LHTO",
+      "mhr_vertices": [
+        8126
+      ],
+      "opensim_body": "humerus_l",
+      "local_offset": [
+        0.012857086902109391,
+        -0.13031241976370347,
+        -0.03485439329378487
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LHAP",
+      "mhr_vertices": [
+        8135
+      ],
+      "opensim_body": "humerus_l",
+      "local_offset": [
+        0.03227688622458583,
+        -0.1133052028846585,
+        0.05655151806578179
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LHBA",
+      "mhr_vertices": [
+        8188
+      ],
+      "opensim_body": "humerus_l",
+      "local_offset": [
+        -0.032040236167908936,
+        -0.1936888749920119,
+        0.01608379006261529
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LHFR",
+      "mhr_vertices": [
+        8200
+      ],
+      "opensim_body": "humerus_l",
+      "local_offset": [
+        0.06636557169282173,
+        -0.18110198221132184,
+        0.007075392930993435
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LFRM",
+      "mhr_vertices": [
+        8552
+      ],
+      "opensim_body": "ulna_l",
+      "local_offset": [
+        -0.04024679397562514,
+        -0.10374655063885202,
+        -0.012928109969872481
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RFLT",
+      "mhr_vertices": [
+        16496
+      ],
+      "opensim_body": "femur_r",
+      "local_offset": [
+        -0.011574636162086538,
+        -0.155952751364404,
+        0.09841741251625535
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RFLB",
+      "mhr_vertices": [
+        16683
+      ],
+      "opensim_body": "femur_r",
+      "local_offset": [
+        -0.0022656213341124623,
+        -0.32725704731777727,
+        0.06152665234548663
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RSHN",
+      "mhr_vertices": [
+        16987
+      ],
+      "opensim_body": "tibia_r",
+      "local_offset": [
+        -0.028933147808903506,
+        -0.15638171236001397,
+        0.07724959003427956
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "RTIB",
+      "mhr_vertices": [
+        17062
+      ],
+      "opensim_body": "tibia_r",
+      "local_offset": [
+        0.020111208834957803,
+        -0.21089117093105975,
+        0.013963864420270589
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LFLT",
+      "mhr_vertices": [
+        11321
+      ],
+      "opensim_body": "femur_l",
+      "local_offset": [
+        -0.011501783463996627,
+        -0.1559542364029671,
+        -0.0984235860613212
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LFLB",
+      "mhr_vertices": [
+        11510
+      ],
+      "opensim_body": "femur_l",
+      "local_offset": [
+        -0.0022189590137969284,
+        -0.327257863393616,
+        -0.06152357057825636
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LSHN",
+      "mhr_vertices": [
+        11806
+      ],
+      "opensim_body": "tibia_l",
+      "local_offset": [
+        -0.028875909971548347,
+        -0.15638042900482782,
+        -0.07726702436558228
+      ],
+      "fixed": true,
+      "synthpose_index": null
+    },
+    {
+      "name": "LTIB",
+      "mhr_vertices": [
+        11899
+      ],
+      "opensim_body": "tibia_l",
+      "local_offset": [
+        0.020121984314403277,
+        -0.2108909266325239,
+        -0.013946188159505185
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "RGTR",
+      "mhr_vertices": [
+        7342
+      ],
+      "opensim_body": "femur_r",
+      "local_offset": [
+        0.012677789125030287,
+        -0.014894207137095397,
+        0.11994807826802527
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "LGTR",
+      "mhr_vertices": [
+        6193
+      ],
+      "opensim_body": "femur_l",
+      "local_offset": [
+        0.012765648043034372,
+        -0.014895699351009678,
+        -0.11993851952299799
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s1_r",
+      "mhr_vertices": [
+        17702,
+        17701,
+        17703,
+        17755,
+        17650,
+        17651,
+        17756,
+        17700,
+        17754,
+        17649,
+        17652,
+        17704
+      ],
+      "opensim_body": "calcn_r",
+      "local_offset": [
+        0.01462,
+        -0.019309,
+        -0.004585
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s2_r",
+      "mhr_vertices": [
+        17868,
+        17869,
+        17867,
+        17903,
+        17902,
+        17904,
+        17823,
+        17824,
+        17870,
+        17866,
+        17822
+      ],
+      "opensim_body": "calcn_r",
+      "local_offset": [
+        0.156294,
+        -0.017168,
+        -0.02011
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s3_r",
+      "mhr_vertices": [
+        17893,
+        17894,
+        17849,
+        17850,
+        17930,
+        17848,
+        17892,
+        17931,
+        17895,
+        17929,
+        17891,
+        17847,
+        17928
+      ],
+      "opensim_body": "calcn_r",
+      "local_offset": [
+        0.139953,
+        -0.014885,
+        0.047137
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s4_r",
+      "mhr_vertices": [
+        17804,
+        17859,
+        17749,
+        17803,
+        17805,
+        17860,
+        17858,
+        17748,
+        17694,
+        17812,
+        17750
+      ],
+      "opensim_body": "calcn_r",
+      "local_offset": [
+        0.066707,
+        -0.018971,
+        0.013823
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s5_r",
+      "mhr_vertices": [
+        18330,
+        18329,
+        18373,
+        18287,
+        18331,
+        18286,
+        18372,
+        18374,
+        18328,
+        18288,
+        18375,
+        18417,
+        18416,
+        18418,
+        18285
+      ],
+      "opensim_body": "toes_r",
+      "local_offset": [
+        0.058353,
+        -0.017903,
+        -0.020506
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s6_r",
+      "mhr_vertices": [
+        18319,
+        18277,
+        18276,
+        18361,
+        18320,
+        18318,
+        18362,
+        18404,
+        18234,
+        18278,
+        18403,
+        18360,
+        18275,
+        18235,
+        18405
+      ],
+      "opensim_body": "toes_r",
+      "local_offset": [
+        0.034604,
+        -0.014398,
+        0.039027
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s1_l",
+      "mhr_vertices": [
+        12518,
+        12519,
+        12571,
+        12573,
+        12468,
+        12517,
+        12572,
+        12520,
+        12574,
+        12469,
+        12516,
+        12570
+      ],
+      "opensim_body": "calcn_l",
+      "local_offset": [
+        0.014596,
+        -0.018819,
+        0.004507
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s2_l",
+      "mhr_vertices": [
+        12719,
+        12718,
+        12720,
+        12758,
+        12759,
+        12757,
+        12666,
+        12665,
+        12717,
+        12721,
+        12667
+      ],
+      "opensim_body": "calcn_l",
+      "local_offset": [
+        0.156206,
+        -0.017586,
+        0.020267
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s3_l",
+      "mhr_vertices": [
+        12694,
+        12693,
+        12640,
+        12639,
+        12731,
+        12641,
+        12695,
+        12730,
+        12692,
+        12732,
+        12696,
+        12642
+      ],
+      "opensim_body": "calcn_l",
+      "local_offset": [
+        0.139986,
+        -0.014502,
+        -0.046976
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s4_l",
+      "mhr_vertices": [
+        12631,
+        12682,
+        12579,
+        12632,
+        12630,
+        12681,
+        12683,
+        12580,
+        12526,
+        12677,
+        12578
+      ],
+      "opensim_body": "calcn_l",
+      "local_offset": [
+        0.066737,
+        -0.018686,
+        -0.014106
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s5_l",
+      "mhr_vertices": [
+        13145,
+        13146,
+        13188,
+        13102,
+        13103,
+        13144,
+        13189,
+        13187,
+        13147,
+        13101,
+        13186,
+        13230,
+        13231,
+        13104,
+        13229
+      ],
+      "opensim_body": "toes_l",
+      "local_offset": [
+        0.05826,
+        -0.018696,
+        0.020772
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s6_l",
+      "mhr_vertices": [
+        13156,
+        13112,
+        13113,
+        13200,
+        13155,
+        13157,
+        13199,
+        13243,
+        13069,
+        13111,
+        13244,
+        13201,
+        13114,
+        13242,
+        13068
+      ],
+      "opensim_body": "toes_l",
+      "local_offset": [
+        0.034574,
+        -0.014417,
+        -0.03877
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s7_r",
+      "mhr_vertices": [
+        18066,
+        18024,
+        18067,
+        18023,
+        18065,
+        18109,
+        18022,
+        18025,
+        18108,
+        18110,
+        18068,
+        17981,
+        17980,
+        18064,
+        17982
+      ],
+      "opensim_body": "toes_r",
+      "local_offset": [
+        0.012989,
+        -0.017472,
+        0.013237
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    },
+    {
+      "name": "SOLE_s7_l",
+      "mhr_vertices": [
+        12893,
+        12849,
+        12892,
+        12850,
+        12894,
+        12936,
+        12851,
+        12848,
+        12935,
+        12937,
+        12891,
+        12806,
+        12807,
+        12895,
+        12805
+      ],
+      "opensim_body": "toes_l",
+      "local_offset": [
+        0.012947,
+        -0.017704,
+        -0.013034
+      ],
+      "fixed": false,
+      "synthpose_index": null
+    }
+  ]
+}

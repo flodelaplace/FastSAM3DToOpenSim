@@ -57,6 +57,7 @@ services:
       # pas besoin de rebuild après modif .py. Read-only pour éviter d'écrire
       # dans /app depuis le container. AWS Batch ignore compose donc pas d'impact.
       - ./demo_video_opensim.py:/app/demo_video_opensim.py:ro
+      - ./generate_avatars.py:/app/generate_avatars.py:ro
       - ./sam_3d_body:/app/sam_3d_body:ro
       # synkro-analytics : mount le repo host pour auto-analytics local sans
       # rebuild. AWS : le package sera pip installé dans l'image (Dockerfile).

@@ -295,43 +295,88 @@ def main(args):
     visualizer.set_pose_meta(mhr70_pose_info)
     print(f"Model loaded in {time.time() - t_load:.1f}s")
 
-    # Optionally estimate floor tilt from MoGe on frame 0 and skip spine correction
-    # when MoGe estimation is active (avoids overcorrection).
+    # Estimation robuste du plan du sol (MoGe multi-frame RANSAC) — méthode
+    # PAR DÉFAUT, alignée sur demo_video_opensim.py (validée). Corrige
+    # l'inclinaison caméra (pitch/roll) et, combinée au shift constant en aval
+    # (correct_floor_lean), ancre le sujet au sol. Désactivée seulement si un
+    # mode sol explicite est choisi (--floor / --floor_seated), ou via
+    # --no_floor_moge / --no_lean_fix.
     moge_floor_angle = None
-    if getattr(args, "floor_moge", False) and not args.no_lean_fix:
+    _floor_moge_on = (getattr(args, "floor_moge", False)
+                      or (not args.floor and not args.floor_seated
+                          and not getattr(args, "no_floor_moge", False)))
+    if _floor_moge_on and not args.no_lean_fix:
         fov_est = getattr(estimator, "fov_estimator", None)
         if fov_est is not None:
-            print("\nEstimating floor plane from MoGe depth (frame 0)...")
             t_moge = time.time()
-            # Read first frame from the video file
-            cap_m = cv2.VideoCapture(args.video_path)
-            ret_m, first_frame = cap_m.read()
-            cap_m.release()
-            if ret_m and first_frame is not None:
+            multi_frame = bool(int(os.environ.get("MOGE_MULTI_FRAME", "1")))
+            n_samples = int(os.environ.get("MOGE_N_SAMPLES", "8"))
+            moge_all_rejected = False
+            # bbox YOLO léger pour exclure le sujet du fit sol (pas besoin de
+            # précision — juste écarter grossièrement la zone corps).
+            _yolo = getattr(estimator, "detector", None)
+            def _bbox_fn(frame_rgb):
+                if _yolo is None:
+                    return None
                 try:
-                    pts, mask = fov_est.get_depth_points(cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB))
-                    # Try to get a person bbox on the first frame to exclude from floor fit
-                    first_bbox = None
-                    try:
-                        outs = estimator.process_one_image(
-                            cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB),
-                            hand_box_source=args.hand_box_source,
-                            inference_type=args.inference_type,
-                            bbox_thr=getattr(args, 'bbox_thr', None),
-                            nms_thr=getattr(args, 'nms_thr', None),
-                        )
-                        if outs and "bbox" in outs[0]:
-                            first_bbox = tuple(outs[0]["bbox"])
-                    except Exception:
-                        first_bbox = None
-                    moge_floor_angle = CoordinateTransformer.floor_angle_from_moge_points(
-                        pts, mask, person_bbox=first_bbox, orig_hw=(first_frame.shape[0], first_frame.shape[1])
-                    )
-                    _p, _r = moge_floor_angle
-                    print(f"  MoGe floor tilt: pitch={_p:+.2f}° roll={_r:+.2f}° "
-                          f"(took {time.time() - t_moge:.2f}s)")
+                    results = _yolo.predict(frame_rgb, verbose=False)
+                    if not results or len(results[0].boxes) == 0:
+                        return None
+                    b = results[0].boxes.xyxy[0].cpu().numpy()
+                    return (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
                 except Exception:
-                    print("  [floor_moge] MoGe floor estimation failed — skipping.")
+                    return None
+            if multi_frame:
+                try:
+                    print("\nEstimating floor plane from MoGe (multi-frame RANSAC)...")
+                    pitch, roll, quality = CoordinateTransformer.robust_floor_angle_multi_frame(
+                        args.video_path,
+                        depth_estimator_fn=fov_est.get_depth_points,
+                        person_bbox_fn=_bbox_fn,
+                        n_samples=n_samples,
+                    )
+                    moge_floor_angle = (pitch, roll)
+                    print(f"  MoGe floor tilt: pitch={pitch:+.2f}° roll={roll:+.2f}° "
+                          f"[{quality['status']}, {quality['n_used']}/{quality['n_requested']} frames, "
+                          f"pitch_std={quality.get('pitch_std_deg', 0):.2f}°] "
+                          f"(took {time.time() - t_moge:.2f}s)")
+                    if quality.get("status") == "insufficient_samples":
+                        print("  [floor_moge] ⚠ MoGe peu fiable — correction pitch caméra ignorée.")
+                        moge_floor_angle = None
+                        moge_all_rejected = True
+                except Exception as e:
+                    print(f"  [floor_moge] multi-frame failed ({e}) — fallback single frame.")
+                    multi_frame = False
+            if (not multi_frame or moge_floor_angle is None) and not moge_all_rejected:
+                print("Estimating floor plane from MoGe depth (frame 0)...")
+                cap_m = cv2.VideoCapture(args.video_path)
+                ret_m, first_frame = cap_m.read()
+                cap_m.release()
+                if ret_m and first_frame is not None:
+                    try:
+                        pts, mask = fov_est.get_depth_points(cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB))
+                        first_bbox = None
+                        try:
+                            outs = estimator.process_one_image(
+                                cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB),
+                                hand_box_source=args.hand_box_source,
+                                inference_type=args.inference_type,
+                                bbox_thr=getattr(args, 'bbox_thr', None),
+                                nms_thr=getattr(args, 'nms_thr', None),
+                            )
+                            if outs and "bbox" in outs[0]:
+                                first_bbox = tuple(outs[0]["bbox"])
+                        except Exception:
+                            first_bbox = None
+                        moge_floor_angle = CoordinateTransformer.floor_angle_from_moge_points(
+                            pts, mask, person_bbox=first_bbox,
+                            orig_hw=(first_frame.shape[0], first_frame.shape[1]),
+                        )
+                        _p, _r = moge_floor_angle
+                        print(f"  MoGe floor tilt (frame 0): pitch={_p:+.2f}° roll={_r:+.2f}° "
+                              f"(took {time.time() - t_moge:.2f}s)")
+                    except Exception:
+                        print("  [floor_moge] MoGe floor estimation failed — skipping.")
         else:
             print("  [floor_moge] No FOV estimator available — skipping.")
 
@@ -863,6 +908,8 @@ def main(args):
         correct_floor_lean=_correct_lean,
         floor_angle=moge_floor_angle,
         apply_body_vertical=_apply_body_vertical,
+        contact_anchor=getattr(args, "contact_anchor", False),
+        fps=out_fps,
     )
 
     # 2b. Spine-based forward-lean correction (runs after floor-plane rotation above).
@@ -942,6 +989,17 @@ def main(args):
         markers_body, _ = converter.convert(
             kpts_opensim, include_derived=True, body_only=True
         )
+
+    # ── Anti-glisse pied : fige le XZ des marqueurs pieds en contact sur le TRC
+    # final → l'avatar retargeté a les pieds plantés (et le squelette post-IK
+    # aussi). ACTIVÉ PAR DÉFAUT (indépendant de --contact_anchor) ; désactivable
+    # via --no_anti_foot_skate.
+    _anti_skate_on = (not getattr(args, "no_anti_foot_skate", False)) or getattr(args, "contact_anchor", False)
+    if _anti_skate_on and marker_names is not None:
+        from sam_3d_body.export.coordinate_transform import anti_foot_skate_markers
+        markers_array, _ = anti_foot_skate_markers(
+            markers_array, marker_names, fps=out_fps)
+        print("  [anti-skate] gel XZ des pieds en contact appliqué au TRC final")
 
     # ── --feet_anchor : shift global per-frame pour que le midpoint des
     # pieds reste à sa position médiane sur toute la vidéo. Translate tout
@@ -1456,13 +1514,18 @@ def main(args):
         #                 premières frames (assumées standing) appliqué constant.
         #                 Évite que le mesh soit way below ground quand il y a
         #                 pas de ground alignment per_frame.
-        _glb_ground_mode = "per_frame" if _apply_floor else "constant_from_calib"
+        # contact_anchor produit des offsets Y PER-FRAME (comme --floor) →
+        # le mesh doit les rejouer en per_frame, sinon il reste figé au bassin.
+        _contact_anchor_on = getattr(args, "contact_anchor", False)
+        _glb_ground_mode = ("per_frame"
+                            if (_apply_floor or _contact_anchor_on)
+                            else "constant_from_calib")
         # Compute shared calib offset depuis les kpts (= référence biomécanique
         # pieds) pour assurer que mesh + kpts segments + joints partagent le
         # même Y zero dans le GLB final. Utilisé en mode constant_from_calib
-        # (no --floor). Pour per_frame (--floor) l'override est ignoré.
+        # (no --floor). Pour per_frame (--floor / contact_anchor) l'override est ignoré.
         _shared_offset_m = None
-        if not _apply_floor:
+        if not _apply_floor and not _contact_anchor_on:
             _kpts_no_offset = transformer.apply_pipeline_to_verts(
                 [k.copy() if k is not None else None for k in all_kpts_raw],
                 output_units="m",
@@ -1664,7 +1727,19 @@ if __name__ == "__main__":
                              "default because on CPU-only OpenSim it roughly doubles the IK "
                              "step wall time. Pass this flag locally when tuning markers.")
     parser.add_argument("--floor_moge", action="store_true",
-                        help="Estimate floor plane from MoGe depth on the first video frame and use its camera-pitch angle to correct forward lean. Requires MoGe to be available.")
+                        help="Force l'estimation robuste du sol MoGe (multi-frame RANSAC). "
+                             "ACTIVÉE PAR DÉFAUT désormais : sujet ancré au sol + correction "
+                             "pitch/roll caméra. Ce flag reste pour compat/forçage explicite.")
+    parser.add_argument("--no_floor_moge", action="store_true",
+                        help="Désactive l'estimation robuste du sol MoGe (défaut activée). "
+                             "À utiliser si l'on veut la position 3D brute sans mise au sol, "
+                             "ou en combinaison avec un mode --floor explicite.")
+    parser.add_argument("--contact_anchor", action="store_true",
+                        help="Ancrage sol conscient du contact : re-ancre le pied en contact "
+                             "soutenu (squat → bassin descend) mais préserve la phase de vol. "
+                             "Recommandé pour les avatars d'exercices (évite le bassin figé).")
+    parser.add_argument("--no_anti_foot_skate", action="store_true",
+                        help="Désactive l'anti-glisse du pied au contact (activé PAR DÉFAUT).")
     parser.add_argument("--person_height", type=float, default=None,
                         help="Known person height in metres (e.g. 1.69). Scales all 3D output "
                              "so the skeleton height matches this value. Applied to all persons "

@@ -61,6 +61,8 @@ class CoordinateTransformer:
         apply_body_vertical: Optional[bool] = None,
         lock_vertical: bool = False,
         lock_lateral: bool = False,
+        contact_anchor: bool = False,
+        fps: float = 30.0,
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
         Transform keypoints (and optionally jcoords) to OpenSim world space.
@@ -189,7 +191,21 @@ class CoordinateTransformer:
         self._last_ground_offsets_m = None
         self._last_constant_offset_m = None
         self._last_penetration_clamp_m = None  # (N,) per-frame safety-net shift
-        if align_to_ground:
+        if contact_anchor:
+            # Ancrage conscient du contact : re-ancre le pied en contact SOUTENU
+            # (squat → bassin descend) mais tient l'offset pendant un vol BREF
+            # (course/saut → pas de "saut"). Unifie --floor (per-frame) et le
+            # mode défaut. Stocke un offset per-frame (comme align_to_ground) →
+            # le mesh GLB le rejoue via _last_ground_offsets_m.
+            kpts, ground_offsets = self._contact_aware_ground(
+                kpts, fps=fps, return_offsets=True)
+            if jc is not None:
+                jc[:, :, 1] -= ground_offsets[:, None]
+            self._last_ground_offsets_m = ground_offsets.copy()
+            # NB : l'anti-glisse pied ne se fait PAS ici (les kpts MHR ne sont
+            # pas les marqueurs finaux). Elle s'applique sur les marqueurs
+            # Flodelaplace du TRC via anti_foot_skate_markers() (voir pipeline).
+        elif align_to_ground:
             # --floor : per-frame ground align (feet à Y=0 chaque frame)
             kpts, ground_offsets = self._align_to_ground(kpts, return_offsets=True)
             if jc is not None:
@@ -642,6 +658,74 @@ class CoordinateTransformer:
             return result, offsets
         return result
 
+    def _contact_aware_ground(
+        self,
+        kpts: np.ndarray,
+        fps: float = 30.0,
+        return_offsets: bool = False,
+        band_m: float = 0.05,
+        max_flight_s: float = 0.6,
+        ground_pct: float = 10.0,
+    ):
+        """Ancrage sol conscient du contact.
+
+        Problème : la repro monoculaire pose le bassin à hauteur ~fixe (aucun
+        mouvement vertical global) ; en squat les pieds "montent" au lieu que le
+        bassin descende. `_align_to_ground` (plaque le pied bas à 0 CHAQUE frame)
+        corrige le squat mais tue la phase de vol (course/saut → "saute").
+
+        Ici on distingue par la DURÉE de l'excursion des pieds au-dessus du sol :
+        - **contact soutenu** (pieds au-dessus du sol longtemps = squat inversé,
+          ou pied planté) → on re-ancre par frame (offset = pied le plus bas) →
+          le bassin descend correctement.
+        - **vol bref** (< ``max_flight_s`` = course/saut) → on TIENT l'offset au
+          niveau du sol (interpolé décollage→réception) → les pieds "flottent"
+          pendant le vol, pas de yank vers le bas.
+
+        Args:
+            kpts : (N, K, 3) en mètres, OpenSim world (Y-up), pas encore ancré.
+            fps  : cadence (pour le seuil de durée du vol).
+        Returns:
+            (kpts_ancré, offsets)  si return_offsets, sinon kpts_ancré.
+            offsets[t] = décalage Y soustrait à la frame t.
+        """
+        result = kpts.copy()
+        T = kpts.shape[0]
+        min_y = np.array([float(np.min(kpts[i, _FOOT_INDICES, 1])) for i in range(T)],
+                         dtype=np.float64)
+        finite = np.isfinite(min_y)
+        if not finite.any():
+            offsets = np.zeros(T)
+            return (result, offsets) if return_offsets else result
+        # Niveau du sol = bas robuste des pieds sur tout le clip.
+        ground = float(np.nanpercentile(min_y[finite], ground_pct))
+        offsets = min_y.copy()
+        airborne = (min_y > ground + band_m) & finite
+        max_flight_frames = max(1, int(round(max_flight_s * fps)))
+        i = 0
+        while i < T:
+            if airborne[i]:
+                j = i
+                while j < T and airborne[j]:
+                    j += 1
+                if (j - i) <= max_flight_frames:
+                    # Vol bref → tenir le sol : interp niveau décollage→réception.
+                    lo = min_y[i - 1] if i > 0 and finite[i - 1] else ground
+                    hi = min_y[j] if j < T and finite[j] else ground
+                    offsets[i:j] = np.linspace(lo, hi, j - i)
+                # else : contact soutenu (squat) → garder offsets=min_y (re-ancrage)
+                i = j
+            else:
+                i += 1
+        # Frames non-finies : pas de shift.
+        offsets[~finite] = 0.0
+        for i in range(T):
+            result[i, :, 1] -= offsets[i]
+        if return_offsets:
+            return result, offsets
+        return result
+
+
     def _fit_floor_plane_angle(self, kpts: np.ndarray) -> float:
         """
         Estimate floor tilt in the sagittal plane (rotation around OpenSim Z / lateral axis).
@@ -809,6 +893,7 @@ class CoordinateTransformer:
         # sol donc les pixels immédiatement sous la bbox = sol garanti.
         # Fallback (pas de bbox) : ancien comportement "bottom floor_frac".
         floor_row_min = None   # ligne min (exclusive) du floor band ; None = pas de contrainte pixel
+        floor_row_fallback = None  # fallback "à côté" (mi-bbox) si pas assez de sol dessous
         if person_bbox is not None and orig_hw is not None:
             oh, ow = orig_hw
             x1, y1, x2, y2 = person_bbox
@@ -832,12 +917,22 @@ class CoordinateTransformer:
             if use_bbox_floor:
                 below_margin = max(1, int((gy2 - gy1) * 0.05))
                 floor_row_min = min(H - 1, gy2 + below_margin)
+                # Fallback : depuis la moitié basse de la bbox → capte le sol
+                # À CÔTÉ des jambes/pieds (bbox intérieur déjà exclu du mask).
+                floor_row_fallback = max(0, gy1 + int(0.5 * (gy2 - gy1)))
 
-        # Restreint le mask aux lignes SOUS la bbox si applicable
+        # Restreint le mask aux lignes SOUS la bbox si applicable ; si trop peu
+        # de pixels sol dessous (sujet en bas du cadre) → fallback "à côté".
         if floor_row_min is not None:
-            floor_band_mask = np.zeros_like(valid_mask)
-            floor_band_mask[floor_row_min:, :] = True
-            valid_mask = valid_mask & floor_band_mask
+            band = np.zeros_like(valid_mask)
+            band[floor_row_min:, :] = True
+            vm_below = valid_mask & band
+            if vm_below.sum() < 200 and floor_row_fallback is not None:
+                band_side = np.zeros_like(valid_mask)
+                band_side[floor_row_fallback:, :] = True
+                valid_mask = valid_mask & band_side
+            else:
+                valid_mask = vm_below
 
         # Flatten to valid points
         pts_flat = points.reshape(-1, 3).astype(np.float64)
@@ -1233,3 +1328,120 @@ class CoordinateTransformer:
                 a = np.degrees(np.arccos(np.clip(cos_a, -1, 1)))
                 angles.append(a if spine_vec[0] > 0 else -a)
         return float(np.median(angles)) if angles else 0.0
+
+
+def anti_foot_skate_markers(
+    markers_array: np.ndarray,
+    marker_names: list,
+    fps: float = 30.0,
+    band_m: float = 0.06,
+    ground_pct: float = 10.0,
+    min_contact_s: float = 0.08,
+):
+    """Anti-glisse pied sur les marqueurs FINAUX du TRC (markerset Flodelaplace).
+
+    À appeler APRÈS le convertisseur (markers_array = (T, M, 3) en mètres,
+    Y-up) et AVANT l'export TRC / l'IK : le TRC anti-slidé nourrit ensuite IK +
+    retargeting avatar, donc le squelette post-IK et l'avatar sont déjà anti-
+    slidés (pas de lavage par l'IK).
+
+    Contact détecté PAR LA HAUTEUR (pied bas soutenu ≥ min_contact_s), pas par la
+    vitesse (la dérive à corriger est de la gigue rapide). Pendant chaque phase de
+    contact d'un pied, on fige la position XZ de ses marqueurs à la médiane de la
+    phase → pied planté.
+
+    Returns:
+        (markers_corrigés, shifts) où shifts[t] = (dx, dz) moyen appliqué à la
+        frame t (utile pour translater le mesh GLB de la même façon).
+    """
+    if markers_array is None or markers_array.ndim != 3 or markers_array.shape[0] < 2:
+        return markers_array, None
+    result = markers_array.copy()
+    T = result.shape[0]
+    # Auto-détection unité (mm vs m) : les marqueurs Flodelaplace peuvent être
+    # en mm (TRC) ou en mètres. band_m est en mètres → on l'échelle.
+    _unit = 1000.0 if np.nanmax(np.abs(markers_array)) > 50.0 else 1.0
+    band = band_m * _unit
+    name_to_idx = {n: i for i, n in enumerate(marker_names)}
+    # Groupes de marqueurs pied par côté (repères sol : talon + orteil).
+    side_markers = {
+        "L": [name_to_idx[n] for n in ("LCAL", "LTOE", "LHEE", "LTO") if n in name_to_idx],
+        "R": [name_to_idx[n] for n in ("RCAL", "RTOE", "RHEE", "RTO") if n in name_to_idx],
+    }
+    min_len = max(2, int(round(min_contact_s * fps)))
+
+    # Contact + position XZ par côté.
+    foot_xz = {}
+    foot_y = {}
+    contact = {}
+    for side, idx in side_markers.items():
+        if not idx:
+            continue
+        # Point de contact = marqueur du pied le PLUS BAS par frame (talon OU
+        # orteil selon la pose : extension pointe de pied → seul l'orteil touche).
+        sub = result[:, idx, :]              # (T, k, 3)
+        foot = np.full((T, 3), np.nan, dtype=np.float64)
+        for t in range(T):
+            col = sub[t, :, 1]
+            if np.all(np.isnan(col)):
+                continue
+            foot[t] = sub[t, int(np.nanargmin(col))]
+        y = foot[:, 1]
+        finite = np.all(np.isfinite(foot), axis=1)
+        if not finite.any():
+            continue
+        ground = float(np.nanpercentile(y[finite], ground_pct))
+        c = (y < ground + band) & finite
+        # ne garde que les runs de contact ≥ min_len
+        keep = np.zeros(T, dtype=bool)
+        i = 0
+        while i < T:
+            if c[i]:
+                j = i
+                while j < T and c[j]:
+                    j += 1
+                if (j - i) >= min_len:
+                    keep[i:j] = True
+                i = j
+            else:
+                i += 1
+        foot_xz[side] = foot[:, [0, 2]]
+        foot_y[side] = foot[:, 1]
+        contact[side] = keep
+
+    if not contact:
+        return result, np.zeros((T, 2))
+
+    # Shift INCRÉMENTAL par pied d'appui : pendant qu'un pied reste en appui,
+    # on garde CE pied fixe (shift[t] = shift[t-1] - déplacement du pied). Au
+    # changement d'appui (ou en vol), on REPORTE le shift sans corriger → le
+    # corps AVANCE d'un pas à l'autre (la marche n'est pas bloquée). Pour un
+    # squat, le même pied reste en appui → seule la gigue est retirée.
+    shifts = np.zeros((T, 2), dtype=np.float64)
+    prev = None  # côté d'appui à t-1
+    for t in range(T):
+        avail = [s for s in contact if contact[s][t]]
+        if prev in avail:
+            cur = prev                       # hystérésis : garde le même appui
+        elif avail:
+            # sinon = pied en contact le PLUS BAS (le plus ancré). Gère le
+            # single-support (initiation de marche) : un seul pied → c'est lui.
+            cur = min(avail, key=lambda s: (foot_y[s][t]
+                                            if np.isfinite(foot_y[s][t]) else 1e9))
+        else:
+            cur = None
+        if t > 0:
+            if (cur is not None and cur == prev
+                    and np.all(np.isfinite(foot_xz[cur][t]))
+                    and np.all(np.isfinite(foot_xz[cur][t - 1]))):
+                delta = foot_xz[cur][t] - foot_xz[cur][t - 1]
+                shifts[t] = shifts[t - 1] - delta
+            else:
+                shifts[t] = shifts[t - 1]   # changement d'appui / vol → report
+        prev = cur
+
+    result[:, :, 0] += shifts[:, 0][:, None]
+    result[:, :, 2] += shifts[:, 1][:, None]
+    # shifts retournés en MÈTRES (pour appliquer le même décalage au mesh GLB,
+    # qui est en mètres), quelle que soit l'unité de markers_array.
+    return result, shifts / _unit

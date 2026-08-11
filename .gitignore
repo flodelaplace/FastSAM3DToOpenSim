@@ -71,3 +71,6 @@ upstream-sam3d/
 /docs/ANGLE_CONVENTIONS.md
 /docs/CROSS_MODAL_ANGLES.md
 /docs/FILENAME_TOKENS.html
+/docs/FRONTEND_INTEGRATION.md
+/ONBOARDING.md
+/aws/push_fastsam3d_ecr.sh

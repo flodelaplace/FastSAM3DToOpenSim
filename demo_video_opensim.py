@@ -188,6 +188,315 @@ def draw_results_on_frame(img_bgr, outputs, visualizer):
     return out
 
 
+def _marker_region(name, opensim_body):
+    """Regroupe un marqueur en région anatomique (color-coding overlay).
+    Porté de Mesh2Sim (demo_pipeline_mono._marker_region) — c'est ce qui rend
+    73 marqueurs lisibles d'un coup d'œil."""
+    n = (name or "").upper()
+    b = opensim_body or ""
+    if b == "head" or n in {"HTOP", "NOSE", "LEYE", "REYE", "LEAR", "REAR"}:
+        return "head"
+    if b in {"torso", "lumbar3", "lumbar5", "pelvis"} or n.startswith(("C_", "C7", "T")) \
+            or n in {"RACR", "LACR", "RCLAV", "LCLAV", "RASI", "LASI", "RPSI", "LPSI",
+                     "XIPH", "RGTR", "LGTR"}:
+        return "trunk"
+    if "hand" in b:
+        return "hand_r" if b.endswith("_r") else "hand_l"
+    if any(k in b for k in ("foot", "calcn", "talus", "toes")):
+        return "foot_r" if b.endswith("_r") or n.startswith("R") else "foot_l"
+    if n.startswith("R"):
+        return "leg_r" if any(k in b for k in ("femur", "tibia", "patella")) else "arm_r"
+    if n.startswith("L"):
+        return "leg_l" if any(k in b for k in ("femur", "tibia", "patella")) else "arm_l"
+    return "other"
+
+
+def _load_anatomical_markerset():
+    """Charge le markerset anatomique Synkro (73 marqueurs virtuels).
+    Retourne (names, vertex_indices[np.int], regions, opensim_bodies) ou None.
+    Chaque marqueur = 1 index de vertex du mesh MHR (pred_vertices)."""
+    import json
+    cj = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      "assets", "correspondence_sole.json")
+    if not os.path.isfile(cj):
+        return None
+    d = json.load(open(cj))
+    markers = d.get("markers", [])
+    names, idxs, regions, bodies = [], [], [], []
+    for m in markers:
+        vids = m.get("mhr_vertices") or []
+        if not vids:
+            continue
+        nm = m.get("name")
+        body = m.get("opensim_body") or ""
+        names.append(nm)
+        idxs.append(int(vids[0]))          # 1er vertex listé (cf. converter)
+        bodies.append(body)
+        regions.append(_marker_region(nm, body))
+    return names, np.asarray(idxs, dtype=np.int64), regions, bodies
+
+
+def _project_points(P3, cam_t, focal, width, height):
+    """Projette des points 3D (repère réseau SAM3D, mètres) → pixels image.
+    pred_keypoints_2d = K @ (P3 + cam_t), K = [[f,0,W/2],[0,f,H/2],[0,0,1]]
+    (principal point au centre, convention SAM3D). Retourne (N,2) float, NaN
+    pour les points derrière la caméra."""
+    cx, cy = width / 2.0, height / 2.0
+    Xc = P3 + cam_t[None, :]
+    Z = Xc[:, 2:3]
+    uv = np.full((P3.shape[0], 2), np.nan, dtype=np.float64)
+    ok = (Z[:, 0] > 1e-6)
+    uv[ok, 0] = focal * Xc[ok, 0] / Z[ok, 0] + cx
+    uv[ok, 1] = focal * Xc[ok, 1] / Z[ok, 0] + cy
+    return uv
+
+
+# Squelette anatomique : segments de tracé sur un marqueur représentatif par
+# articulation. Les 73 marqueurs anatomiques sont des landmarks de SURFACE
+# (RLFC=condyle latéral, XIPH=devant, C7=derrière) → les relier donne un
+# squelette incohérent. On trace donc le squelette sur les CENTRES ARTICULAIRES
+# du modèle (keypoints MHR body, centrés sur l'articulation) → cohérent + centré.
+# Nom JC_* → nom du keypoint mhr70 (projeté depuis pred_keypoints_3d, validé 0px).
+_JOINT_CENTERS = [
+    ("JC_neck", "neck"),               ("JC_nose", "nose"),
+    ("JC_Lshoulder", "left_shoulder"), ("JC_Rshoulder", "right_shoulder"),
+    ("JC_Lelbow", "left_elbow"),       ("JC_Relbow", "right_elbow"),
+    ("JC_Lwrist", "left_wrist"),       ("JC_Rwrist", "right_wrist"),
+    ("JC_Lhip", "left_hip"),           ("JC_Rhip", "right_hip"),
+    ("JC_Lknee", "left_knee"),         ("JC_Rknee", "right_knee"),
+    ("JC_Lankle", "left_ankle"),       ("JC_Rankle", "right_ankle"),
+    ("JC_Lheel", "left_heel"),         ("JC_Rheel", "right_heel"),
+    ("JC_Ltoe", "left_big_toe"),       ("JC_Rtoe", "right_big_toe"),
+]
+# Squelette cinématique cohérent sur les centres articulaires (ligne centrale).
+_JOINT_EDGES = [
+    ("JC_neck", "JC_nose"),
+    ("JC_neck", "JC_Lshoulder"), ("JC_neck", "JC_Rshoulder"),
+    ("JC_Lshoulder", "JC_Lelbow"), ("JC_Lelbow", "JC_Lwrist"),
+    ("JC_Rshoulder", "JC_Relbow"), ("JC_Relbow", "JC_Rwrist"),
+    ("JC_Lshoulder", "JC_Lhip"), ("JC_Rshoulder", "JC_Rhip"),
+    ("JC_Lhip", "JC_Rhip"),
+    ("JC_Lhip", "JC_Lknee"), ("JC_Lknee", "JC_Lankle"),
+    ("JC_Lankle", "JC_Lheel"), ("JC_Lheel", "JC_Ltoe"),
+    ("JC_Rhip", "JC_Rknee"), ("JC_Rknee", "JC_Rankle"),
+    ("JC_Rankle", "JC_Rheel"), ("JC_Rheel", "JC_Rtoe"),
+]
+
+# Chaîne de la COLONNE (centres de vertèbres c_spine*, sur l'axe → cohérent).
+# Bas → haut, base reliée au sacrum (RPSI/LPSI). Se raccorde aux épaules via les
+# arêtes C7↔RACR/LACR de _ANAT_VOLUME_EDGES.
+_SPINE_EDGES = [
+    ("c_spine0", "RPSI"), ("c_spine0", "LPSI"),
+    ("c_spine0", "c_spine2"), ("c_spine2", "c_spine3"), ("c_spine3", "C7"),
+    ("C7", "c_neck"), ("c_neck", "c_head"), ("c_head", "HTOP"),
+]
+
+# Bandes de VOLUME entre landmarks anatomiques appariés (médial + latéral au
+# même niveau → "barreaux" + arêtes latérale/médiale de chaque segment). Donne
+# du volume au membre (wireframe), sans incohérence avant/arrière.
+_ANAT_VOLUME_EDGES = [
+    # jambe droite : cuisse (GTR→condyles), barreau genou, tibia (condyles→
+    # malléoles), barreau cheville, pied.
+    ("RGTR", "RLFC"), ("RGTR", "RMFC"), ("RLFC", "RMFC"),
+    ("RLFC", "RLMAL"), ("RMFC", "RMMAL"), ("RLMAL", "RMMAL"),
+    ("RLMAL", "RCAL"), ("RMMAL", "RCAL"), ("RCAL", "RTOE"),
+    ("RTOE", "RMT5"), ("RCAL", "RMT5"),
+    # jambe gauche
+    ("LGTR", "LLFC"), ("LGTR", "LMFC"), ("LLFC", "LMFC"),
+    ("LLFC", "LLMAL"), ("LMFC", "LMMAL"), ("LLMAL", "LMMAL"),
+    ("LLMAL", "LCAL"), ("LMMAL", "LCAL"), ("LCAL", "LTOE"),
+    ("LTOE", "LMT5"), ("LCAL", "LMT5"),
+    # bras droit : bras (ACR→épicondyles), barreau coude, avant-bras, barreau poignet
+    ("RACR", "RLEL"), ("RACR", "RMEL"), ("RLEL", "RMEL"),
+    ("RLEL", "RFAradius"), ("RMEL", "RFAulna"), ("RFAradius", "RFAulna"),
+    # bras gauche
+    ("LACR", "LLEL"), ("LACR", "LMEL"), ("LLEL", "LMEL"),
+    ("LLEL", "LFAradius"), ("LMEL", "LFAulna"), ("LFAradius", "LFAulna"),
+    # tronc + bassin (quad pelvis, côtés du tronc, épaules, cou→tête)
+    ("RACR", "LACR"), ("C7", "RACR"), ("C7", "LACR"), ("HTOP", "C7"),
+    ("RASI", "LASI"), ("RPSI", "LPSI"), ("RASI", "RPSI"), ("LASI", "LPSI"),
+    ("RASI", "RGTR"), ("LASI", "LGTR"), ("RPSI", "RGTR"), ("LPSI", "LGTR"),
+    ("RACR", "RASI"), ("LACR", "LASI"),
+]
+
+
+def _project_or_none(P3, cam_t, focal, width, height):
+    """Projette [M,3] → liste de [x,y,conf] (conf 0 si hors-champ/derrière cam)."""
+    uv = _project_points(np.asarray(P3), np.asarray(cam_t), float(focal),
+                         width, height)
+    out = []
+    for x, y in uv:
+        if np.isnan(x) or np.isnan(y):
+            out.append([None, None, 0.0])
+        else:
+            out.append([round(float(x), 2), round(float(y), 2), 1.0])
+    return out
+
+
+def write_points2d_json_3d(all_anat, all_cam_t, all_focal, names, regions,
+                           label_set, width, height, fps, out_path,
+                           all_kpts_raw=None, all_kpts_2d=None,
+                           kpt_name_to_id=None, offset_s=0.0):
+    """Écrit points2d.json (coords écran) pour l'overlay interactif front-end.
+
+    DEUX groupes de points, projetés via K @ (P + cam_t) (validé 0px) :
+    1. **73 marqueurs anatomiques** (index vertex du mesh) = dots "mocap" colorés
+       par région (approche Mesh2Sim). PAS de segments entre eux (landmarks de
+       surface → squelette incohérent).
+    2. **Centres articulaires** (JC_*, keypoints MHR body centrés) = squelette
+       cohérent (`edges`), à tracer par le front en couleurs Synkro (bleu Navy).
+
+    Champs : `regions` (color-coding ; les JC ont la région "joint"),
+    `label_markers`, `edges` (sur les JC). offset_s=0. Auto-validation reproj si
+    all_kpts_raw/all_kpts_2d fournis.
+    """
+    import json
+    n_anat = len(names)
+
+    # Indices mhr70 des centres articulaires (via kpt_name_to_id).
+    jc_names, jc_ids = [], []
+    if kpt_name_to_id:
+        for jc_name, kpt_name in _JOINT_CENTERS:
+            if kpt_name in kpt_name_to_id:
+                jc_names.append(jc_name)
+                jc_ids.append(kpt_name_to_id[kpt_name])
+    jc_ids = np.asarray(jc_ids, dtype=np.int64) if jc_ids else None
+
+    frames = []
+    for anat, k3, cam_t, focal in zip(all_anat, all_kpts_raw or [None] * len(all_anat),
+                                      all_cam_t, all_focal):
+        n_total = n_anat + len(jc_names)
+        if cam_t is None or not focal:
+            frames.append([[None, None, 0.0] for _ in range(n_total)])
+            continue
+        # 1. marqueurs anatomiques
+        if anat is not None:
+            fr = _project_or_none(anat, cam_t, focal, width, height)
+        else:
+            fr = [[None, None, 0.0] for _ in range(n_anat)]
+        # 2. centres articulaires
+        if jc_ids is not None and k3 is not None:
+            fr += _project_or_none(np.asarray(k3)[jc_ids], cam_t, focal, width, height)
+        else:
+            fr += [[None, None, 0.0] for _ in range(len(jc_names))]
+        frames.append(fr)
+
+    # Auto-validation projection (reprojette les kpts connus).
+    reproj_err = None
+    if all_kpts_raw is not None and all_kpts_2d is not None:
+        errs = []
+        for k3, k2, cam_t, focal in zip(all_kpts_raw, all_kpts_2d, all_cam_t, all_focal):
+            if k3 is None or k2 is None or cam_t is None or not focal:
+                continue
+            uv = _project_points(np.asarray(k3), np.asarray(cam_t), float(focal),
+                                 width, height)
+            d = np.linalg.norm(uv - np.asarray(k2)[:, :2], axis=1)
+            errs.extend(d[np.isfinite(d)].tolist())
+        if errs:
+            reproj_err = float(np.median(errs))
+
+    all_names = list(names) + jc_names
+    all_regions = list(regions) + ["joint"] * len(jc_names)
+    _nidx = {nm: i for i, nm in enumerate(all_names)}
+    # `edges` = squelette central (centres articulaires + chaîne colonne).
+    # `edges_volume` = bandes médial/latéral entre landmarks → volume (wireframe).
+    edges = [[_nidx[a], _nidx[b]] for a, b in (_JOINT_EDGES + _SPINE_EDGES)
+             if a in _nidx and b in _nidx]
+    edges_volume = [[_nidx[a], _nidx[b]] for a, b in _ANAT_VOLUME_EDGES
+                    if a in _nidx and b in _nidx]
+
+    doc = {
+        "schema_version": "1.0.0",
+        "modality": "3d",
+        "video": {"largeur_px": int(width), "hauteur_px": int(height),
+                  "fps": round(float(fps), 6)},
+        "sync": {"offset_s": offset_s},
+        "noms": all_names,
+        "regions": all_regions,
+        "label_markers": sorted(label_set) if label_set else [],
+        "edges": edges,
+        "edges_volume": edges_volume,
+        "frames": frames,
+    }
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(doc, f)
+    return len(frames), len(all_names), len(edges) + len(edges_volume), reproj_err
+
+
+# Palette overlay bakée (BGR) — MÊME DA que le pipeline 2D gonio :
+#   squelette BLANC · marqueurs Navy pleins uniformes (pas de couleur par
+#   région) · Lime en accent (ici les centres articulaires).
+# Réf : synkro-gonio2d/scripts/runner.py, _patch_skeleton_uniform_color()
+# et _patch_render_cosmetics().
+_OVERLAY_NAVY = (75, 24, 23)     # #17184B (bleu Synkro)
+_OVERLAY_LIME = (3, 241, 217)    # #D9F103
+_OVERLAY_WHITE = (255, 255, 255)
+
+
+def render_overlay_video(points2d_path, raw_video_path, out_path):
+    """Rend l'overlay Synkro (marqueurs colorés par région + squelette bleu Navy
+    + volume) depuis points2d.json sur la vidéo BRUTE → overlay baké dans le
+    dossier de résultats. MÊME rendu (données + algo) que ce que le front
+    dessinera → source unique. Retourne le nb de frames écrites."""
+    import json
+    doc = json.load(open(points2d_path))
+    names = doc["noms"]
+    regions = doc.get("regions", ["other"] * len(names))
+    label_set = set(doc.get("label_markers", []))
+    edges = doc.get("edges", [])
+    edges_vol = doc.get("edges_volume", [])
+    frames = doc["frames"]
+    fps = doc["video"]["fps"]
+    cap = cv2.VideoCapture(str(raw_video_path))
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"),
+                             fps, (W, H))
+    n = 0
+    while cap.isOpened() and n < len(frames):
+        ret, img = cap.read()
+        if not ret:
+            break
+        fr = frames[n]
+        # 1. bandes de volume : blanc fin (wireframe discret du membre)
+        for a, b in edges_vol:
+            pa, pb = fr[a], fr[b]
+            if pa[0] is None or pb[0] is None or pa[2] == 0 or pb[2] == 0:
+                continue
+            cv2.line(img, (int(pa[0]), int(pa[1])), (int(pb[0]), int(pb[1])),
+                     _OVERLAY_WHITE, 1, cv2.LINE_AA)
+        # 2. squelette central : blanc (DA gonio, thickness 2)
+        for a, b in edges:
+            pa, pb = fr[a], fr[b]
+            if pa[0] is None or pb[0] is None or pa[2] == 0 or pb[2] == 0:
+                continue
+            cv2.line(img, (int(pa[0]), int(pa[1])), (int(pb[0]), int(pb[1])),
+                     _OVERLAY_WHITE, 2, cv2.LINE_AA)
+        # 3. points : marqueurs Navy pleins uniformes ; centres articulaires en
+        #    Lime (accent Synkro, comme le point focus du 2D).
+        for i, name in enumerate(names):
+            p = fr[i]
+            if p[0] is None or p[2] == 0:
+                continue
+            x, y = int(p[0]), int(p[1])
+            if not (0 <= x < W and 0 <= y < H):
+                continue
+            if regions[i] == "joint":
+                cv2.circle(img, (x, y), 7, _OVERLAY_LIME, -1, cv2.LINE_AA)
+            else:
+                cv2.circle(img, (x, y), 5, _OVERLAY_NAVY, -1, cv2.LINE_AA)
+                if name in label_set:
+                    cv2.putText(img, name, (x + 7, y - 7),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, _OVERLAY_WHITE, 1,
+                                cv2.LINE_AA)
+        writer.write(img)
+        n += 1
+    cap.release()
+    writer.release()
+    return n
+
+
 def _centroid_from_bbox(bbox):
     x1, y1, x2, y2 = bbox
     return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
@@ -275,7 +584,7 @@ def main(args):
     # --markerset pose2sim               : original KeypointConverter + pose2sim_wholebody_model.osim
     markerset = getattr(args, "markerset", "pose2sim")
     if markerset == "flodelaplace":
-        model_template = os.path.join(parent_dir, "assets", "Model_Flodelaplace_XIPH_synkro.osim")
+        model_template = os.path.join(parent_dir, "assets", "Model_Flodelaplace_SOLE.osim")
         from sam_3d_body.export.flodelaplace_converter import FlodelaplaceConverter
         florian_converter = FlodelaplaceConverter()
         # Force vertex collection even when mesh GLB is disabled — the
@@ -447,7 +756,12 @@ def main(args):
     prefix = f"markers_{video_name}"
 
     # Output paths — mirror SAM3D-OpenSim naming convention
+    # vid_path garde le nom historique (_skeleton.mp4) → récupération AWS/S3
+    # inchangée, mais son CONTENU est maintenant le nouvel overlay Synkro. La
+    # boucle remplit d'abord une vidéo brute temporaire (_raw.mp4) qui sert de
+    # fond au rendu de l'overlay (post-pass), puis est supprimée.
     vid_path       = os.path.join(args.output_dir, f"{prefix}_skeleton.mp4")
+    raw_vid_path   = os.path.join(args.output_dir, f"{prefix}_raw.mp4")
     trc_path       = os.path.join(args.output_dir, f"{prefix}.trc")
     ik_mot_path    = os.path.join(args.output_dir, f"{prefix}_ik.mot")
     errors_path    = os.path.join(args.output_dir, "_ik_marker_errors.sto")
@@ -457,7 +771,7 @@ def main(args):
     outputs_path   = os.path.join(args.output_dir, "video_outputs.json")
 
     writer = cv2.VideoWriter(
-        vid_path, cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (width, height)
+        raw_vid_path, cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (width, height)
     )
 
     print(f"\nVideo: {width}x{height} @ {fps:.1f}fps | {total} frames")
@@ -470,7 +784,21 @@ def main(args):
     processed       = 0
     timestamps      = []
     all_kpts_raw    = []   # [N_frames] of [70, 3] camera-space kpts, or None
+    all_kpts_2d     = []   # [N_frames] of [70, 2] image-pixel kpts, or None
+                           #   (auto-validation projection → points2d.json)
+    all_anat        = []   # [N_frames] of [73, 3] anatomical marker positions
+                           #   (mesh vertices) camera-frame, or None → overlay
+    all_focal       = []   # [N_frames] focal length (px), or None
     all_cam_t       = []   # [N_frames] of [3], or None
+
+    # Markerset anatomique (73 marqueurs virtuels = index vertex du mesh MHR)
+    # pour l'overlay interactif projeté (points2d.json, style Mesh2Sim).
+    _anat_ms = _load_anatomical_markerset()
+    if _anat_ms is not None:
+        _anat_names, _anat_vidx, _anat_regions, _anat_bodies = _anat_ms
+    else:
+        _anat_names = _anat_vidx = _anat_regions = _anat_bodies = None
+        print("  [points2d] correspondence_synkro.json introuvable → overlay 3D désactivé")
     all_verts       = []   # [N_frames] of [18439, 3] or None  (for mesh GLB)
     all_joint_coords = []  # [N_frames] of [127, 3] camera-space joint coords, or None
     all_raw_outputs = []   # for video_outputs.json
@@ -524,6 +852,9 @@ def main(args):
             writer.write(frame_bgr)
             timestamps.append(frame_idx / fps)
             all_kpts_raw.append(None)
+            all_kpts_2d.append(None)
+            all_anat.append(None)
+            all_focal.append(None)
             all_cam_t.append(None)
             all_verts.append(None)
             all_joint_coords.append(None)
@@ -658,6 +989,9 @@ def main(args):
                 writer.write(frame_bgr)
                 timestamps.append(frame_idx / fps)
                 all_kpts_raw.append(None)
+                all_kpts_2d.append(None)
+                all_anat.append(None)
+                all_focal.append(None)
                 all_cam_t.append(None)
                 all_verts.append(None)
                 all_joint_coords.append(None)
@@ -761,6 +1095,20 @@ def main(args):
             else:
                 all_kpts_raw.append(None)
                 all_cam_t.append(None)
+            # Keypoints 2D projetés (pixels image) → auto-validation projection.
+            k2 = person.get("pred_keypoints_2d")       # [70, 2] pixels, ou None
+            if k2 is not None and not np.any(np.isnan(k2)):
+                all_kpts_2d.append(np.asarray(k2)[:, :2].copy())
+            else:
+                all_kpts_2d.append(None)
+            # Marqueurs anatomiques (73 index vertex du mesh) → overlay projeté.
+            all_focal.append(person.get("focal_length"))
+            _vrt = person.get("pred_vertices")          # [18439, 3] repère réseau
+            if (_anat_vidx is not None and _vrt is not None
+                    and not np.any(np.isnan(_vrt))):
+                all_anat.append(np.asarray(_vrt)[_anat_vidx].astype(np.float32).copy())
+            else:
+                all_anat.append(None)
             jc = person.get("pred_joint_coords")       # [127, 3] camera space
             if jc is not None and not np.any(np.isnan(jc)):
                 all_joint_coords.append(jc.copy())
@@ -775,6 +1123,9 @@ def main(args):
             hp = person.get("hand_pose_params");  all_hand_pose_params.append(np.asarray(hp).copy() if hp is not None else None)
         else:
             all_kpts_raw.append(None)
+            all_kpts_2d.append(None)
+            all_anat.append(None)
+            all_focal.append(None)
             all_cam_t.append(None)
             all_joint_coords.append(None)
             all_shape_params.append(None); all_scale_params.append(None)
@@ -872,8 +1223,9 @@ def main(args):
         else:
             all_verts.append(None)
 
-        vis_frame = draw_results_on_frame(frame_bgr, outputs, visualizer)
-        writer.write(vis_frame)
+        # On écrit la frame BRUTE (l'overlay Synkro est rendu en post-pass depuis
+        # points2d.json → markers_*_overlay.mp4). Fini l'ancien squelette cuit.
+        writer.write(frame_bgr)
 
         processed += 1
         avg_fps = 1.0 / (sum(inference_times) / len(inference_times))
@@ -888,6 +1240,53 @@ def main(args):
 
     cap.release()
     writer.release()
+
+    # points2d.json (overlay interactif front-end) — MARQUEURS ANATOMIQUES
+    # (73 marqueurs virtuels) projetés à l'écran, style Mesh2Sim, colorés par
+    # région. Alignés frame-pour-frame avec markers_*_skeleton.mp4. Écrit dans
+    # analytics/ (à côté de metrics.json), indépendant de --module.
+    if _anat_names is None:
+        # Pas de markerset → pas d'overlay : garde la vidéo brute sous le nom
+        # historique pour ne rien casser en aval.
+        try: os.replace(raw_vid_path, vid_path)
+        except OSError: pass
+    if _anat_names is not None:
+        try:
+            _label_set = {"HTOP", "C7", "RACR", "LACR", "XIPH", "RGTR", "LGTR",
+                          "RASI", "LASI", "RPSI", "LPSI", "RLEL", "RMEL", "LLEL",
+                          "LMEL", "RLFC", "RMFC", "LLFC", "LMFC", "RLMAL", "RMMAL",
+                          "LLMAL", "LMMAL", "RTOE", "LTOE", "RCAL", "LCAL"}
+            # Map nom keypoint mhr70 → id (pour projeter les centres articulaires).
+            _kpt_name_to_id = {v["name"]: v["id"]
+                               for v in mhr70_pose_info.get("keypoint_info", {}).values()}
+            pts2d_path = os.path.join(args.output_dir, "analytics", "points2d.json")
+            _nf, _nk, _ne, _err = write_points2d_json_3d(
+                all_anat, all_cam_t, all_focal, _anat_names, _anat_regions,
+                _label_set, width, height, out_fps, pts2d_path,
+                all_kpts_raw=all_kpts_raw, all_kpts_2d=all_kpts_2d,
+                kpt_name_to_id=_kpt_name_to_id)
+            _errmsg = (f"reproj médiane={_err:.2f}px" if _err is not None
+                       else "reproj n/a")
+            print(f"points2d.json → {_nf} frames × {_nk} points (marqueurs + JC) "
+                  f"+ {_ne} segments squelette ({width}x{height} @ {out_fps:.1f}fps, "
+                  f"offset_s=0, {_errmsg}) → {pts2d_path}")
+            # Overlay Synkro baké (nouveau) → markers_*_skeleton.mp4 (même nom
+            # qu'avant pour l'AWS), rendu depuis points2d.json sur la vidéo brute.
+            # La brute temporaire est supprimée si le rendu réussit.
+            try:
+                _no = render_overlay_video(pts2d_path, raw_vid_path, vid_path)
+                print(f"overlay Synkro → {vid_path} ({_no} frames)")
+                if os.path.isfile(vid_path) and os.path.getsize(vid_path) > 0:
+                    try: os.remove(raw_vid_path)
+                    except OSError: pass
+            except Exception as _eo:
+                print(f"WARN: overlay baké échec ({_eo}) — fallback vidéo brute")
+                try: os.replace(raw_vid_path, vid_path)  # au moins la brute sous le bon nom
+                except OSError: pass
+        except Exception as _e:
+            print(f"WARN: points2d.json (3D) échec — {_e}")
+            try: os.replace(raw_vid_path, vid_path)  # pas de points2d → garde la brute
+            except OSError: pass
 
     print(f"\nDone! {processed} frames processed.")
     if inference_times:
@@ -917,6 +1316,22 @@ def main(args):
                     all_shape_params, all_scale_params,
                     all_expr_params, all_body_pose_params,
                 )
+                # Sauvegarde des betas morpho verrouillés (ajout de sortie pur).
+                # Vecteur 73 = [identité(45), scale(28)] — c'est exactement ce
+                # qu'attend Mesh2Marker pour générer un .osim à la morphologie
+                # du sujet (marqueurs posés sur SA peau).
+                try:
+                    _bs = locked.get("shape_params"); _bsc = locked.get("scale_params")
+                    if _bs is not None and _bsc is not None:
+                        _betas_path = os.path.join(args.output_dir, "_shape_betas.npz")
+                        np.savez(_betas_path,
+                                 betas73=np.concatenate([np.asarray(_bs).ravel(),
+                                                         np.asarray(_bsc).ravel()]),
+                                 shape_params=np.asarray(_bs).ravel(),
+                                 scale_params=np.asarray(_bsc).ravel())
+                        print(f"[shape_lock] betas → {_betas_path}")
+                except Exception as _e:
+                    print(f"[shape_lock] sauvegarde betas échouée: {_e}")
                 per_frame_pose = []
                 for i in range(len(all_body_pose_params)):
                     if (all_body_pose_params[i] is None
@@ -1048,7 +1463,25 @@ def main(args):
                                           "d3.jump")
     _auto_stationary = args.module in ("d3.squat", "d3.sit_to_stand",
                                           "d3.jump", "d3.cycling")
+    # MODE TAPIS AUTO : dès qu'une vitesse tapis est fournie (token tm<kmh>) sur
+    # course/marche, le sujet est EN PLACE → --stationary récupère l'oscillation
+    # verticale (rebond) via l'injection cam_t.Y, sinon le bassin reste plat et
+    # ça "glisse" au lieu de courir. L'anti-skate est désactivé en aval (le pied
+    # recule avec la bande, il DOIT glisser). Le stride est déjà calculé via
+    # vitesse × temps d'appui côté module.
+    _is_treadmill = (getattr(args, "treadmill_speed", None) is not None
+                     and args.module in ("d3.running", "d3.gait"))
+    if _is_treadmill:
+        _auto_stationary = True
+        print(f"  [mode tapis] vitesse {args.treadmill_speed} m/s → --stationary "
+              f"auto (rebond vertical) + anti-skate OFF (pied glisse avec la bande)")
     _auto_lock_vertical = args.module == "d3.cycling"
+    # Tests RTS unipodaux : single_leg_squat (statique pied au sol) et
+    # single_leg_hop (sauts avec vol). L'ancrage conscient du contact gère les
+    # deux — bassin qui descend en SLS, vol préservé en hop — sans le pré-réglage
+    # feet_anchor/stationary qui casserait la phase de vol.
+    _auto_contact_anchor = args.module in ("d3.single_leg_squat",
+                                            "d3.single_leg_hop")
     _stationary_effective = args.stationary or _auto_stationary
     # Running/gait/sprint : feet peuvent lever naturellement → clamp désactivé
     if args.module in ("d3.running", "d3.gait", "d3.sprint_start"):
@@ -1066,6 +1499,8 @@ def main(args):
         apply_body_vertical=_apply_body_vertical,
         lock_vertical=args.lock_vertical,
         lock_lateral=args.lock_lateral or _auto_lock_lateral,
+        contact_anchor=args.contact_anchor or _auto_contact_anchor,
+        fps=out_fps,
     )
 
     # 2b. Spine-based forward-lean correction (runs after floor-plane rotation above).
@@ -1145,6 +1580,24 @@ def main(args):
         markers_body, _ = converter.convert(
             kpts_opensim, include_derived=True, body_only=True
         )
+
+    # ── Anti-glisse pied : fige le XZ des marqueurs pieds pendant le contact,
+    # sur le TRC FINAL (markerset Flodelaplace). Le TRC anti-slidé nourrit
+    # ensuite IK + retargeting avatar → post-IK et avatar déjà anti-slidés (pas
+    # de lavage par l'IK). ACTIVÉ PAR DÉFAUT (indépendant de --contact_anchor,
+    # qui lui gère l'ancrage vertical du bassin) : dès qu'un pied touche le sol,
+    # il ne doit pas déraper. Désactivable via --no_anti_foot_skate.
+    _antiskate_shifts = None
+    _anti_skate_on = (not getattr(args, "no_anti_foot_skate", False)) or args.contact_anchor
+    # Mode tapis : le pied recule AVEC la bande → il DOIT glisser. On force
+    # l'anti-skate OFF (sauf si --contact_anchor explicitement demandé).
+    if _is_treadmill and not args.contact_anchor:
+        _anti_skate_on = False
+    if _anti_skate_on and marker_names is not None:
+        from sam_3d_body.export.coordinate_transform import anti_foot_skate_markers
+        markers_array, _antiskate_shifts = anti_foot_skate_markers(
+            markers_array, marker_names, fps=out_fps)
+        print("  [anti-skate] gel XZ des pieds en contact appliqué au TRC final")
 
     # ── --feet_anchor : shift global per-frame pour que le midpoint des
     # pieds reste à sa position médiane sur toute la vidéo. Translate tout
@@ -1323,6 +1776,8 @@ def main(args):
                 apply_body_vertical=not args.floor_seated,
                 lock_vertical=args.lock_vertical,
                 lock_lateral=args.lock_lateral or _auto_lock_lateral,
+                contact_anchor=args.contact_anchor or _auto_contact_anchor,
+                fps=out_fps,
             )
 
             # Spine lean correction
@@ -1534,6 +1989,33 @@ def main(args):
             calib_ts, calib_te, f_s, f_e = _detect_static_window(kpts_opensim, out_fps)
             print(f"  [calib] quietest window: frames {f_s}-{f_e}  ({calib_ts:.2f}-{calib_te:.2f}s)")
 
+        # OPT-IN : facteurs d'échelle depuis les JOINTS du rig MHR au lieu des
+        # distances entre marqueurs de peau (immunisé à la corpulence).
+        # Cf. sam_3d_body/export/mhr_segment_scale.py. Défaut = méthode
+        # historique (mesures), inchangée.
+        _manual_scales = None
+        if getattr(args, "scale_from_mhr_joints", False):
+            try:
+                from sam_3d_body.export.mhr_segment_scale import (
+                    segment_scales_from_joints, subject_joints_from_frames)
+                # ⚠️ Utiliser `jcoords_opensim` (sortie de transform()) et NON
+                # `all_joint_coords` : ces derniers sont les joints BRUTS de
+                # l'inférence, à l'échelle MHR (~11 % compressée). transform()
+                # applique `jc = jc * scale` avec le scale dérivé de
+                # --person_height → les joints sont alors à la TAILLE RÉELLE,
+                # et le ratio vs le template MHR donne directement le bon
+                # facteur, sans correction a posteriori.
+                _js = subject_joints_from_frames(jcoords_opensim)
+                if _js is None:
+                    print("  [scale MHR] pas assez de frames avec joints → "
+                          "fallback sur les mesures de marqueurs.")
+                else:
+                    _manual_scales = segment_scales_from_joints(_js)
+                    _shown = {k: round(v[0], 4) for k, v in sorted(_manual_scales.items())}
+                    print(f"  [scale MHR] facteurs depuis les joints du rig : {_shown}")
+            except Exception as _e:
+                print(f"  [scale MHR] échec ({_e}) → fallback sur les mesures.")
+
         print(f"  Scaling model     → {osim_path}  (mass={subject_mass:.1f} kg, height={subject_height:.2f} m)")
         scale_ok = run_scale_tool(
             model_path=osim_path,
@@ -1545,6 +2027,7 @@ def main(args):
             calibration_t_start=calib_ts,
             calibration_t_end=calib_te,
             marker_placer=getattr(args, "marker_placer", False),
+            manual_scales=_manual_scales,
         )
         if not scale_ok:
             print("  WARNING: Scale Tool failed – running IK on unscaled model.")
@@ -1671,13 +2154,19 @@ def main(args):
         #                 premières frames (assumées standing) appliqué constant.
         #                 Évite que le mesh soit way below ground quand il y a
         #                 pas de ground alignment per_frame.
-        _glb_ground_mode = "per_frame" if _apply_floor else "constant_from_calib"
+        # contact_anchor et --floor produisent tous deux des offsets Y PER-FRAME
+        # (stockés dans _last_ground_offsets_m) → le mesh doit les rejouer en
+        # mode per_frame, sinon il reste centré au bassin (mesh figé) alors que
+        # l'anatomical descend.
+        _glb_ground_mode = ("per_frame"
+                            if (_apply_floor or args.contact_anchor)
+                            else "constant_from_calib")
         # Compute shared calib offset depuis les kpts (= référence biomécanique
         # pieds) pour assurer que mesh + kpts segments + joints partagent le
         # même Y zero dans le GLB final. Utilisé en mode constant_from_calib
-        # (no --floor). Pour per_frame (--floor) l'override est ignoré.
+        # (no --floor). Pour per_frame (--floor / contact_anchor) l'override est ignoré.
         _shared_offset_m = None
-        if not _apply_floor:
+        if not _apply_floor and not args.contact_anchor:
             # Fix Y offset mesh vs anatomical (2026-07-08) : on réutilise
             # EXACTEMENT la valeur calculée par transform() (stockée dans
             # _last_constant_offset_m). Zéro écart mesh/anatomical.
@@ -1718,6 +2207,23 @@ def main(args):
                 if jc_world[i] is not None:
                     jc_world[i][:, 0] += dxz[0]
                     jc_world[i][:, 2] += dxz[1]
+        # Anti-skate : applique le MÊME shift XZ (en mètres) au mesh GLB pour
+        # qu'il suive le TRC anti-slidé (sinon le mesh dérape alors que le
+        # squelette est ancré).
+        if _antiskate_shifts is not None:
+            for i in range(len(verts_world)):
+                if i >= len(_antiskate_shifts):
+                    break
+                sx, sz = float(_antiskate_shifts[i][0]), float(_antiskate_shifts[i][1])
+                if verts_world[i] is not None:
+                    verts_world[i][:, 0] += sx
+                    verts_world[i][:, 2] += sz
+                if kpts_world[i] is not None:
+                    kpts_world[i][:, 0] += sx
+                    kpts_world[i][:, 2] += sz
+                if jc_world[i] is not None:
+                    jc_world[i][:, 0] += sx
+                    jc_world[i][:, 2] += sz
         # Le writer attend des verts en frame caméra (il fait son X/Y flip).
         # Nos verts sont DÉJÀ en world OpenSim → on signale verts_in_world=True
         # pour que le writer skip son flip et ne touche pas notre repère.
@@ -1729,41 +2235,45 @@ def main(args):
                        body_only=body_only,
                        verts_in_world=True)
 
-        # Separate anatomical-bone GLB (in OpenSim frame, animated by IK .mot)
-        if ik_ok and os.path.isfile(osim_path) and os.path.isfile(ik_mot_path):
-            anat_glb = os.path.join(args.output_dir, f"{prefix}_anatomical.glb")
-            print(f"  Writing anatomical GLB → {anat_glb}")
-            from sam_3d_body.export.opensim_exporter import write_anatomical_glb
-            # Alignement anatomical/mesh (fix 2026-07-08) :
-            # L'anatomical est natif (via IK sur TRC déjà shifté par transform()).
-            # Le mesh est shifté par override_constant_offset_m = _last_constant_offset_m.
-            # Ces deux références se retrouvent au MÊME repère si on n'ajoute PAS
-            # de y_offset supplémentaire à l'anatomical.
-            # L'ancien y_offset = -_shared_offset_m compensait un bug de rotation
-            # MoGe (Y-UP conv) qui n'existe plus depuis le fix Y-DOWN.
-            # Env var ANAT_Y_OFFSET_M pour override manuel si régression.
-            _anat_y_offset = float(os.environ.get("ANAT_Y_OFFSET_M", "0.0"))
-            write_anatomical_glb(anat_glb, osim_path, ik_mot_path,
-                                 y_offset_m=_anat_y_offset)
-
-            # Derived clinical angles : ajoute 11 colonnes au .mot
-            # (knee_valgus, knee_rotation, ankle_rotation, foot_progression
-            # × R/L + trunk_flexion/lean_lateral/rotation). Réutilise le
-            # body_transforms.json déjà calculé pour l'anatomical GLB —
-            # négligeable en coût supplémentaire (juste de la géométrie).
-            from sam_3d_body.export.clinical_angles import add_clinical_angles_to_mot
-            body_tf_json = os.path.join(
-                args.output_dir,
-                f"{os.path.splitext(os.path.basename(osim_path))[0]}_body_transforms.json",
-            )
-            try:
-                n_added = add_clinical_angles_to_mot(ik_mot_path, body_tf_json)
-                if n_added:
-                    print(f"  Clinical angles    → {n_added} colonnes ajoutées au .mot")
-            except Exception as err:
-                print(f"  [clinical_angles] failed silently: {err}")
         # gltfpack disabled: incompatible with viewer (KHR_mesh_quantization breaks morph targets)
         # _compress_glb(mesh_glb)
+
+    # NOTE: découplé de --no_mesh_glb (2026-08). Ce bloc ne dépend que du
+    # .osim scalé + .mot IK : le désactiver avec le mesh supprimait aussi le
+    # GLB anatomique ET les 11 colonnes d'angles cliniques du .mot.
+    # Separate anatomical-bone GLB (in OpenSim frame, animated by IK .mot)
+    if ik_ok and os.path.isfile(osim_path) and os.path.isfile(ik_mot_path):
+        anat_glb = os.path.join(args.output_dir, f"{prefix}_anatomical.glb")
+        print(f"  Writing anatomical GLB → {anat_glb}")
+        from sam_3d_body.export.opensim_exporter import write_anatomical_glb
+        # Alignement anatomical/mesh (fix 2026-07-08) :
+        # L'anatomical est natif (via IK sur TRC déjà shifté par transform()).
+        # Le mesh est shifté par override_constant_offset_m = _last_constant_offset_m.
+        # Ces deux références se retrouvent au MÊME repère si on n'ajoute PAS
+        # de y_offset supplémentaire à l'anatomical.
+        # L'ancien y_offset = -_shared_offset_m compensait un bug de rotation
+        # MoGe (Y-UP conv) qui n'existe plus depuis le fix Y-DOWN.
+        # Env var ANAT_Y_OFFSET_M pour override manuel si régression.
+        _anat_y_offset = float(os.environ.get("ANAT_Y_OFFSET_M", "0.0"))
+        write_anatomical_glb(anat_glb, osim_path, ik_mot_path,
+                             y_offset_m=_anat_y_offset)
+
+        # Derived clinical angles : ajoute 11 colonnes au .mot
+        # (knee_valgus, knee_rotation, ankle_rotation, foot_progression
+        # × R/L + trunk_flexion/lean_lateral/rotation). Réutilise le
+        # body_transforms.json déjà calculé pour l'anatomical GLB —
+        # négligeable en coût supplémentaire (juste de la géométrie).
+        from sam_3d_body.export.clinical_angles import add_clinical_angles_to_mot
+        body_tf_json = os.path.join(
+            args.output_dir,
+            f"{os.path.splitext(os.path.basename(osim_path))[0]}_body_transforms.json",
+        )
+        try:
+            n_added = add_clinical_angles_to_mot(ik_mot_path, body_tf_json)
+            if n_added:
+                print(f"  Clinical angles    → {n_added} colonnes ajoutées au .mot")
+        except Exception as err:
+            print(f"  [clinical_angles] failed silently: {err}")
 
     # Write processing report (matches SAM3D-OpenSim convention)
     report_path = os.path.join(args.output_dir, "processing_report.json")
@@ -1845,6 +2355,16 @@ OpenSim workflow:
             subj_info["age"] = args.age
         if args.sex is not None:
             subj_info["sex"] = args.sex
+        if args.module == "d3.cycling":
+            # Position cycliste → stratum de normes (road=performance, tt, comfort).
+            # Évite de flaguer à tort coude ~90° / CdA bas en position chrono.
+            subj_info["cycling_position"] = args.cycling_position
+            subj_info["use_case"] = {"road": "performance", "tt": "tt",
+                                     "comfort": "comfort"}[args.cycling_position]
+            # Côté caméra (vue 3/4) → neutralise les angles du membre occulté.
+            # Vide = auto-détection dans le module (orientation du torse).
+            if args.camera_side:
+                subj_info["camera_side"] = args.camera_side
         subj_json = os.path.join(args.output_dir, "subject_info.json")
         with open(subj_json, "w") as f:
             json.dump(subj_info, f, indent=2)
@@ -1859,6 +2379,10 @@ OpenSim workflow:
                    "--export-pdf"]
         if args.treadmill_speed is not None:
             cli_cmd += ["--treadmill-speed", str(args.treadmill_speed)]
+        if getattr(args, "hop_type", None):
+            cli_cmd += ["--hop-type", args.hop_type]
+        if getattr(args, "leg", None):
+            cli_cmd += ["--leg", args.leg]
         print(f"\n[analytics] Running: {' '.join(cli_cmd)}")
         try:
             _sp.run(cli_cmd, check=True)
@@ -1914,6 +2438,15 @@ if __name__ == "__main__":
                              "positions don't match the subject's mesh-picked landmarks. "
                              "Default OFF — diagnose raw placement errors first, then turn "
                              "on to clean up IK residuals.")
+    parser.add_argument("--scale_from_mhr_joints", action="store_true", default=False,
+                        help="MODE EXPÉRIMENTAL : calcule les facteurs d'échelle du "
+                             "ScaleTool depuis les JOINTS du rig MHR (127) au lieu des "
+                             "distances entre marqueurs de peau. Les joints du rig ne "
+                             "répondent qu'au bloc 'scale' de la base de forme : les "
+                             "longueurs d'os sont donc immunisées à la corpulence, alors "
+                             "qu'une mesure sur la peau allonge les os d'un sujet "
+                             "corpulent. Porté de Mesh2Marker (segment_scale.py). "
+                             "Défaut OFF = méthode historique par mesures.")
     parser.add_argument("--target_fps", type=float, default=0,
                         help="Process at this FPS (0=all frames, default=0 = no skipping)")
     parser.add_argument("--max_frames", type=int, default=0,
@@ -1966,6 +2499,11 @@ if __name__ == "__main__":
                              "step wall time. Pass this flag locally when tuning markers.")
     parser.add_argument("--floor_moge", action="store_true",
                         help="Estimate floor plane from MoGe depth on the first video frame and use its camera-pitch angle to correct forward lean. Requires MoGe to be available.")
+    parser.add_argument("--contact_anchor", action="store_true",
+                        help="Ancrage sol conscient du contact : re-ancre le pied en contact "
+                             "soutenu (squat → bassin descend) mais préserve la phase de vol "
+                             "(course/saut). Unifie et remplace --floor/défaut. Recommandé pour "
+                             "avatars + mouvements libres. (Opt-in en cours de validation.)")
     parser.add_argument("--person_height", type=float, default=None,
                         help="Known person height in metres (e.g. 1.69). Scales all 3D output "
                              "so the skeleton height matches this value. Applied to all persons "
@@ -2077,7 +2615,8 @@ if __name__ == "__main__":
     parser.add_argument("--module", default=None,
                         choices=[None, "d3.running", "d3.gait", "d3.squat",
                                  "d3.jump", "d3.sit_to_stand", "d3.cycling",
-                                 "d3.sprint_start"],
+                                 "d3.sprint_start", "d3.single_leg_hop",
+                                 "d3.single_leg_squat"],
                         help="Après SAM3D, appelle synkro-analytics avec ce module. "
                              "d3.running/gait → GaitDynamics GRF. Autres → Newton-CoM GRF. "
                              "Écrit metrics.json + report.html/pdf dans le dossier output.")
@@ -2093,5 +2632,28 @@ if __name__ == "__main__":
     parser.add_argument("--treadmill_speed", type=float, default=None,
                         help="Vitesse tapis (m/s) — pour --module d3.running/gait sur tapis. "
                              "Laisser vide pour overground.")
+    parser.add_argument("--cycling_position", default="road",
+                        choices=["road", "tt", "comfort"],
+                        help="Position cycliste (module d3.cycling) — bascule le jeu de "
+                             "normes coude/tronc/épaule/aéro. 'road' = course cocottes/drops "
+                             "(défaut), 'tt' = contre-la-montre/prolongateurs (coude ~90-105°, "
+                             "CdA bas = optimal, pas anormal), 'comfort' = position droite.")
+    parser.add_argument("--camera_side", default=None, choices=[None, "R", "L"],
+                        help="Côté près de la caméra en vue 3/4 (module d3.cycling). "
+                             "Le membre opposé (occulté au bas du pédalier) voit ses angles "
+                             "genou/cheville neutralisés pour éviter un faux red flag. "
+                             "Laisser vide = auto-détection par l'orientation du torse.")
+    parser.add_argument("--no_anti_foot_skate", action="store_true",
+                        help="Désactive l'anti-glisse du pied au contact (activé PAR DÉFAUT). "
+                             "L'anti-glisse fige la position XZ du pied pendant qu'il touche le "
+                             "sol (indépendant de --contact_anchor qui, lui, gère aussi l'ancrage "
+                             "vertical du bassin). Toujours utile dès qu'il y a contact au sol.")
+    parser.add_argument("--hop_type", default=None,
+                        choices=[None, "single", "triple", "crossover", "timed6m"],
+                        help="Type de saut pour d3.single_leg_hop (RTS) : single (défaut) / "
+                             "triple / crossover / timed6m. Relayé à synkro-analytics.")
+    parser.add_argument("--leg", default=None, choices=[None, "R", "L"],
+                        help="Jambe testée pour les tests unipodaux RTS (single_leg_hop/squat). "
+                             "Vide = auto-détection. Une vidéo = une jambe ; LSI agrégé côté app.")
     args = parser.parse_args()
     main(args)

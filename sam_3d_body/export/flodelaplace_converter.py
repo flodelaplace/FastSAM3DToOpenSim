@@ -1,7 +1,7 @@
 """
 MHR → flodelaplace XIPH mocap markerset converter (v2).
 
-Reads `assets/correspondence_synkro.json` (produced by Mesh2Marker) which maps
+Reads `assets/correspondence_sole.json` (produced by Mesh2Marker) which maps
 each marker name to ONE MHR mesh vertex index (the anatomical landmark on the
 template mesh, frame-invariant via MHR's fixed topology).
 
@@ -26,7 +26,7 @@ from typing import List, Tuple
 import numpy as np
 
 _ASSETS = Path(__file__).resolve().parents[2] / "assets"
-_CORRESPONDENCE_JSON = _ASSETS / "correspondence_synkro.json"
+_CORRESPONDENCE_JSON = _ASSETS / "correspondence_sole.json"
 
 
 def load_correspondence(path: Path | str | None = None) -> dict:
@@ -51,25 +51,26 @@ class FlodelaplaceConverter:
             "opensim_model": data.get("opensim_model"),
             "marker_set": data.get("marker_set"),
         }
-        # ordered list of (name, mhr_vertex_idx, opensim_body) — preserves
+        # ordered list of (name, [mhr_vertex_idx, ...], opensim_body) — preserves
         # the file's marker order, which we keep stable in the TRC output.
-        self._markers: List[Tuple[str, int, str]] = []
+        # Un marqueur peut référencer PLUSIEURS vertices : sa position est alors
+        # le CENTROÏDE du patch (contrat de la correspondance). C'est le cas des
+        # marqueurs SOLE de Mesh2Marker (12-15 vertices chacun) : moyenner un
+        # patch est plus stable qu'un vertex isolé sur une surface plane.
+        self._markers: List[Tuple[str, List[int], str]] = []
         for m in data["markers"]:
             verts = m["mhr_vertices"]
             if not verts:
                 raise ValueError(f"Marker {m['name']!r} has empty mhr_vertices")
-            # Use the first listed vertex. If more than one is provided, the
-            # contract says the marker is the centroid; we keep it simple here
-            # because every entry in correspondence_synkro.json has exactly 1.
-            if len(verts) != 1:
-                raise NotImplementedError(
-                    f"Marker {m['name']!r} has {len(verts)} mhr_vertices — "
-                    "centroid mode not implemented yet."
-                )
-            self._markers.append((m["name"], int(verts[0]), m["opensim_body"]))
+            self._markers.append(
+                (m["name"], [int(v) for v in verts], m["opensim_body"]))
 
         self.marker_names: List[str] = [n for n, _, _ in self._markers]
-        self.vertex_indices: dict[str, int] = {n: v for n, v, _ in self._markers}
+        # vertex_indices garde le PREMIER vertex (compat : plusieurs appelants
+        # attendent un entier). Le centroïde vit dans _marker_vertex_lists.
+        self.vertex_indices: dict[str, int] = {n: v[0] for n, v, _ in self._markers}
+        self._marker_vertex_lists: dict[str, List[int]] = {
+            n: v for n, v, _ in self._markers}
         self.opensim_body: dict[str, str] = {n: b for n, _, b in self._markers}
 
     # ── API back-compat with the legacy converter ──────────────────────────
@@ -90,8 +91,20 @@ class FlodelaplaceConverter:
         single = vertices_3d.ndim == 2
         if single:
             vertices_3d = vertices_3d[np.newaxis]
-        idxs = np.asarray([v for _, v, _ in self._markers], dtype=np.int64)
-        out = vertices_3d[:, idxs, :]
+        # Cas courant (1 vertex par marqueur) : indexation vectorisée directe.
+        # Sinon : centroïde du patch. On garde le chemin rapide quand tous les
+        # marqueurs sont mono-vertex pour ne rien changer aux perfs existantes.
+        if all(len(v) == 1 for _, v, _ in self._markers):
+            idxs = np.asarray([v[0] for _, v, _ in self._markers], dtype=np.int64)
+            out = vertices_3d[:, idxs, :]
+        else:
+            out = np.empty((vertices_3d.shape[0], len(self._markers), 3),
+                           dtype=vertices_3d.dtype)
+            for k, (_, verts, _) in enumerate(self._markers):
+                if len(verts) == 1:
+                    out[:, k, :] = vertices_3d[:, verts[0], :]
+                else:
+                    out[:, k, :] = vertices_3d[:, verts, :].mean(axis=1)
         return out[0] if single else out
 
     def convert(
@@ -131,6 +144,6 @@ class FlodelaplaceConverter:
 # Keep a thin wrapper that returns {name: idx} for the new correspondence file.
 
 def load_anatomical_vertex_indices() -> dict[str, int]:
-    """Return {marker_name: mhr_vertex_idx} from correspondence_synkro.json."""
+    """Return {marker_name: mhr_vertex_idx} from correspondence_sole.json."""
     data = load_correspondence()
     return {m["name"]: int(m["mhr_vertices"][0]) for m in data["markers"]}

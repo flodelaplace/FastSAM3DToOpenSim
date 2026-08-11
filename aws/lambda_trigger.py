@@ -29,6 +29,13 @@ Module tokens (activent l'auto-analytics post-SAM3D) :
     cmj / jump           --module d3.jump
     sts                  --module d3.sit_to_stand
     cycling              --module d3.cycling
+    slh                  --module d3.single_leg_hop   (RTS post-LCA, LSI)
+    sls                  --module d3.single_leg_squat (RTS valgus unipodal)
+
+Tokens RTS (tests unipodaux — une vidéo = une jambe, LSI agrégé côté app) :
+    single|triple|crossover|timed6m   type de saut (slh) : --hop_type
+    legR | legL          jambe testée (slh/sls) : --leg
+    Ex: hop_marie__h172_m64_sxF_slh_triple_legR.mp4  → triple hop jambe D
 
 Flags avancés (auto-dispatch par --module rend ces flags souvent redondants) :
     st                   --stationary   (auto pour cmj/squat/sts/cycling)
@@ -36,6 +43,12 @@ Flags avancés (auto-dispatch par --module rend ces flags souvent redondants) :
     floor                --floor        (mode aggressive : per-frame ground align)
     lv                   --lock-vertical
     bikefit              MACRO = st + lv + no_lean_fix (home-trainer)
+    camR | camL          --camera_side (module cycling) : côté près caméra en
+                         vue 3/4 (neutralise le membre occulté). Vide = auto.
+    tt|road|comfort      --cycling_position (module cycling) : bascule les normes
+                         coude/tronc/épaule/aéro. road = défaut (course cocottes/
+                         drops), tt = contre-la-montre (coude ~90-105°, CdA bas =
+                         optimal), comfort = position droite.
 
 Examples:
     squat_jean__h185_m85_a30_squat.mp4                     → auto d3.squat
@@ -43,6 +56,7 @@ Examples:
     running_cedric__h178_m70_a35_sxM_run.mp4               → auto d3.running
     sts_diane__h165_m82_a65_sxF_cl_sts.mp4                 → auto d3.sit_to_stand
     bikefit_alex__h180_m75_a40_bikefit_cycling.mp4         → bikefit + cycling
+    titia_clm__h165_m55_a23_sxF_el_cycling_tt.mp4          → cycling position CLM
 """
 import json
 import os
@@ -72,11 +86,14 @@ FLAG_TOKENS = {"st", "com", "floor", "lv", "bikefit"}
 LEVEL_TOKENS = {"tr": "trained", "re": "recreational",
                 "cl": "clinical", "el": "elite"}
 # Module token → --module value (d3 par défaut pour SAM3D 3D pipeline)
+HOP_TYPE_TOKENS = {"single", "triple", "crossover", "timed6m"}  # single_leg_hop
 MODULE_TOKENS = {
     "run": "d3.running",
     "gait": "d3.gait",
     "sprint": "d3.sprint_start",
     "squat": "d3.squat",
+    "slh": "d3.single_leg_hop",     # RTS : single leg hop (LSI)
+    "sls": "d3.single_leg_squat",   # RTS : single leg squat (valgus)
     "cmj": "d3.jump",
     "jump": "d3.jump",
     "sts": "d3.sit_to_stand",
@@ -132,6 +149,10 @@ def parse_filename(basename):
     floor = False
     lock_vertical = False
     bikefit = False
+    cycling_position = None  # road (défaut) / tt / comfort → stratum normes vélo
+    camera_side = None       # camR / camL → --camera_side (vue 3/4 cyclisme)
+    hop_type = None          # single/triple/crossover/timed6m → single_leg_hop RTS
+    leg = None               # legR / legL → jambe testée (tests unipodaux RTS)
 
     for t in tokens:
         m = HEIGHT_RE.match(t)
@@ -202,6 +223,26 @@ def parse_filename(basename):
         if t == "bikefit":
             bikefit = True
             continue
+        if t in ("tt", "road", "comfort"):
+            if cycling_position is not None:
+                raise FilenameParseError(f"Duplicate cycling position token: '{t}'")
+            cycling_position = t
+            continue
+        if t in ("camR", "camL"):
+            if camera_side is not None:
+                raise FilenameParseError(f"Duplicate camera side token: '{t}'")
+            camera_side = t[-1]  # R / L
+            continue
+        if t in HOP_TYPE_TOKENS:
+            if hop_type is not None:
+                raise FilenameParseError(f"Duplicate hop type token: '{t}'")
+            hop_type = t
+            continue
+        if t in ("legR", "legL"):
+            if leg is not None:
+                raise FilenameParseError(f"Duplicate leg token: '{t}'")
+            leg = t[-1]  # R / L
+            continue
         raise FilenameParseError(f"Unknown token: '{t}'")
 
     if heights is None:
@@ -262,6 +303,42 @@ def parse_filename(basename):
             extra += ["--level", level]
         if treadmill_mps is not None:
             extra += ["--treadmill_speed", str(treadmill_mps)]
+        if cycling_position is not None:
+            if module != "d3.cycling":
+                raise FilenameParseError(
+                    f"Token position '{cycling_position}' réservé au module cycling."
+                )
+            extra += ["--cycling_position", cycling_position]
+        if camera_side is not None:
+            if module != "d3.cycling":
+                raise FilenameParseError(
+                    f"Token 'cam{camera_side}' réservé au module cycling."
+                )
+            extra += ["--camera_side", camera_side]
+        if hop_type is not None:
+            if module != "d3.single_leg_hop":
+                raise FilenameParseError(
+                    f"Token hop '{hop_type}' réservé au module 'slh' (single_leg_hop)."
+                )
+            extra += ["--hop_type", hop_type]
+        if leg is not None:
+            if module not in ("d3.single_leg_hop", "d3.single_leg_squat"):
+                raise FilenameParseError(
+                    f"Token 'leg{leg}' réservé aux tests unipodaux (slh/sls)."
+                )
+            extra += ["--leg", leg]
+    elif cycling_position is not None:
+        raise FilenameParseError(
+            f"Token position '{cycling_position}' nécessite le module 'cycling'."
+        )
+    elif camera_side is not None:
+        raise FilenameParseError(
+            f"Token 'cam{camera_side}' nécessite le module 'cycling'."
+        )
+    elif hop_type is not None or leg is not None:
+        raise FilenameParseError(
+            "Tokens hop/leg nécessitent un module RTS (slh/sls)."
+        )
 
     # Toujours activer --floor_moge (fix Y-DOWN 2026-07 : marche pour tous les
     # cas standard, auto-skip si MoGe échoue).
@@ -378,23 +455,23 @@ def _self_test():
     cases_ok = [
         ("squat_jean__h185.mp4",
          {"raw_name": "squat_jean",
-          "extra_args": "--person_height 1.85",
+          "extra_args": "--person_height 1.85 --floor_moge",
           "trim_start": "", "trim_end": ""}),
         ("cmj__h185_st_com.mp4",
          {"raw_name": "cmj",
-          "extra_args": "--person_height 1.85 --stationary --compute_com",
+          "extra_args": "--person_height 1.85 --stationary --compute_com --floor_moge",
           "trim_start": "", "trim_end": ""}),
         ("violon__h185_s3_e12.mp4",
          {"raw_name": "violon",
-          "extra_args": "--person_height 1.85",
+          "extra_args": "--person_height 1.85 --floor_moge",
           "trim_start": "3", "trim_end": "12"}),
         ("groupe__h185-170-180.mp4",
          {"raw_name": "groupe",
-          "extra_args": "--multi_person --person_heights 1.85,1.70,1.80 --run_ik_per_person --write_combined_trc",
+          "extra_args": "--multi_person --person_heights 1.85,1.70,1.80 --run_ik_per_person --write_combined_trc --floor_moge",
           "trim_start": "", "trim_end": ""}),
         ("grp__h185-170_st_com.mp4",
          {"raw_name": "grp",
-          "extra_args": "--multi_person --person_heights 1.85,1.70 --run_ik_per_person --write_combined_trc --stationary --compute_com",
+          "extra_args": "--multi_person --person_heights 1.85,1.70 --run_ik_per_person --write_combined_trc --stationary --compute_com --floor_moge",
           "trim_start": "", "trim_end": ""}),
         ("Squat.MP4__h185_e5.MOV", None),  # tests uppercase ext handling
     ]

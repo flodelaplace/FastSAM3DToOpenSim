@@ -40,20 +40,32 @@ from scipy.spatial.transform import Rotation as R
 # capture all 3 DOF (including axial rotation around the bone). Otherwise we
 # fall back to a 2-DOF swing-only rotation.
 MAKEHUMAN_BONE_TARGETS: dict[str, tuple[str, str, str | None, str | None]] = {
-    # Spine chain (2 DOF — no per-segment lateral markers)
-    "spine05":      (":midhip",   "c_spine0",   None,         None),
-    "spine04":      ("c_spine0",  "c_spine1",   None,         None),
-    "spine03":      ("c_spine1",  "c_spine2",   None,         None),
-    "spine02":      ("c_spine2",  "c_spine3",   None,         None),
+    # Spine chain — 3 DOF. La référence de twist est la ligne des hanches pour
+    # le rachis bas et la ligne des épaules pour le rachis haut : ça capture la
+    # rotation axiale réelle du tronc, ET surtout ça SUPPRIME le roll indéfini.
+    # Sans référence axiale (ancien 2 DOF) la rotation était l'arc minimal depuis
+    # la pose bind : correct debout (petit arc), mais dès que le sujet s'éloigne
+    # de la A-pose (allongé, pont fessier, décubitus) l'arc injecte un roll
+    # arbitraire qui vrille tout le haut du corps (les enfants héritent).
+    # aux_lat/aux_med sont ordonnés pour que (lat - med) pointe vers la GAUCHE
+    # du sujet, ce qui correspond au +X de l'avatar en bind (cf. bind_aux).
+    # La référence de twist glisse progressivement du bassin (ASIS/HJC) vers les
+    # épaules (ACR) → la rotation axiale du tronc se répartit sur la chaîne au
+    # lieu de se concentrer sur une seule vertèbre.
+    "spine05":      (":midhip",   "c_spine0",   "LHJC",       "RHJC"),
+    "spine04":      ("c_spine0",  "c_spine1",   ":slatL33",   ":slatR33"),
+    "spine03":      ("c_spine1",  "c_spine2",   ":slatL67",   ":slatR67"),
+    "spine02":      ("c_spine2",  "c_spine3",   "LACR",       "RACR"),
     # spine01 (top thoracic) disabled: applying c_spine3→C7 rotation on top of
     # the avatar's natural kyphosis doubled the curvature and pushed the chest
     # mesh forward, giving male avatars a visual "breast" bulge. Lets the
     # avatar's bind thoracic curve stay anatomical. spine02-05 still capture
     # the subject's lean.
-    # Neck / head (2 DOF)
+    # Neck / head — 3 DOF via la ligne des épaules (même raison que le rachis :
+    # sans référence axiale la tête se vrille dès que le sujet n'est pas debout).
     # neck01 disabled — see note in previous version.
-    "neck02":       ("c_neck",    "c_head",     None,         None),
-    "head":         ("c_head",    "HTOP",       None,         None),
+    "neck02":       ("c_neck",    "c_head",     "LACR",       "RACR"),
+    "head":         ("c_head",    "HTOP",       "LACR",       "RACR"),
     # Left arm
     # clavicle.L disabled — C7 marker too noisy.
     # 3 DOF for upperarm only. lowerarm stays at 2 DOF because its bone roll in
@@ -72,7 +84,7 @@ MAKEHUMAN_BONE_TARGETS: dict[str, tuple[str, str, str | None, str | None]] = {
     # Wrist L : flexion/extension via (LWrist_hand, LMiddle). Roll fixé par
     # LFAradius/LFAulna (mêmes aux que lowerarm02 et fingers → cohérent, pas
     # de conflit d'orientation entre palm et fingers).
-    "wrist.L":      ("LWrist_hand", "LMiddle",    "LFAradius", "LFAulna"),
+    "wrist.L":      ("LWrist_hand", ":LMCP",      "LFAradius", "LFAulna"),
     "finger1-1.L":  ("LWrist_hand", "LThumb",     None, None),
     # Metacarpals L 1-4 : gardés en bind pose (spread naturel du template
     # MakeHuman). Le retarget du metacarpal donne un roll indéfini (2-DOF) ou
@@ -84,19 +96,19 @@ MAKEHUMAN_BONE_TARGETS: dict[str, tuple[str, str, str | None, str | None]] = {
     # axes différents (wrist main = LWrist→LMCP, finger main = LMCP→LTip) crée
     # un décalage cumulé visible.
     "finger2-1.L":  ("LIndex",  "LIndexTip",  None, None),
-    "finger3-1.L":  ("LMiddle", "LMiddleTip", None, None),
-    "finger4-1.L":  ("LRing",   "LRingTip",   None, None),
+    "finger3-1.L":  (":LMiddle", ":LMiddleTip", None, None),
+    "finger4-1.L":  (":LRing",   ":LRingTip",   None, None),
     "finger5-1.L":  ("LPinky",  "LPinkyTip",  None, None),
     # Right arm
     "upperarm01.R": ("RACR",      "REJC",       "RLEL",       "RMEL"),
     "lowerarm01.R": ("REJC",      "RWrist_hand", None,        None),
     "lowerarm02.R": ("REJC",      "RWrist_hand", "RFAradius", "RFAulna"),
     # Right hand — même stratégie : wrist flexion + metacarpals bind + phalanges flex/ext roll fixé.
-    "wrist.R":      ("RWrist_hand", "RMiddle",    "RFAradius", "RFAulna"),
+    "wrist.R":      ("RWrist_hand", ":RMCP",      "RFAradius", "RFAulna"),
     "finger1-1.R":  ("RWrist_hand", "RThumb",     None, None),
     "finger2-1.R":  ("RIndex",  "RIndexTip",  None, None),
-    "finger3-1.R":  ("RMiddle", "RMiddleTip", None, None),
-    "finger4-1.R":  ("RRing",   "RRingTip",   None, None),
+    "finger3-1.R":  (":RMiddle", ":RMiddleTip", None, None),
+    "finger4-1.R":  (":RRing",   ":RRingTip",   None, None),
     "finger5-1.R":  ("RPinky",  "RPinkyTip",  None, None),
     # Left leg (3 DOF for upperleg + lowerleg, 2 DOF for foot)
     "upperleg01.L": ("LHJC",      "LKJC",       "LLFC",       "LMFC"),
@@ -240,6 +252,35 @@ _VIRTUAL_MARKERS: dict[str, tuple] = {
     "LWrist_hand": ("midpoint", "LFAradius", "LFAulna"),  # wrist = midpoint radius/ulna
     "RWrist_hand": ("midpoint", "RFAradius", "RFAulna"),
     "c_spine1":    ("midpoint", "c_spine0", "c_spine2"),
+    # Paires latérales INTERPOLÉES le long du rachis : direction mediolatérale
+    # mélangée entre la ligne du bassin (ASIS) et celle des épaules (ACR).
+    # Elles servent de référence de twist aux vertèbres intermédiaires pour
+    # répartir progressivement la rotation axiale du tronc. Sans elles, tout le
+    # twist se concentrerait entre deux vertèbres (pli visible : jusqu'à 39° sur
+    # un bird dog). Seule la DIFFÉRENCE L-R compte (le centre est arbitraire).
+    ":slatL33":    ("blend_lat", "LASI", "RASI", "LACR", "RACR", 0.33, 1.0),
+    ":slatR33":    ("blend_lat", "LASI", "RASI", "LACR", "RACR", 0.33, -1.0),
+    ":slatL67":    ("blend_lat", "LASI", "RASI", "LACR", "RACR", 0.67, 1.0),
+    ":slatR67":    ("blend_lat", "LASI", "RASI", "LACR", "RACR", 0.67, -1.0),
+    # --- Main : le markerset n'a que 5 marqueurs par main (Thumb, Index, Pinky
+    # + IndexTip, PinkyTip). Le rig visait "LMiddle"/"LRing" qui N'EXISTENT PAS
+    # → poignet, majeur et annulaire restaient FIGÉS en pose bind (3 doigts
+    # animés, 2 plantés = la main "bizarre").
+    # Centre de la rangée des MCP = axe long de la paume → axe principal du poignet.
+    ":LMCP":       ("midpoint", "LIndex", "LPinky"),
+    ":RMCP":       ("midpoint", "RIndex", "RPinky"),
+    # Majeur / annulaire reconstruits par interpolation latérale index↔auriculaire.
+    # forward_frac > 1 rallonge la pointe : la simple interpolation des tips
+    # sous-estime la longueur (l'auriculaire est nettement plus court).
+    # Valeurs anthropométriques approchées (majeur ≈ le plus long).
+    ":LMiddle":    ("interp", "LIndex", "LPinky", 0.33),
+    ":LRing":      ("interp", "LIndex", "LPinky", 0.67),
+    ":RMiddle":    ("interp", "RIndex", "RPinky", 0.33),
+    ":RRing":      ("interp", "RIndex", "RPinky", 0.67),
+    ":LMiddleTip": ("interp_forward", "LIndex", "LPinky", "LIndexTip", "LPinkyTip", 0.33, 1.25),
+    ":LRingTip":   ("interp_forward", "LIndex", "LPinky", "LIndexTip", "LPinkyTip", 0.67, 1.10),
+    ":RMiddleTip": ("interp_forward", "RIndex", "RPinky", "RIndexTip", "RPinkyTip", 0.33, 1.25),
+    ":RRingTip":   ("interp_forward", "RIndex", "RPinky", "RIndexTip", "RPinkyTip", 0.67, 1.10),
 }
 
 # Marker positions to OVERRIDE (not add) — used quand un marker existant
@@ -336,6 +377,22 @@ def _augment_trc_with_virtual_markers(
             tip_pos = (1.0 - lat_t) * positions[:, name_to_idx[tip_a], :] + \
                       lat_t * positions[:, name_to_idx[tip_b], :]
             new_pos = mcp_pos + forward_frac * (tip_pos - mcp_pos)
+        elif op == "blend_lat":
+            # Direction latérale interpolée entre deux paires (a = bas, b = haut).
+            # On renvoie un POINT tel que (L - R) = direction mélangée unitaire.
+            aL, aR, bL, bR = spec[1], spec[2], spec[3], spec[4]
+            w, sign = float(spec[5]), float(spec[6])
+            if any(m not in name_to_idx for m in (aL, aR, bL, bR)):
+                continue
+            a_dir = positions[:, name_to_idx[aL], :] - positions[:, name_to_idx[aR], :]
+            b_dir = positions[:, name_to_idx[bL], :] - positions[:, name_to_idx[bR], :]
+            a_dir = a_dir / (np.linalg.norm(a_dir, axis=1, keepdims=True) + 1e-12)
+            b_dir = b_dir / (np.linalg.norm(b_dir, axis=1, keepdims=True) + 1e-12)
+            blended = (1.0 - w) * a_dir + w * b_dir
+            blended = blended / (np.linalg.norm(blended, axis=1, keepdims=True) + 1e-12)
+            center = 0.5 * (positions[:, name_to_idx[aL], :]
+                            + positions[:, name_to_idx[aR], :])
+            new_pos = center + sign * 0.5 * blended
         else:
             raise ValueError(f"Unknown virtual marker op: {op!r}")
         extra_pos.append(new_pos)
@@ -692,7 +749,14 @@ def retarget_from_trc(
                                 elif ".R" in _name:
                                     bind_aux = np.array([1.0 if flip else -1.0, 0.0, 0.0])
                                 else:
-                                    bind_aux = None
+                                    # Os centraux (rachis, cou, tête) : pas de
+                                    # suffixe .L/.R. En bind MakeHuman la GAUCHE
+                                    # de l'avatar est +X (même convention que les
+                                    # membres .L non flippés), et les aux du
+                                    # rachis sont ordonnés lat-med = gauche sujet.
+                                    # Sans ce cas, bind_aux restait None → retour
+                                    # silencieux en 2 DOF (roll indéfini).
+                                    bind_aux = np.array([1.0, 0.0, 0.0])
                                 if bind_aux is not None and np.linalg.norm(aux_av) > 1e-6:
                                     target_frame = _make_frame(main_av, aux_av)
                                     bind_frame = _make_frame(bind_main, bind_aux)
@@ -868,6 +932,122 @@ def export_animated_glb(
 # Convenience one-shot
 # ---------------------------------------------------------------------------
 
+def ground_avatar_feet(
+    rig: AvatarRig,
+    result: RetargetResult,
+    trc_positions: np.ndarray,
+    marker_names: list[str],
+    fps: float = 30.0,
+    band_m: float = 0.05,
+    max_flight_s: float = 0.6,
+    ground_pct: float = 10.0,
+) -> float:
+    """Colle le pied d'appui de l'AVATAR au sol, sans casser la phase de vol.
+
+    Pourquoi : le retarget pilote l'avatar par le delta du bassin + des rotations
+    d'os. Comme les jambes de l'avatar n'ont PAS la longueur du sujet, l'erreur
+    ressort aux pieds : mesuré jusqu'à **8 cm** de dérive sur un pont fessier
+    (pieds du sujet plantés à 7 mm près, pieds de l'avatar qui montent de 8,4 cm).
+    Le grounding amont (floor_moge / align_to_ground / anti-skate) travaille sur
+    les MARQUEURS et ne peut pas voir ce décalage propre à l'avatar.
+
+    Principe (transposé de `coordinate_transform._contact_aware_ground`) :
+      - **contact** → on corrige la hauteur du root pour que le pied bas de
+        l'avatar suive exactement le pied bas du sujet ;
+      - **vol bref** (< max_flight_s) → on TIENT la correction (interpolation
+        décollage→réception) pour ne pas aplatir un saut.
+
+    La correction est une translation rigide du root : elle déplace le pied
+    d'exactement la même quantité, donc pas besoin d'itérer.
+    Retourne la correction médiane appliquée (m), 0.0 si non applicable.
+    """
+    name_to_local = {n: i for i, n in enumerate(rig.joint_names)}
+    foot_bones = [name_to_local[b] for b in ("foot.L", "foot.R") if b in name_to_local]
+    idx = {n: i for i, n in enumerate(marker_names)}
+    foot_marks = [idx[m] for m in ("LAJC", "RAJC") if m in idx]
+    root_idx = name_to_local.get(ROOT_BONE_NAME, -1)
+    if not foot_bones or not foot_marks or root_idx < 0:
+        return 0.0
+
+    T = result.local_quat.shape[0]
+    J = result.local_quat.shape[1]
+    # ordre topologique (parents avant enfants)
+    order, seen = [], [False] * J
+    def _dfs(j):
+        if seen[j]:
+            return
+        p = rig.joint_to_parent.get(j, -1)
+        if p >= 0 and not seen[p]:
+            _dfs(p)
+        seen[j] = True
+        order.append(j)
+    for j in range(J):
+        _dfs(j)
+
+    def _avatar_low_foot(t: int) -> float:
+        Mw = np.tile(np.eye(4), (J, 1, 1))
+        for j in order:
+            p = rig.joint_to_parent.get(j, -1)
+            tr = result.root_translation[t] if j == root_idx else rig.bind_local_t[j]
+            L = np.eye(4)
+            L[:3, :3] = R.from_quat(result.local_quat[t, j]).as_matrix()
+            L[:3, 3] = tr
+            Mw[j] = (Mw[p] if p >= 0 else np.eye(4)) @ L
+        return float(min(Mw[b][1, 3] for b in foot_bones))
+
+    av_y = np.array([_avatar_low_foot(t) for t in range(T)])
+    su_y = np.array([float(np.min(trc_positions[t, foot_marks, 1])) for t in range(T)])
+    finite = np.isfinite(av_y) & np.isfinite(su_y)
+    if not finite.any():
+        return 0.0
+
+    # 1) Suivi RELATIF : le pied de l'avatar suit le pied du sujet.
+    corr = (su_y - su_y[0]) - (av_y - av_y[0])
+    corr[~finite] = 0.0
+
+    # 2) Recalage ABSOLU : sans ça l'avatar garde la hauteur de bassin de sa pose
+    # bind (debout) même quand le sujet est au sol → il FLOTTE (mesuré : pied à
+    # 89,6 cm au lieu de 7,2 cm sur un pont fessier, soit ~83 cm en l'air).
+    # On vise la hauteur du pied de l'avatar en BIND (= avatar posé au sol), et
+    # on prend la MÉDIANE de l'écart sur les frames d'appui pour ne pas se caler
+    # sur une frame aberrante. C'est un offset constant : aucun mouvement ajouté.
+    foot_bind_y = float(min(rig.bind_world[b, 1, 3] for b in foot_bones))
+
+    # Phases de vol détectées sur le SUJET (source de vérité déjà groundée).
+    ground = float(np.nanpercentile(su_y[finite], ground_pct))
+    airborne = (su_y > ground + band_m) & finite
+    max_flight_frames = max(1, int(round(max_flight_s * fps)))
+    i = 0
+    while i < T:
+        if airborne[i]:
+            j = i
+            while j < T and airborne[j]:
+                j += 1
+            if (j - i) <= max_flight_frames:
+                # Vol bref → tenir la correction (pas de re-collage au sol).
+                lo = corr[i - 1] if i > 0 else 0.0
+                hi = corr[j] if j < T else lo
+                corr[i:j] = np.linspace(lo, hi, j - i)
+            # else : "vol" long = contact soutenu mal détecté → on corrige
+            i = j
+        else:
+            i += 1
+
+    # Offset absolu estimé sur les frames d'APPUI uniquement (pendant le vol le
+    # pied est légitimement en l'air, il ne doit pas tirer le calage vers le bas).
+    stance = finite & ~airborne
+    if not stance.any():
+        stance = finite
+    offset = foot_bind_y - float(np.median((av_y + corr)[stance]))
+    corr = corr + offset
+
+    result.root_translation[:, 1] += corr
+    med = float(np.median(np.abs(corr)))
+    print(f"  [avatar_retarget] grounding pieds : recalage absolu "
+          f"{offset * 100:+.1f} cm, correction médiane {med * 100:.1f} cm")
+    return med
+
+
 def stretch_torso_to_subject(
     rig: AvatarRig,
     trc_positions: np.ndarray,
@@ -932,6 +1112,7 @@ def generate_avatar_from_trc(
     avatar_glb_path: str | Path,
     out_path: str | Path,
     stretch_torso: bool = True,
+    ground_feet: bool = True,
 ) -> Path:
     rig = load_avatar_glb(avatar_glb_path)
     positions, marker_names, fps = load_trc(trc_path)
@@ -940,4 +1121,8 @@ def generate_avatar_from_trc(
         stretch_torso_to_subject(rig, positions, marker_names)
     result = retarget_from_trc(rig, positions, marker_names)
     result.fps = fps
+    if ground_feet:
+        # Le grounding amont porte sur les MARQUEURS ; celui-ci rattrape l'écart
+        # propre à l'avatar (longueurs de membres différentes du sujet).
+        ground_avatar_feet(rig, result, positions, marker_names, fps=fps)
     return export_animated_glb(rig, result, out_path)

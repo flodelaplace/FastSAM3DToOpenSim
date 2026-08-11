@@ -68,6 +68,17 @@ MARKER_WEIGHTS_FLODELAPLACE: dict[str, float] = {
     "RCAL": 1.5, "LCAL": 1.5,
     "RTOE": 1.5, "LTOE": 1.5,
     "RMT5": 1.0, "LMT5": 1.0,
+    # Semelle (modèle SOLE, 7 patchs par pied). Présents dans le TRC pour la
+    # DÉTECTION DE CONTACT au sol, mais volontairement EXCLUS de l'IK
+    # (poids 0) : ce sont des points de peau plantaire, ils écraseraient les
+    # repères osseux du pied si on les laissait contraindre la cinématique.
+    "SOLE_s1_r": 0.0, "SOLE_s1_l": 0.0,
+    "SOLE_s2_r": 0.0, "SOLE_s2_l": 0.0,
+    "SOLE_s3_r": 0.0, "SOLE_s3_l": 0.0,
+    "SOLE_s4_r": 0.0, "SOLE_s4_l": 0.0,
+    "SOLE_s5_r": 0.0, "SOLE_s5_l": 0.0,
+    "SOLE_s6_r": 0.0, "SOLE_s6_l": 0.0,
+    "SOLE_s7_r": 0.0, "SOLE_s7_l": 0.0,
 }
 
 # Scale Tool measurements using Rajagopal marker names — non-uniform per-axis.
@@ -287,6 +298,7 @@ def _write_scale_setup_xml(
     marker_placer: bool = False,
     placer_t_start: float | None = None,
     placer_t_end: float | None = None,
+    manual_scales: dict[str, tuple[float, float, float]] | None = None,
 ) -> None:
     if measurements is None:
         measurements = _SCALE_MEASUREMENTS
@@ -336,6 +348,57 @@ def _write_scale_setup_xml(
 
     meas_str = "\n".join(meas_xml_parts)
 
+    # Mode MANUEL (opt-in) : les facteurs viennent des joints du rig MHR
+    # (cf. mhr_segment_scale.py) au lieu des distances entre marqueurs de peau.
+    # On bascule le ModelScaler en `manualScale` + ScaleSet explicite ; le
+    # MeasurementSet est alors ignoré (on l'écrit vide pour rester lisible).
+    if manual_scales:
+        scale_objs = "\n".join(
+            f'\t\t\t\t\t<Scale name="{body}">\n'
+            f'\t\t\t\t\t\t<scales> {s[0]:.6f} {s[1]:.6f} {s[2]:.6f} </scales>\n'
+            f'\t\t\t\t\t\t<segment>{body}</segment>\n'
+            f'\t\t\t\t\t\t<apply>true</apply>\n'
+            f'\t\t\t\t\t</Scale>'
+            for body, s in sorted(manual_scales.items())
+        )
+        scale_set_xml = (
+            f'\t\t\t<ScaleSet>\n'
+            f'\t\t\t\t<objects>\n'
+            f'{scale_objs}\n'
+            f'\t\t\t\t</objects>\n'
+            f'\t\t\t</ScaleSet>'
+        )
+        if meas_xml_parts:
+            # MODE HYBRIDE : les facteurs manuels (joints du rig MHR, immunisés
+            # à la corpulence) couvrent le squelette ; les mesures marqueurs
+            # restantes couvrent ce que l'armature ne sait pas mesurer — la
+            # TÊTE en premier lieu (aucun span osseux fiable, et elle a besoin
+            # de 3 axes indépendants). Les deux mécanismes s'appliquent dans
+            # l'ordre listé ; ils portent sur des corps disjoints.
+            scaler_block = (
+                f'\t\t\t<scaling_order> measurements manualScale </scaling_order>\n'
+                f'\t\t\t<MeasurementSet>\n'
+                f'\t\t\t\t<objects>\n'
+                f'{meas_str}\n'
+                f'\t\t\t\t</objects>\n'
+                f'\t\t\t</MeasurementSet>\n'
+                f'{scale_set_xml}'
+            )
+        else:
+            scaler_block = (
+                f'\t\t\t<scaling_order> manualScale </scaling_order>\n'
+                f'{scale_set_xml}'
+            )
+    else:
+        scaler_block = (
+            f'\t\t\t<scaling_order> measurements </scaling_order>\n'
+            f'\t\t\t<MeasurementSet>\n'
+            f'\t\t\t\t<objects>\n'
+            f'{meas_str}\n'
+            f'\t\t\t\t</objects>\n'
+            f'\t\t\t</MeasurementSet>'
+        )
+
     xml = f"""<?xml version="1.0" encoding="UTF-8" ?>
 <OpenSimDocument Version="40500">
 \t<ScaleTool name="subject">
@@ -347,12 +410,7 @@ def _write_scale_setup_xml(
 \t\t</GenericModelMaker>
 \t\t<ModelScaler>
 \t\t\t<apply>true</apply>
-\t\t\t<scaling_order> measurements </scaling_order>
-\t\t\t<MeasurementSet>
-\t\t\t\t<objects>
-{meas_str}
-\t\t\t\t</objects>
-\t\t\t</MeasurementSet>
+{scaler_block}
 \t\t\t<marker_file>{trc_rel}</marker_file>
 \t\t\t<time_range>{t_start:.6f} {t_end:.6f}</time_range>
 \t\t\t<output_model_file>{out_model_rel}</output_model_file>
@@ -474,6 +532,7 @@ def run_scale_tool(
     calibration_t_start: float | None = None,
     calibration_t_end:   float | None = None,
     marker_placer: bool = False,
+    manual_scales: dict[str, tuple[float, float, float]] | None = None,
 ) -> bool:
     """
     Scale the generic OpenSim model to the subject's proportions using the TRC.
@@ -501,6 +560,14 @@ def run_scale_tool(
 
         measurements = (_SCALE_MEASUREMENTS_FLODELAPLACE
                         if markerset == "flodelaplace" else _SCALE_MEASUREMENTS)
+        if manual_scales:
+            # HYBRIDE : on ne garde que les mesures portant sur des corps que
+            # les facteurs MHR ne couvrent PAS (la tête n'a pas de span
+            # d'armature fiable). Évite que les deux mécanismes se marchent
+            # dessus sur un même corps.
+            _covered = set(manual_scales)
+            measurements = [m for m in measurements
+                            if not (set(m[2]) & _covered)]
         _write_scale_setup_xml(
             model_path=os.path.abspath(model_path),
             trc_path=os.path.abspath(trc_path),
@@ -516,6 +583,7 @@ def run_scale_tool(
             marker_placer=marker_placer,
             placer_t_start=t_start,
             placer_t_end=t_end,
+            manual_scales=manual_scales,
         )
         Path(script_path).write_text(_SCALE_SCRIPT, encoding="utf-8")
 

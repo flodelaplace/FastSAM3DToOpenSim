@@ -1,0 +1,9 @@
+# Overlay build : réutilise l'image existante (base CUDA/conda/deps inchangée)
+# et ne rebuild QUE les couches code (synkro-analytics + app). ~3 min au lieu
+# d'un full rebuild (dont le cache a été purgé pendant le nettoyage C:).
+FROM synkro-fastsam3d:local
+COPY synkro-analytics /app/synkro-analytics
+RUN /opt/conda/envs/opensim/bin/pip install --no-cache-dir -e /app/synkro-analytics
+WORKDIR /app
+COPY . /app
+RUN mkdir -p /outputs
