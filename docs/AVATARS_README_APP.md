@@ -134,24 +134,62 @@ inference_meta.json                      métadonnées vidéo
 
 ---
 
-## 6. Catalogue d'avatars
+## 6. Catalogue d'avatars — ce que le kiné voit et choisit
 
-10 avatars, tous au rig MakeHuman « Default » (163 os) en A-pose.
+Un run produit **un fichier GLB par avatar**, nommé :
 
-| Nom | Taille |
-|---|---|
-| `male_child` / `female_child` | ~1,24 m |
-| `male_young` / `female_young` | 1,74 / 1,59 m |
-| `male_old` / `female_old` | 1,69 / 1,57 m |
-| `male_young_large` / `female_young_large` | idem jeunes, corpulence élevée |
-| `male_old_large` / `female_old_large` | idem seniors, corpulence élevée |
+```
+markers_<nom_video>_avatar_<avatar>.glb
+```
+
+Le suffixe après `_avatar_` est l'identité à présenter dans l'interface. Tous
+jouent **exactement le même mouvement** — celui du patient filmé. Seule
+l'apparence change. Le choix est donc purement une question de **à qui
+l'exercice est destiné**.
+
+| Fichier `..._avatar_X.glb` | À montrer à | Taille | Apparence |
+|---|---|---|---|
+| `male_child` | garçon | 1,24 m | enfant, t-shirt + bermuda |
+| `female_child` | fille | 1,22 m | enfant, t-shirt + jean |
+| `male_young` | homme adulte | 1,74 m | ~25 ans, t-shirt + bermuda |
+| `female_young` | femme adulte | 1,59 m | ~30 ans, t-shirt + short |
+| `male_old` | homme senior | 1,69 m | ~70 ans, cheveux gris, chemise + jean |
+| `female_old` | femme senior | 1,57 m | ~70 ans, cheveux blancs, pull + pantalon |
+| `male_young_large` | homme adulte en surpoids | 1,74 m | idem `male_young`, corpulence élevée |
+| `female_young_large` | femme adulte en surpoids | 1,59 m | idem `female_young`, corpulence élevée |
+| `male_old_large` | homme senior en surpoids | 1,69 m | idem `male_old`, corpulence élevée |
+| `female_old_large` | femme senior en surpoids | 1,57 m | idem `female_old`, corpulence élevée |
+
+**Règle de sélection à implémenter** : proposer l'avatar dont l'âge, le sexe et
+la corpulence se rapprochent le plus du patient. Un patient de 70 ans se
+reconnaît mieux dans `male_old` que dans `male_young`, et l'adhésion à
+l'exercice en dépend.
+
+⚠️ **Ne pas proposer un avatar d'enfant pour une vidéo d'adulte** (ni
+l'inverse) : l'avatar est étiré vers la morphologie du sujet filmé, mais cet
+étirement est **plafonné**. Un avatar enfant (tronc ~33 cm) sur un adulte
+(tronc ~64 cm) sature la limite et sort avec des proportions fausses. Filtrer
+le catalogue sur la classe d'âge du sujet filmé.
+
+### Poids : ne pas tout générer
+
+Chaque GLB pèse **~27 Mo** — le catalogue complet fait donc **~270 Mo par
+exercice**. Le temps n'est pas le problème (1,4 s par avatar), le stockage si.
+
+Deux façons de n'en produire qu'un :
+
+```bash
+--avatars male_old                 # un ou plusieurs noms du catalogue
+--avatars male_old,female_old      # séparés par des virgules
+```
+
+Et surtout : **le TRC ne pèse que ~380 Ko**. On peut donc archiver le TRC seul
+et rejouer le retargeting à la demande en ~1,4 s quand le kiné change d'avatar,
+sans refaire l'inférence (qui, elle, prend des minutes de GPU). C'est
+l'architecture recommandée pour l'app.
 
 Les sources sont des specs JSON versionnées (`assets/avatars/specs/`) : une
 variante se dérive en changeant une ligne, sans repasser par MakeHuman.
-
-⚠️ Un avatar est **retargeté sur le sujet réel**, mais l'étirement du tronc est
-plafonné. Choisir un avatar d'enfant pour une vidéo d'adulte donne des
-proportions fausses — laisser l'app proposer un avatar cohérent avec le sujet.
 
 ---
 

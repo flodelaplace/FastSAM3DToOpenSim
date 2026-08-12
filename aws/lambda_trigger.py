@@ -82,7 +82,7 @@ SEX_RE = re.compile(r"^sx([MF])$")
 START_RE = re.compile(r"^s(\d+)$")
 END_RE = re.compile(r"^e(\d+)$")
 TREADMILL_RE = re.compile(r"^tm(\d+)$")  # vitesse tapis en km/h (tm12 = 12 km/h)
-FLAG_TOKENS = {"st", "com", "floor", "lv", "bikefit"}
+FLAG_TOKENS = {"st", "com", "floor", "lv", "bikefit", "ca", "seated"}
 LEVEL_TOKENS = {"tr": "trained", "re": "recreational",
                 "cl": "clinical", "el": "elite"}
 # Module token → --module value (d3 par défaut pour SAM3D 3D pipeline)
@@ -149,6 +149,8 @@ def parse_filename(basename):
     floor = False
     lock_vertical = False
     bikefit = False
+    contact_anchor = False  # token 'ca' → --contact_anchor
+    floor_seated = False    # token 'seated' → --floor_seated
     cycling_position = None  # road (défaut) / tt / comfort → stratum normes vélo
     camera_side = None       # camR / camL → --camera_side (vue 3/4 cyclisme)
     hop_type = None          # single/triple/crossover/timed6m → single_leg_hop RTS
@@ -223,6 +225,17 @@ def parse_filename(basename):
         if t == "bikefit":
             bikefit = True
             continue
+        if t == "seated":
+            # Sujet assis : mise au sol per-frame SANS le redressement
+            # "corps vertical", qui suppose un sujet debout.
+            floor_seated = True
+            continue
+        if t == "ca":
+            # Ancrage sol conscient du contact. Remplace l'ancien --feet_anchor
+            # pour les exercices : re-ancre le pied en appui soutenu (le bassin
+            # descend bien dans un squat) tout en preservant les phases de vol.
+            contact_anchor = True
+            continue
         if t in ("tt", "road", "comfort"):
             if cycling_position is not None:
                 raise FilenameParseError(f"Duplicate cycling position token: '{t}'")
@@ -278,6 +291,10 @@ def parse_filename(basename):
         extra.append("--compute_com")
     if floor:
         extra.append("--floor")
+    if floor_seated:
+        extra.append("--floor_seated")
+    if contact_anchor:
+        extra.append("--contact_anchor")
     if lock_vertical:
         extra.append("--lock-vertical")
     if bikefit:

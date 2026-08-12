@@ -1346,10 +1346,29 @@ def main(args):
     exporter = TRCExporter(fps=out_fps, units="mm")
     exporter.export(markers_array, marker_names, trc_path)
 
-    # --- Boucle sur tous les templates avatars présents -------------------
+    # --- Sélection des templates avatars ----------------------------------
+    # Par défaut on génère TOUT le catalogue, mais un GLB pèse ~27 Mo : à 10
+    # avatars cela fait ~270 Mo par exercice. Pour l'app, il vaut mieux ne
+    # produire que l'avatar demandé — le TRC ne fait que ~380 Ko et le
+    # retargeting ~1,4 s, donc on peut aussi le rejouer à la demande plus tard
+    # sans refaire l'inférence.
     import glob
-    templates = sorted(glob.glob(os.path.join(parent_dir, "assets", "avatars",
-                                              "avatar_*_apose_opaque.glb")))
+    _all = sorted(glob.glob(os.path.join(parent_dir, "assets", "avatars",
+                                         "avatar_*_apose_opaque.glb")))
+    if getattr(args, "avatar_glb", None):
+        templates = [args.avatar_glb]
+    elif getattr(args, "avatars", None):
+        wanted = [s.strip() for s in args.avatars.split(",") if s.strip()]
+        by_name = {os.path.basename(p)[len("avatar_"):-len("_apose_opaque.glb")]: p
+                   for p in _all}
+        unknown = [w for w in wanted if w not in by_name]
+        if unknown:
+            raise SystemExit(
+                f"--avatars : inconnu(s) {unknown}. Disponibles : "
+                f"{sorted(by_name)}")
+        templates = [by_name[w] for w in wanted]
+    else:
+        templates = _all
     if not templates:
         print("  WARNING: aucun template avatar trouvé dans assets/avatars/")
     else:
@@ -1829,6 +1848,11 @@ if __name__ == "__main__":
                         help="Also write the combined TRC used for IK in addition to per-person TRCs.")
     parser.add_argument("--run_ik_per_person", action="store_true",
                         help="Run OpenSim scale + IK for each per-person TRC (slow).")
+    parser.add_argument("--avatars", default=None,
+                        help="Liste de noms d'avatars du catalogue, separes par des "
+                             "virgules (ex: male_old,female_young). Par defaut TOUT le "
+                             "catalogue est genere, soit ~27 Mo par avatar. Pour l'app, "
+                             "ne demander que celui choisi par le kine.")
     parser.add_argument("--avatar_glb", default=None,
                         help="Path to a rigged humanoid GLB (MakeHuman 'Default' rig in "
                              "T- or A-pose). When set, retargets the TRC onto this avatar "
