@@ -1342,6 +1342,7 @@ def anti_foot_skate_markers(
     exit_band_ratio: float = 1.6,
     vel_gate_window_s: float = 0.30,
     vel_gate_std_m: float = 0.02,
+    max_contact_hspeed_ms: float = 0.50,
 ):
     """Anti-glisse pied sur les marqueurs FINAUX du TRC (markerset Flodelaplace).
 
@@ -1431,6 +1432,24 @@ def anti_foot_skate_markers(
                 vel_gate_std_m * _unit)
         c &= stable
 
+        # Porte de vitesse HORIZONTALE — le critère décisif sur la marche.
+        # La hauteur seule ne suffit pas : la reconstruction MHR sous-estime le
+        # décollement du pied (mesuré : 5,4 cm de garde maximale sur une marche
+        # tandem), si bien qu'un pied peut rester sous le seuil de hauteur
+        # PENDANT TOUTE la séquence et passer pour planté en permanence. Un pied
+        # réellement en appui a une vitesse horizontale nulle ; ici la médiane
+        # atteignait 1 m/s. On exige donc les deux : bas ET immobile.
+        xz_all = np.nanmean(sub[:, :, [0, 2]], axis=1)
+        step_xz = np.full(T, np.inf)
+        step_xz[1:] = np.linalg.norm(np.diff(xz_all, axis=0), axis=1)
+        step_xz[0] = step_xz[1] if T > 1 else 0.0
+        # lissage court : une image isolée de bruit ne doit pas casser un appui
+        k = max(1, int(round(0.10 * fps)))
+        if k > 1:
+            pad = np.pad(step_xz, k // 2, mode="edge")
+            step_xz = np.array([np.nanmedian(pad[i:i + k]) for i in range(T)])
+        c &= step_xz < (max_contact_hspeed_ms * _unit / max(fps, 1e-6))
+
         # Bouche les DÉCROCHAGES trop courts pour être un vol réel. Le filtre
         # min_contact_s ci-dessous ne rejette que les contacts trop courts ; il
         # n'avait pas de symétrique. Résultat : une gigue de 1-2 frames au-dessus
@@ -1481,43 +1500,61 @@ def anti_foot_skate_markers(
     if not contact:
         return result, np.zeros((T, 2))
 
-    # Shift INCRÉMENTAL par pied d'appui : pendant qu'un pied reste en appui,
-    # on garde CE pied fixe (shift[t] = shift[t-1] - déplacement du pied). Au
-    # changement d'appui (ou en vol), on REPORTE le shift sans corriger → le
-    # corps AVANCE d'un pas à l'autre (la marche n'est pas bloquée). Pour un
-    # squat, le même pied reste en appui → seule la gigue est retirée.
+    # ANCRAGE PAR PHASE D'APPUI (portage de l'étage ground_anchor de Mesh2Sim,
+    # rodé sur de la marche).
+    #
+    # La version précédente corrigeait le déplacement du pied ENTRE DEUX IMAGES.
+    # Elle lissait donc la dérive sans jamais PLANTER le pied : l'erreur
+    # résiduelle s'accumulait librement le long d'une phase d'appui, et sur de
+    # la marche le pied glissait de plusieurs dizaines de centimètres.
+    #
+    # Ici, dès qu'un pied se pose on mémorise une ancre, et le décalage du corps
+    # est celui qui ramène ce pied SUR son ancre — une consigne absolue, pas une
+    # dérivée. L'ancre est posée en coordonnées DÉJÀ CORRIGÉES
+    # (`foot + shift` à l'instant de la pose) : sans cela, chaque nouveau pas
+    # exigerait d'annuler tout le décalage accumulé et rappellerait le corps en
+    # arrière. Le pied qui décolle libère son ancre, donc la marche progresse.
     shifts = np.zeros((T, 2), dtype=np.float64)
-    prev = None  # côté d'appui à t-1
+    max_step = max_contact_speed_ms * _unit / max(fps, 1e-6)
+    anchors: dict[str, np.ndarray | None] = {s: None for s in contact}
+
     for t in range(T):
-        avail = [s for s in contact if contact[s][t]]
-        if prev in avail:
-            cur = prev                       # hystérésis : garde le même appui
-        elif avail:
-            # sinon = pied en contact le PLUS BAS (le plus ancré). Gère le
-            # single-support (initiation de marche) : un seul pied → c'est lui.
-            cur = min(avail, key=lambda s: (foot_y[s][t]
-                                            if np.isfinite(foot_y[s][t]) else 1e9))
-        else:
-            cur = None
-        if t > 0:
-            if (cur is not None and cur == prev
-                    and np.all(np.isfinite(foot_xz[cur][t]))
-                    and np.all(np.isfinite(foot_xz[cur][t - 1]))):
-                delta = foot_xz[cur][t] - foot_xz[cur][t - 1]
-                # Un pied EN APPUI ne glisse pas vite. Au-delà de
-                # max_contact_speed_ms, ce n'est pas du mouvement réel mais de
-                # la gigue d'inférence — et la compenser telle quelle revient à
-                # injecter ce bruit dans le déplacement du corps entier (le
-                # sujet part d'un coup sur le côté). On borne donc la correction
-                # sans l'annuler : la dérive lente reste corrigée.
-                _lim = max_contact_speed_ms * _unit / max(fps, 1e-6)
-                _n = float(np.linalg.norm(delta))
-                if _n > _lim:
-                    delta = delta * (_lim / _n)
-                shifts[t] = shifts[t - 1] - delta
-            else:
-                shifts[t] = shifts[t - 1]   # changement d'appui / vol → report
-        prev = cur
+        needed = []
+        for side in contact:
+            xz = foot_xz[side][t]
+            if not (contact[side][t] and np.all(np.isfinite(xz))):
+                anchors[side] = None      # pied en vol → l'ancre expire
+                continue
+            if anchors[side] is None:     # pose : ancre = position corrigée
+                anchors[side] = xz + shifts[t - 1] if t > 0 else xz.copy()
+            needed.append(anchors[side] - xz)
+
+        if not needed:
+            shifts[t] = shifts[t - 1] if t > 0 else 0.0
+            continue
+
+        # Double appui : moyenne des deux consignes. Suivre un seul pied ferait
+        # basculer le corps à chaque transition d'appui.
+        target = np.mean(np.stack(needed), axis=0)
+        step = target - (shifts[t - 1] if t > 0 else 0.0)
+        # Un pied en appui ne glisse pas vite : au-delà, c'est de la gigue
+        # d'inférence, et la compenser d'un coup projetterait le corps de côté.
+        n = float(np.linalg.norm(step))
+        if n > max_step:
+            step *= max_step / n
+        shifts[t] = (shifts[t - 1] if t > 0 else 0.0) + step
+
+    # Lissage zéro-phase de la correction cumulée : les transitions d'appui
+    # laissent des angles vifs dans la trajectoire du bassin. 2 Hz laisse passer
+    # la cadence de marche (~1 Hz) tout en supprimant les ruptures.
+    if T > 18 and fps > 6:
+        try:
+            from scipy.signal import butter, sosfiltfilt
+            wn = min(2.0 / (fps / 2.0), 0.99)
+            shifts = sosfiltfilt(butter(2, wn, btype="low", output="sos"),
+                                 shifts, axis=0)
+        except Exception:
+            pass  # scipy absent ou signal trop court : on garde le brut
 
     result[:, :, 0] += shifts[:, 0][:, None]
     result[:, :, 2] += shifts[:, 1][:, None]
