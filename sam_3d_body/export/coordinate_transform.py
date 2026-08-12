@@ -190,6 +190,9 @@ class CoordinateTransformer:
         # 4. Align feet to Y=0
         self._last_ground_offsets_m = None
         self._last_constant_offset_m = None
+        # Offset de mise au sol partage entre les appels successifs a
+        # apply_pipeline_to_verts (mesh / kpts / jcoords).
+        self._replay_constant_offset_m = None
         self._last_penetration_clamp_m = None  # (N,) per-frame safety-net shift
         if contact_anchor:
             # Ancrage conscient du contact : re-ancre le pied en contact SOUTENU
@@ -400,6 +403,17 @@ class CoordinateTransformer:
             # frames de l'array passé (calib window standing typique).
             if override_constant_offset_m is not None:
                 constant_offset = float(override_constant_offset_m)
+            elif self._replay_constant_offset_m is not None:
+                # Le mesh, les keypoints et les centres articulaires arrivent en
+                # TROIS appels separes. Sans partage, chacun recalculait son
+                # offset sur SES propres donnees — donc trois translations
+                # differentes (mesure : 0,673 / 0,702 / 0,000 m sur un bird dog),
+                # d'ou des spheres articulaires flottant au-dessus de la peau et
+                # un anatomical passant sous le sol. Le premier appel fait
+                # reference, les suivants le rejouent.
+                constant_offset = self._replay_constant_offset_m
+                print(f"  [apply_pipeline_to_verts] constant_from_calib: "
+                      f"Y -= {constant_offset:.3f} m (offset partage)")
             else:
                 calib_ys = []
                 for i, w in enumerate(pre_ground[:calib_window_frames]):
@@ -412,6 +426,7 @@ class CoordinateTransformer:
                     print(f"  [apply_pipeline_to_verts] constant_from_calib: "
                           f"Y -= {constant_offset:.3f} m (calib over "
                           f"{len(calib_ys)} frames)")
+                self._replay_constant_offset_m = constant_offset
             for w in pre_ground:
                 if w is not None:
                     w[:, 1] -= constant_offset

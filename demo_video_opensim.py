@@ -2255,6 +2255,19 @@ def main(args):
         # MoGe (Y-UP conv) qui n'existe plus depuis le fix Y-DOWN.
         # Env var ANAT_Y_OFFSET_M pour override manuel si régression.
         _anat_y_offset = float(os.environ.get("ANAT_Y_OFFSET_M", "0.0"))
+        # Le mesh GLB peut avoir recu un offset de mise au sol que le TRC n'a
+        # PAS recu : c'est le cas quand transform() n'a rien pu caler (MoGe en
+        # echec, aucun mode --floor), si bien que apply_pipeline_to_verts calcule
+        # son propre offset de calibration pour le seul mesh. L'anatomical, qui
+        # derive du TRC, restait alors a la hauteur brute — mesure sur un bird
+        # dog : 33,6 cm d'ecart, squelette sous le sol. On lui applique la MEME
+        # translation pour que tout le monde partage un seul repere.
+        if _shared_offset_m is None and "ANAT_Y_OFFSET_M" not in os.environ:
+            _mesh_applied = getattr(transformer, "_replay_constant_offset_m", None)
+            if _mesh_applied:
+                _anat_y_offset = -float(_mesh_applied)
+                print(f"  Anatomical GLB: Y -= {_mesh_applied:.3f} m "
+                      f"(meme offset que le mesh → alignement)")
         write_anatomical_glb(anat_glb, osim_path, ik_mot_path,
                              y_offset_m=_anat_y_offset)
 
