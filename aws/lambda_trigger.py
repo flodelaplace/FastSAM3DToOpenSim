@@ -82,7 +82,7 @@ SEX_RE = re.compile(r"^sx([MF])$")
 START_RE = re.compile(r"^s(\d+)$")
 END_RE = re.compile(r"^e(\d+)$")
 TREADMILL_RE = re.compile(r"^tm(\d+)$")  # vitesse tapis en km/h (tm12 = 12 km/h)
-FLAG_TOKENS = {"st", "com", "floor", "lv", "bikefit", "ca", "seated"}
+FLAG_TOKENS = {"st", "com", "floor", "lv", "ll", "bikefit", "ca", "seated"}
 LEVEL_TOKENS = {"tr": "trained", "re": "recreational",
                 "cl": "clinical", "el": "elite"}
 # Module token → --module value (d3 par défaut pour SAM3D 3D pipeline)
@@ -151,6 +151,7 @@ def parse_filename(basename):
     bikefit = False
     contact_anchor = False  # token 'ca' → --contact_anchor
     floor_seated = False    # token 'seated' → --floor_seated
+    lock_lateral = False    # token 'll' → --lock_lateral
     cycling_position = None  # road (défaut) / tt / comfort → stratum normes vélo
     camera_side = None       # camR / camL → --camera_side (vue 3/4 cyclisme)
     hop_type = None          # single/triple/crossover/timed6m → single_leg_hop RTS
@@ -225,6 +226,13 @@ def parse_filename(basename):
         if t == "bikefit":
             bikefit = True
             continue
+        if t == "ll":
+            # Verrouille la derive laterale en laissant la progression avant :
+            # le sujet avance dans un couloir. Pour la marche et la course en
+            # ligne droite. NE PAS mettre sur un pas chasse, ou le deplacement
+            # lateral EST le mouvement.
+            lock_lateral = True
+            continue
         if t == "seated":
             # Sujet assis : mise au sol per-frame SANS le redressement
             # "corps vertical", qui suppose un sujet debout.
@@ -293,6 +301,8 @@ def parse_filename(basename):
         extra.append("--floor")
     if floor_seated:
         extra.append("--floor_seated")
+    if lock_lateral:
+        extra.append("--lock_lateral")
     if contact_anchor:
         extra.append("--contact_anchor")
     if lock_vertical:

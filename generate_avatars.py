@@ -905,6 +905,7 @@ def main(args):
         center_pelvis=True,
         align_to_ground=_apply_floor,
         apply_global_translation=not args.stationary,
+        lock_lateral=getattr(args, 'lock_lateral', False),
         correct_floor_lean=_correct_lean,
         floor_angle=moge_floor_angle,
         apply_body_vertical=_apply_body_vertical,
@@ -1173,6 +1174,7 @@ def main(args):
                 center_pelvis=True,
                 align_to_ground=True,
                 apply_global_translation=not args.stationary,
+                lock_lateral=getattr(args, 'lock_lateral', False),
                 correct_floor_lean=not args.no_lean_fix,
                 floor_angle=moge_floor_angle,
                 apply_body_vertical=not args.floor_seated,
@@ -1730,6 +1732,14 @@ if __name__ == "__main__":
     parser.add_argument("--enable_auto_lean_fix", action="store_true",
                         help="Active la spine lean correction AUTO (off par défaut depuis "
                              "que le biais MHR sur acromions rendait l'anatomical penché ≠ mesh)")
+    parser.add_argument("--lock_lateral", action="store_true",
+                        help="Verrouille la derive LATERALE en laissant la progression "
+                             "avant : le sujet avance dans un couloir au lieu de partir "
+                             "de biais. A utiliser pour la marche et la course. Le "
+                             "pipeline complet l'active automatiquement via "
+                             "--module d3.gait / d3.running / d3.sprint_start ; le "
+                             "pipeline avatar n'ayant pas --module, il faut le passer "
+                             "explicitement.")
     parser.add_argument("--stationary", action="store_true",
                         help="Disable global XZ translation — keeps the person centred at "
                              "origin with feet fixed to the ground. Use for exercises where "
