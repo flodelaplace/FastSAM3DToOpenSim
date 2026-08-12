@@ -171,22 +171,45 @@ l'inverse) : l'avatar est étiré vers la morphologie du sujet filmé, mais cet
 (tronc ~64 cm) sature la limite et sort avec des proportions fausses. Filtrer
 le catalogue sur la classe d'âge du sujet filmé.
 
-### Poids : ne pas tout générer
+### Poids : ce qu'il faut savoir avant de tout stocker
 
-Chaque GLB pèse **~27 Mo** — le catalogue complet fait donc **~270 Mo par
-exercice**. Le temps n'est pas le problème (1,4 s par avatar), le stockage si.
+Les textures des avatars ont été optimisées le 2026-08-12 :
 
-Deux façons de n'en produire qu'un :
+| | Avant | Après |
+|---|---|---|
+| Un avatar | 21,7 Mo | **4,2 Mo** |
+| Catalogue (10) | 217 Mo | **42 Mo** |
+| Un exercice complet | ~271 Mo | **~44 Mo** |
 
-```bash
---avatars male_old                 # un ou plusieurs noms du catalogue
---avatars male_old,female_old      # séparés par des virgules
-```
+La décomposition d'un GLB explique le reste de la stratégie :
 
-Et surtout : **le TRC ne pèse que ~380 Ko**. On peut donc archiver le TRC seul
-et rejouer le retargeting à la demande en ~1,4 s quand le kiné change d'avatar,
-sans refaire l'inférence (qui, elle, prend des minutes de GPU). C'est
-l'architecture recommandée pour l'app.
+| Contenu | Part |
+|---|---|
+| Textures | **91 %** |
+| Géométrie + skinning | 8 % |
+| **Animation** | **1 %** (~0,2 Mo) |
+
+Autrement dit, générer les 10 avatars pour chaque exercice revient à **recopier
+dix fois les mêmes textures**. Seuls 0,2 Mo par avatar sont réellement propres à
+l'exercice.
+
+Trois conséquences pratiques :
+
+1. **Ne générer que l'avatar demandé** :
+   ```bash
+   --avatars male_old                 # un seul
+   --avatars male_old,female_old      # ou plusieurs, séparés par des virgules
+   ```
+2. **Le TRC ne pèse que ~380 Ko** et le retargeting prend **1,4 s en CPU pur,
+   sans GPU**. On peut donc archiver le TRC seul et régénérer l'avatar à la
+   demande quand le kiné en change — sans refaire l'inférence, qui coûte des
+   minutes de GPU. Un petit service CPU (Lambda ou Fargate) suffit ; ce travail
+   n'a rien à faire dans le job Batch GPU.
+3. **Piste à évaluer côté app** : servir les 10 avatars comme assets statiques
+   mis en cache une fois, et ne livrer par exercice que le clip d'animation
+   (~0,2 Mo). glTF le permet nativement. Cela suppose que le moteur 3D de l'app
+   sache appliquer une animation à un GLB chargé séparément — c'est la question
+   à trancher avant de choisir l'architecture.
 
 Les sources sont des specs JSON versionnées (`assets/avatars/specs/`) : une
 variante se dérive en changeant une ligne, sans repasser par MakeHuman.
@@ -200,13 +223,33 @@ sous la forme `<nom>__h<cm>[_tokens].mp4` :
 
 | Token | Argument |
 |---|---|
-| `h175` | `--person_height 1.75` |
+| `h<cm>` | `--person_height` (ex. `h175` → 1.75 m) |
 | `st` | `--stationary` |
 | `floor` | `--floor` |
+| `seated` | `--floor_seated` |
+| `ca` | `--contact_anchor` |
 | `com` | `--compute_com` |
+| `lv` | `--lock-vertical` (bikefit uniquement) |
+| `bikefit` | macro home-trainer |
 
-Exemple : `ex03_fente__h175_floor.mp4`.
+Exemple : `ex03_fente__h175_floor_ca_st.mp4`.
 
-⚠️ Tous les arguments n'ont **pas** de token (`--contact_anchor`,
-`--lean_ref_frame`, `--no_floor_moge` n'en ont pas aujourd'hui). Si l'app doit
-les piloter via S3, il faut d'abord les ajouter à `aws/lambda_trigger.py`.
+`seated` et `ca` viennent d'être ajoutés (2026-08-12). Ils manquaient, et sans
+eux la banque d'exercices ne pouvait pas tourner sur AWS : `trim_and_run.py`
+produisait des noms contenant `anchor` et `seated`, tous deux rejetés par le
+parseur. Le problème était invisible parce que le batch tournait en Docker
+local. Les 31 clips de la banque passent désormais le parseur.
+
+⚠️ **Cinq arguments n'ont toujours pas de token** et ne sont donc pas
+pilotables depuis un nom de fichier S3 :
+
+| Argument | Conséquence |
+|---|---|
+| **`--avatars`** | **Le lambda génère toujours les 10 avatars** — impossible d'en demander un seul via S3 |
+| `--no_floor_moge` | Le recours « pas de sol visible » n'est pas déclenchable |
+| `--lean_angle`, `--lean_ref_frame` | Les rattrapages d'inclinaison non plus |
+| `--no_anti_foot_skate` | Débogage seulement, sans importance |
+
+`--avatars` est le plus important à ajouter si l'app doit piloter AWS
+directement. Cela se fait dans `aws/lambda_trigger.py` (`FLAG_TOKENS` + parsing
++ émission).
