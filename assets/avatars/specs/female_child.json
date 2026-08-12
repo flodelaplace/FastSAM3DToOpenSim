@@ -1,0 +1,35 @@
+{
+  "name": "female_child",
+  "_comment": "Enfant ~10 ans. Barème d'âge MakeHuman : 0.0 = 1 an, 0.1875 = 10 ans, 0.5 = 25 ans. La taille suit l'âge automatiquement, on laisse height neutre.",
+  "macro": {
+    "gender": 0.0,
+    "age": 0.1875,
+    "muscle": 0.45,
+    "weight": 0.5,
+    "proportions": 0.5,
+    "height": 0.44,
+    "cupsize": 0.5,
+    "firmness": 0.5,
+    "race": {
+      "asian": 0.0,
+      "caucasian": 1.0,
+      "african": 0.0
+    }
+  },
+  "skin": "skins/young_caucasian_female/young_caucasian_female.mhmat",
+  "eyes": "eyes/high-poly/high-poly.mhclo",
+  "eyebrows": "eyebrows/eyebrow006/eyebrow006.mhclo",
+  "eyelashes": "eyelashes/eyelashes02/eyelashes02.mhclo",
+  "teeth": "teeth/teeth_shape03/teeth_shape03.mhclo",
+  "tongue": "tongue/tongue01/tongue01.mhclo",
+  "hair": "hair/ponytail01/ponytail01.mhclo",
+  "_clothes_comment": "jean droit (pack pants02, CC-BY) : le cargo faisait trop militaire sur une enfant.",
+  "clothes": [
+    "clothes/elvs_crude_t-shirt_male/elvs_crude_t-shirt_male.mhclo",
+    "clothes/elvs_jeans_straight_leg/elvs_jeans_straight_leg.mhclo",
+    "clothes/shoes01/shoes01.mhclo"
+  ],
+  "rig": "default",
+  "_hair_comment": "cortu_short_messy_hair rend une touffe clairsemée et sale ; short01 (asset système) est propre.",
+  "_height_comment": "calibré pour ~1.20 m"
+}

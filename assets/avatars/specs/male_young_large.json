@@ -1,0 +1,35 @@
+{
+  "name": "male_young_large",
+  "_comment": "Variante corpulente : weight monté à 0.92 et muscle VOLONTAIREMENT bas (0.35) — chez MakeHuman weight = masse grasse et muscle = musculature ; monter les deux donnerait un gabarit d'haltérophile, pas une surcharge.",
+  "macro": {
+    "gender": 1.0,
+    "age": 0.5,
+    "muscle": 0.35,
+    "weight": 0.92,
+    "proportions": 0.5,
+    "height": 0.5,
+    "cupsize": 0.5,
+    "firmness": 0.5,
+    "race": {
+      "asian": 0.0,
+      "caucasian": 1.0,
+      "african": 0.0
+    }
+  },
+  "skin": "skins/young_caucasian_male/young_caucasian_male.mhmat",
+  "eyes": "eyes/high-poly/high-poly.mhclo",
+  "eyebrows": "eyebrows/eyebrow006/eyebrow006.mhclo",
+  "eyelashes": "eyelashes/eyelashes02/eyelashes02.mhclo",
+  "teeth": "teeth/teeth_shape03/teeth_shape03.mhclo",
+  "tongue": "tongue/tongue01/tongue01.mhclo",
+  "hair": "hair/short01/short01.mhclo",
+  "_clothes_comment": "short homme (pack pants03, CC-BY Elvaerwyn) : cortu_jeans_shorts est une coupe très courte taillée pour femme.",
+  "clothes": [
+    "clothes/elvs_crude_t-shirt_male/elvs_crude_t-shirt_male.mhclo",
+    "clothes/elvs_male_trouser_short_2/elvs_male_trouser_short_2.mhclo",
+    "clothes/shoes01/shoes01.mhclo"
+  ],
+  "rig": "default",
+  "_hair_comment": "cortu_short_messy_hair rend une touffe clairsemée et sale ; short01 (asset système) est propre.",
+  "_weight_comment": "0.75 se voyait à peine ; 0.90 donne une surcharge nettement lisible."
+}

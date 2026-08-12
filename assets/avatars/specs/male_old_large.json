@@ -1,0 +1,33 @@
+{
+  "name": "male_old_large",
+  "_comment": "Variante corpulente : weight monté à 0.92 et muscle VOLONTAIREMENT bas (0.35) — chez MakeHuman weight = masse grasse et muscle = musculature ; monter les deux donnerait un gabarit d'haltérophile, pas une surcharge.",
+  "macro": {
+    "gender": 1.0,
+    "age": 0.846,
+    "muscle": 0.35,
+    "weight": 0.92,
+    "proportions": 0.5,
+    "height": 0.45,
+    "cupsize": 0.5,
+    "firmness": 0.35,
+    "race": {
+      "asian": 0.0,
+      "caucasian": 1.0,
+      "african": 0.0
+    }
+  },
+  "skin": "skins/old_caucasian_male/old_caucasian_male.mhmat",
+  "eyes": "eyes/high-poly/high-poly.mhclo",
+  "eyebrows": "eyebrows/eyebrow006/eyebrow006.mhclo",
+  "eyelashes": "eyelashes/eyelashes02/eyelashes02.mhclo",
+  "teeth": "teeth/teeth_shape03/teeth_shape03.mhclo",
+  "tongue": "tongue/tongue01/tongue01.mhclo",
+  "hair": "hair/short02/short02.mhclo",
+  "clothes": [
+    "clothes/male_casualsuit01/male_casualsuit01.mhclo",
+    "clothes/shoes02/shoes02.mhclo"
+  ],
+  "rig": "default",
+  "hair_material": "short02/bogdan666_short_02_gray/bogdan666_short_02_gray.mhmat",
+  "_weight_comment": "0.75 se voyait à peine ; 0.90 donne une surcharge nettement lisible."
+}

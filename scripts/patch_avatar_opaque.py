@@ -32,6 +32,44 @@ KEEP_BLEND_HINTS: tuple[str, ...] = (
 )
 
 
+def _base_color_has_alpha(gltf: pygltflib.GLTF2, mat) -> bool:
+    """True si la texture de couleur de base est réellement découpée en alpha.
+
+    Les cheveux MakeHuman sont des cartes planes dont la forme vient uniquement
+    du canal alpha de la texture. Les forcer en OPAQUE affiche les quads pleins :
+    on voit une calotte au lieu d'une coiffure. Les noms d'assets étant trop
+    variés pour une liste (`afro01`, `short02`, `ponytail01`, `bob01`…), on
+    regarde la texture elle-même.
+    """
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+    except ImportError:
+        return False
+
+    pbr = getattr(mat, "pbrMetallicRoughness", None)
+    tex_info = getattr(pbr, "baseColorTexture", None) if pbr else None
+    if tex_info is None:
+        return False
+    try:
+        image = gltf.images[gltf.textures[tex_info.index].source]
+        if image.bufferView is None:
+            return False
+        view = gltf.bufferViews[image.bufferView]
+        blob = gltf.binary_blob()
+        offset = view.byteOffset or 0
+        img = Image.open(BytesIO(blob[offset:offset + view.byteLength]))
+        if img.mode not in ("RGBA", "LA", "PA"):
+            return False
+        alpha = img.getchannel("A")
+        # Une texture opaque a un alpha constant à 255 ; une carte de cheveux
+        # descend à 0 sur une large part de sa surface.
+        return alpha.getextrema()[0] < 250
+    except Exception:
+        return False
+
+
 def patch_glb_opaque(src: str | Path, dst: str | Path) -> tuple[int, int]:
     """Return (n_switched_to_opaque, n_kept_transparent)."""
     src, dst = Path(src), Path(dst)
@@ -41,6 +79,9 @@ def patch_glb_opaque(src: str | Path, dst: str | Path) -> tuple[int, int]:
     for mat in gltf.materials:
         name_lc = (mat.name or "").lower()
         if any(h in name_lc for h in KEEP_BLEND_HINTS):
+            n_kept += 1
+            continue
+        if _base_color_has_alpha(gltf, mat):
             n_kept += 1
             continue
         if mat.alphaMode != "OPAQUE":

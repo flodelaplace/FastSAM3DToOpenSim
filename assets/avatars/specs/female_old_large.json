@@ -1,0 +1,37 @@
+{
+  "name": "female_old_large",
+  "_comment": "Variante corpulente : weight monté à 0.92 et muscle VOLONTAIREMENT bas (0.35) — chez MakeHuman weight = masse grasse et muscle = musculature ; monter les deux donnerait un gabarit d'haltérophile, pas une surcharge.",
+  "macro": {
+    "gender": 0.0,
+    "age": 0.846,
+    "muscle": 0.35,
+    "weight": 0.92,
+    "proportions": 0.5,
+    "height": 0.46,
+    "cupsize": 0.35,
+    "firmness": 0.3,
+    "race": {
+      "asian": 0.0,
+      "caucasian": 1.0,
+      "african": 0.0
+    }
+  },
+  "skin": "skins/old_caucasian_female/old_caucasian_female.mhmat",
+  "eyes": "eyes/high-poly/high-poly.mhclo",
+  "eyebrows": "eyebrows/eyebrow006/eyebrow006.mhclo",
+  "eyelashes": "eyelashes/eyelashes02/eyelashes02.mhclo",
+  "teeth": "teeth/teeth_shape03/teeth_shape03.mhclo",
+  "tongue": "tongue/tongue01/tongue01.mhclo",
+  "hair": "hair/short02/short02.mhclo",
+  "_clothes_comment": "vrai pantalon de ville (pack pants02) : le cargo faisait militaire, et le pantalon de laine avait une ceinture qui passait par-dessus le pull.",
+  "clothes": [
+    "clothes/toigo_fisherman_sweater/toigo_fisherman_sweater.mhclo",
+    "clothes/mindfront_female_trousers_1/mindfront_female_trousers_1.mhclo",
+    "clothes/shoes01/shoes01.mhclo"
+  ],
+  "rig": "default",
+  "_hair_comment": "short02 en matériau gris explicite : le matériau par défaut ressortait blond.",
+  "hair_material": "short02/bogdan666_short_02_gray/bogdan666_short_02_gray.mhmat",
+  "_cupsize_comment": "0.5 faisait transpercer la poitrine à travers le pull.",
+  "_weight_comment": "0.75 se voyait à peine ; 0.90 donne une surcharge nettement lisible."
+}

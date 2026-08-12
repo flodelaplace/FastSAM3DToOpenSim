@@ -1,0 +1,33 @@
+{
+  "name": "female_young",
+  "_comment": "Femme ~30 ans, tenue casual. Remplace l'avatar féminin historique jugé peu satisfaisant. Barème d'âge MakeHuman : 0.5 = 25 ans, 1.0 = 90 ans, donc 30 ans ≈ 0.538.",
+  "macro": {
+    "gender": 0.0,
+    "age": 0.538,
+    "muscle": 0.45,
+    "weight": 0.45,
+    "proportions": 0.5,
+    "height": 0.51,
+    "cupsize": 0.5,
+    "firmness": 0.5,
+    "race": {
+      "asian": 0.0,
+      "caucasian": 1.0,
+      "african": 0.0
+    }
+  },
+  "skin": "skins/young_caucasian_female/young_caucasian_female.mhmat",
+  "eyes": "eyes/high-poly/high-poly.mhclo",
+  "eyebrows": "eyebrows/eyebrow006/eyebrow006.mhclo",
+  "eyelashes": "eyelashes/eyelashes02/eyelashes02.mhclo",
+  "teeth": "teeth/teeth_shape03/teeth_shape03.mhclo",
+  "tongue": "tongue/tongue01/tongue01.mhclo",
+  "hair": "hair/ponytail01/ponytail01.mhclo",
+  "clothes": [
+    "clothes/joepal_crude_t-shirt_female/joepal_crude_t-shirt_female.mhclo",
+    "clothes/cortu_jeans_shorts/cortu_jeans_shorts.mhclo",
+    "clothes/shoes01/shoes01.mhclo"
+  ],
+  "rig": "default",
+  "_clothes_comment": "haut + short séparés au lieu de l'ensemble casualsuit01, qui portait le logo MakeHuman."
+}

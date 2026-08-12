@@ -1337,6 +1337,11 @@ def anti_foot_skate_markers(
     band_m: float = 0.06,
     ground_pct: float = 10.0,
     min_contact_s: float = 0.08,
+    max_gap_s: float = 0.12,
+    max_contact_speed_ms: float = 0.30,
+    exit_band_ratio: float = 1.6,
+    vel_gate_window_s: float = 0.30,
+    vel_gate_std_m: float = 0.02,
 ):
     """Anti-glisse pied sur les marqueurs FINAUX du TRC (markerset Flodelaplace).
 
@@ -1364,10 +1369,18 @@ def anti_foot_skate_markers(
     band = band_m * _unit
     name_to_idx = {n: i for i, n in enumerate(marker_names)}
     # Groupes de marqueurs pied par côté (repères sol : talon + orteil).
-    side_markers = {
-        "L": [name_to_idx[n] for n in ("LCAL", "LTOE", "LHEE", "LTO") if n in name_to_idx],
-        "R": [name_to_idx[n] for n in ("RCAL", "RTOE", "RHEE", "RTO") if n in name_to_idx],
-    }
+    # Repères de pied : on prend toute la semelle disponible plutôt que le seul
+    # couple talon/orteil. Un appui se juge mieux sur 5 points (calcanéus,
+    # orteil, 5e méta, malléoles) que sur 2, et les marqueurs de semelle SOLE
+    # (`*_s1`..`*_s7`, absents des TRC anciens) sont pris s'ils existent.
+    # Jeu repris de l'étage ground_anchor de Mesh2Sim, rodé sur de la marche.
+    _base = ("CAL", "TOE", "MT5", "LMAL", "MMAL")
+    side_markers = {}
+    for side in ("L", "R"):
+        idx = [name_to_idx[side + n] for n in _base if side + n in name_to_idx]
+        idx += [i for n, i in name_to_idx.items()
+                if n.startswith(side) and len(n) > 2 and n[1] == "s" and n[2:].isdigit()]
+        side_markers[side] = idx
     min_len = max(2, int(round(min_contact_s * fps)))
 
     # Contact + position XZ par côté.
@@ -1391,7 +1404,55 @@ def anti_foot_skate_markers(
         if not finite.any():
             continue
         ground = float(np.nanpercentile(y[finite], ground_pct))
-        c = (y < ground + band) & finite
+
+        # Hystérésis : on ENTRE en contact plus bas qu'on n'en SORT. Avec un
+        # seuil unique, un pied posé qui oscille d'un millimètre autour de la
+        # limite bascule sans arrêt entre appui et vol.
+        lo = y < ground + band
+        hi = y < ground + band * exit_band_ratio
+        c = np.zeros(T, dtype=bool)
+        state = False
+        for t in range(T):
+            state = (hi[t] if state else lo[t])
+            c[t] = state
+        c &= finite
+
+        # Porte de vitesse : un pied réellement en appui est STABLE en hauteur.
+        # On exige que l'écart-type glissant de sa distance au sol reste faible.
+        # C'est ce qui distingue « le pied a vraiment décollé » de « l'inférence
+        # a bougé » — sans ça, une secousse de tracking passe pour un envol et
+        # la correction accumulée se relâche d'un coup.
+        win = max(3, int(round(vel_gate_window_s * fps)))
+        pad = win // 2
+        ypad = np.pad(np.where(finite, y, np.nan), pad, mode="edge")
+        roll = np.lib.stride_tricks.sliding_window_view(ypad, win)[:T]
+        with np.errstate(invalid="ignore"):
+            stable = np.nan_to_num(np.nanstd(roll, axis=1), nan=np.inf) < (
+                vel_gate_std_m * _unit)
+        c &= stable
+
+        # Bouche les DÉCROCHAGES trop courts pour être un vol réel. Le filtre
+        # min_contact_s ci-dessous ne rejette que les contacts trop courts ; il
+        # n'avait pas de symétrique. Résultat : une gigue de 1-2 frames au-dessus
+        # du seuil cassait une phase d'appui en deux, et au raccord le décalage
+        # accumulé se relâchait d'un coup — le pied « décrochait » et le corps
+        # sautait brusquement alors que le sujet n'avait jamais quitté le sol.
+        # On ferme donc les trous < max_gap_s AVANT le filtre de durée.
+        # Les trous en BORD de séquence sont laissés tels quels : un vrai vol au
+        # début ou à la fin du clip ne doit pas être comblé par extrapolation.
+        max_gap = max(1, int(round(max_gap_s * fps)))
+        i = 0
+        while i < T:
+            if not c[i]:
+                j = i
+                while j < T and not c[j]:
+                    j += 1
+                if i > 0 and j < T and (j - i) <= max_gap:
+                    c[i:j] = True
+                i = j
+            else:
+                i += 1
+
         # ne garde que les runs de contact ≥ min_len
         keep = np.zeros(T, dtype=bool)
         i = 0
@@ -1405,7 +1466,15 @@ def anti_foot_skate_markers(
                 i = j
             else:
                 i += 1
-        foot_xz[side] = foot[:, [0, 2]]
+        # ⚠️ La HAUTEUR vient du marqueur le plus bas (talon OU orteil selon la
+        # pose) — c'est correct pour détecter le contact. Mais le DÉPLACEMENT
+        # doit se mesurer sur une référence STABLE : si l'on suit « le plus bas »,
+        # une bascule talon→orteil fait sauter la référence d'un marqueur à
+        # l'autre, et la distance talon-orteil (~22 cm) est appliquée telle quelle
+        # comme décalage du corps. Le sujet part brutalement de côté alors qu'il
+        # n'a jamais quitté le sol. On prend donc le centroïde XZ des marqueurs
+        # du pied, insensible à la bascule.
+        foot_xz[side] = np.nanmean(sub[:, :, [0, 2]], axis=1)
         foot_y[side] = foot[:, 1]
         contact[side] = keep
 
@@ -1435,6 +1504,16 @@ def anti_foot_skate_markers(
                     and np.all(np.isfinite(foot_xz[cur][t]))
                     and np.all(np.isfinite(foot_xz[cur][t - 1]))):
                 delta = foot_xz[cur][t] - foot_xz[cur][t - 1]
+                # Un pied EN APPUI ne glisse pas vite. Au-delà de
+                # max_contact_speed_ms, ce n'est pas du mouvement réel mais de
+                # la gigue d'inférence — et la compenser telle quelle revient à
+                # injecter ce bruit dans le déplacement du corps entier (le
+                # sujet part d'un coup sur le côté). On borne donc la correction
+                # sans l'annuler : la dérive lente reste corrigée.
+                _lim = max_contact_speed_ms * _unit / max(fps, 1e-6)
+                _n = float(np.linalg.norm(delta))
+                if _n > _lim:
+                    delta = delta * (_lim / _n)
                 shifts[t] = shifts[t - 1] - delta
             else:
                 shifts[t] = shifts[t - 1]   # changement d'appui / vol → report
