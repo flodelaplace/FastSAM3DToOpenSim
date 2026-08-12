@@ -635,7 +635,17 @@ def main(args):
     # Flag : True = MoGe a essayé et confirme que le sol est indétectable → skip
     # tout fix. False = MoGe pas encore essayé OU a foiré techniquement → fallback OK.
     moge_all_rejected = False
-    if getattr(args, "floor_moge", False) and not args.no_lean_fix:
+    # Mise au sol MoGe ACTIVEE PAR DEFAUT, comme dans generate_avatars.py.
+    # Ce pipeline-ci exigeait le flag explicite, alors que son aide annonce
+    # deja le contraire : en local sans --floor_moge, AUCUNE mise au sol
+    # n'etait faite. Le TRC sortait avec le bassin a Y=0 et les pieds 70 cm
+    # sous le sol, et tout ce qui en derive suivait — dont les fleches GRF,
+    # ancrees sur les pieds du TRC. Invisible sur AWS, ou le lambda ajoute
+    # --floor_moge explicitement.
+    _floor_moge_on = (getattr(args, "floor_moge", False)
+                      or (not args.floor and not args.floor_seated
+                          and not getattr(args, "no_floor_moge", False)))
+    if _floor_moge_on and not args.no_lean_fix:
         fov_est = getattr(estimator, "fov_estimator", None)
         if fov_est is not None:
             # MULTI-FRAME robust estimation : sample N frames dispersées,
@@ -2512,6 +2522,9 @@ if __name__ == "__main__":
                              "step wall time. Pass this flag locally when tuning markers.")
     parser.add_argument("--floor_moge", action="store_true",
                         help="Estimate floor plane from MoGe depth on the first video frame and use its camera-pitch angle to correct forward lean. Requires MoGe to be available.")
+    parser.add_argument("--no_floor_moge", action="store_true",
+                        help="Desactive l'estimation du sol MoGe (activee par defaut). "
+                             "A utiliser quand aucun sol n'est visible dans la video.")
     parser.add_argument("--contact_anchor", action="store_true",
                         help="Ancrage sol conscient du contact : re-ancre le pied en contact "
                              "soutenu (squat → bassin descend) mais préserve la phase de vol "
