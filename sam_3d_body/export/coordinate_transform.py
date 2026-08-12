@@ -1342,7 +1342,9 @@ def anti_foot_skate_markers(
     exit_band_ratio: float = 1.6,
     vel_gate_window_s: float = 0.30,
     vel_gate_std_m: float = 0.02,
-    max_contact_hspeed_ms: float = 0.50,
+    recede_tol_ms: float = 0.05,
+    walk_min_travel_m: float = 0.40,
+    stance_band_fraction: float = 0.35,
 ):
     """Anti-glisse pied sur les marqueurs FINAUX du TRC (markerset Flodelaplace).
 
@@ -1384,6 +1386,31 @@ def anti_foot_skate_markers(
         side_markers[side] = idx
     min_len = max(2, int(round(min_contact_s * fps)))
 
+    # Axe de marche et position du bassin — nécessaires au critère de recul.
+    # L'axe est la direction principale du déplacement du bassin (ACP sur XZ),
+    # orientée dans le sens du trajet net. S'il n'y a pas de déplacement franc
+    # (exercice en place), l'axe n'a pas de sens : on le laisse à None et la
+    # détection retombe sur hauteur + stabilité verticale, qui suffisent là.
+    pelvis_xz = None
+    walk_axis = None
+    _pel = [name_to_idx[m] for m in ("RASI", "LASI", "RPSI", "LPSI")
+            if m in name_to_idx]
+    if _pel:
+        pelvis_xz = np.nanmean(result[:, _pel, :][:, :, [0, 2]], axis=1)
+        d = pelvis_xz - np.nanmean(pelvis_xz, axis=0)
+        d = d[np.all(np.isfinite(d), axis=1)]
+        if len(d) > 4:
+            net = np.linalg.norm(np.nanmean(pelvis_xz[-5:], axis=0)
+                                 - np.nanmean(pelvis_xz[:5], axis=0))
+            if net > walk_min_travel_m * _unit:
+                _, _, vt = np.linalg.svd(d, full_matrices=False)
+                axis = vt[0] / (np.linalg.norm(vt[0]) or 1.0)
+                # oriente l'axe dans le sens de la marche
+                if (np.nanmean(pelvis_xz[-5:], axis=0)
+                        - np.nanmean(pelvis_xz[:5], axis=0)) @ axis < 0:
+                    axis = -axis
+                walk_axis = axis
+
     # Contact + position XZ par côté.
     foot_xz = {}
     foot_y = {}
@@ -1405,6 +1432,12 @@ def anti_foot_skate_markers(
         if not finite.any():
             continue
         ground = float(np.nanpercentile(y[finite], ground_pct))
+        # Bande ADAPTATIVE (Mesh2Sim) : une bande fixe de 6 cm est absurde quand
+        # la reconstruction ne donne que 5 cm de garde au sol — le pied est alors
+        # "en contact" en permanence. On la prend proportionnelle à l'amplitude
+        # REELLE du pied sur le clip, avec band_m comme plancher.
+        _span = float(np.nanpercentile(y[finite], 85.0)) - ground
+        band = max(band_m * _unit, stance_band_fraction * _span)
 
         # Hystérésis : on ENTRE en contact plus bas qu'on n'en SORT. Avec un
         # seuil unique, un pied posé qui oscille d'un millimètre autour de la
@@ -1432,23 +1465,22 @@ def anti_foot_skate_markers(
                 vel_gate_std_m * _unit)
         c &= stable
 
-        # Porte de vitesse HORIZONTALE — le critère décisif sur la marche.
-        # La hauteur seule ne suffit pas : la reconstruction MHR sous-estime le
-        # décollement du pied (mesuré : 5,4 cm de garde maximale sur une marche
-        # tandem), si bien qu'un pied peut rester sous le seuil de hauteur
-        # PENDANT TOUTE la séquence et passer pour planté en permanence. Un pied
-        # réellement en appui a une vitesse horizontale nulle ; ici la médiane
-        # atteignait 1 m/s. On exige donc les deux : bas ET immobile.
-        xz_all = np.nanmean(sub[:, :, [0, 2]], axis=1)
-        step_xz = np.full(T, np.inf)
-        step_xz[1:] = np.linalg.norm(np.diff(xz_all, axis=0), axis=1)
-        step_xz[0] = step_xz[1] if T > 1 else 0.0
-        # lissage court : une image isolée de bruit ne doit pas casser un appui
-        k = max(1, int(round(0.10 * fps)))
-        if k > 1:
-            pad = np.pad(step_xz, k // 2, mode="edge")
-            step_xz = np.array([np.nanmedian(pad[i:i + k]) for i in range(T)])
-        c &= step_xz < (max_contact_hspeed_ms * _unit / max(fps, 1e-6))
+        # Critère de RECUL RELATIF (Mesh2Sim, _contacts_on_axis).
+        #
+        # La vitesse absolue du pied est inutilisable : la trajectoire globale
+        # vient de l'estimation caméra et son bruit domine tout (mesuré sur un
+        # couloir de marche : bassin à 6,4 m/s de pointe pour une marche à
+        # 1,9 m/s). Un pied planté n'y paraît jamais immobile.
+        #
+        # Le signe du mouvement RELATIF au bassin, lui, est robuste : le bruit
+        # commun s'annule par différence. Un pied en appui RECULE par rapport au
+        # bassin pendant que le corps avance ; un pied en vol AVANCE. C'est ce
+        # qui discrimine appui et oscillation, pas la hauteur.
+        if walk_axis is not None and pelvis_xz is not None:
+            rel = (np.nanmean(sub[:, :, [0, 2]], axis=1) - pelvis_xz) @ walk_axis
+            fwd = np.zeros(T)
+            fwd[1:] = np.diff(rel) * fps
+            c &= fwd <= (recede_tol_ms * _unit)
 
         # Bouche les DÉCROCHAGES trop courts pour être un vol réel. Le filtre
         # min_contact_s ci-dessous ne rejette que les contacts trop courts ; il
@@ -1515,6 +1547,12 @@ def anti_foot_skate_markers(
     # exigerait d'annuler tout le décalage accumulé et rappellerait le corps en
     # arrière. Le pied qui décolle libère son ancre, donc la marche progresse.
     shifts = np.zeros((T, 2), dtype=np.float64)
+    # Plafond exprimé en VITESSE (donc indépendant du fps). Volontairement
+    # serré : notre déplacement global vient de `cam_t`, et une correction
+    # ample reviendrait à reconstruire la trajectoire depuis les pieds —
+    # ce que fait Mesh2Sim, mais qui entrerait ici en conflit avec cam_t
+    # (mesuré : 3,95 m de correction sur un couloir de 10,8 m). On se limite
+    # donc à retirer la gigue.
     max_step = max_contact_speed_ms * _unit / max(fps, 1e-6)
     anchors: dict[str, np.ndarray | None] = {s: None for s in contact}
 
