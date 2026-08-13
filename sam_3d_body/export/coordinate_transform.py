@@ -9,6 +9,30 @@ from scipy.ndimage import uniform_filter1d
 # jcoords index for the head joint (c_head) in the MHR 127-joint armature
 _JCOORDS_HEAD_IDX = 113
 
+# Chaine articulaire cheville -> sommet du crane, dans les 127 joints du rig MHR.
+# Sert a estimer la STATURE du sujet par somme de segments : contrairement a une
+# distance tete-pied a vol d'oiseau, une somme de segments est INVARIANTE PAR
+# POSTURE. Le rachis est somme vertebre par vertebre, sinon un tronc penche
+# raccourcit la mesure et on retombe sur le meme biais.
+_STATURE_CHAIN: tuple[tuple[int, int], ...] = (
+    (20, 19),    # tibia (cheville -> genou)
+    (19, 18),    # femur (genou -> hanche)
+    (18, 1),     # bassin
+    (1, 34), (34, 35), (35, 36), (36, 37), (37, 110),  # rachis
+    (110, 113),  # cou -> tete
+    (113, 126),  # tete -> sommet du crane
+)
+# Topologie verifiee sur mhr_skeleton.json (joint_parents) : chaque maillon est
+# bien une relation parent-enfant directe. Deux pieges evites :
+#   - 18 et 34 sont des branches SOEURS (parent commun = 1), il n'existe aucun
+#     lien 18 -> 35 ; on passe donc par le joint 1.
+#   - 112 est un FRERE de 113, pas un maillon du rachis. L'y inclure etait
+#     numeriquement indolore (3,7 mm) mais topologiquement faux.
+# stature = somme_chaine x C. Mesure sur le template MHR (betas = 0) : chaine
+# 1,7218 m pour une stature de 1,7657 m. C absorbe la courbure du rachis et la
+# hauteur cheville-sol, toutes deux proportionnelles a l'echelle du sujet.
+_STATURE_CHAIN_TO_HEIGHT = 1.0255
+
 # MHR70 foot indices used for ground alignment and height measurement
 _FOOT_INDICES = [15, 17, 18, 20]   # LBigToe, LHeel, RBigToe, RHeel
 
@@ -640,6 +664,26 @@ class CoordinateTransformer:
             h = float(np.linalg.norm(top - foot))
             if h > 0.1:
                 heights.append(h)
+
+        # Estimation par SOMME DE SEGMENTS quand les jcoords sont disponibles.
+        # La mesure tete-pied ci-dessus suppose un sujet qui s'etend au moins une
+        # fois dans le clip — le percentile 95 attrape cet instant sur un squat ou
+        # un sit-to-stand. Mais un CYCLISTE ne se redresse jamais : hanches et
+        # genoux flechis, tronc penche, sa distance tete-pied vaut bien moins que
+        # sa taille, et la forcer a subject_height dilate tout le squelette
+        # (mesure sur un cyclisme in-situ : +22 %, femur a 0,599 m au lieu de 0,49).
+        # La somme de segments ne depend pas de la posture.
+        if jc is not None and jc.shape[1] > 126:
+            seg = []
+            for a, b in _STATURE_CHAIN:
+                d = np.linalg.norm(jc[:, a] - jc[:, b], axis=1)
+                d = d[np.isfinite(d)]
+                if d.size:
+                    seg.append(float(np.median(d)))   # os rigide -> mediane
+            if len(seg) == len(_STATURE_CHAIN):
+                stature = sum(seg) * _STATURE_CHAIN_TO_HEIGHT
+                if stature > 0.5:
+                    return self.subject_height / stature
 
         if not heights:
             return 1.0
