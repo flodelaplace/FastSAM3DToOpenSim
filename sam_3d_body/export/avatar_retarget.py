@@ -113,11 +113,18 @@ MAKEHUMAN_BONE_TARGETS: dict[str, tuple[str, str, str | None, str | None]] = {
     # Left leg (3 DOF for upperleg + lowerleg, 2 DOF for foot)
     "upperleg01.L": ("LHJC",      "LKJC",       "LLFC",       "LMFC"),
     "lowerleg01.L": ("LKJC",      "LAJC",       "LLMAL",      "LMMAL"),
-    "foot.L":       ("LAJC",      "LTOE",       None,         None),
+    # Pied — 3 DOF via le PLAN de la semelle. En 2 DOF le roulis venait de
+    # l'arc minimal depuis la bind, or le pied est l'os qui s'en éloigne le plus
+    # (mesuré : 132° médian sur un bird dog, contre 71° pour spine02 et 95° pour
+    # le pied sur une fente) — près de la dégénérescence à 180°, le roulis
+    # devient arbitraire. C'est pourquoi il tenait sur un squat et cassait à
+    # quatre pattes, alors que tous les autres segments majeurs sont déjà en
+    # 3 DOF et donc immunisés.
+    "foot.L":       ("LAJC",      "LTOE",       ":footlatL",  ":footmedL"),
     # Right leg
     "upperleg01.R": ("RHJC",      "RKJC",       "RLFC",       "RMFC"),
     "lowerleg01.R": ("RKJC",      "RAJC",       "RLMAL",      "RMMAL"),
-    "foot.R":       ("RAJC",      "RTOE",       None,         None),
+    "foot.R":       ("RAJC",      "RTOE",       ":footlatR",  ":footmedR"),
 }
 
 # Root pelvis: we drive its world translation from midhip and its world rotation
@@ -241,6 +248,10 @@ def load_trc(path: str | Path) -> tuple[np.ndarray, list[str], float]:
 # plus les joint-center virtuels — ils sont reconstruits ici depuis les
 # markers de surface pour rester compatible avec le retarget avatar.
 _VIRTUAL_MARKERS: dict[str, tuple] = {
+    ":footlatL":   ("sole_axis", "l", +1.0),   # axe médio-latéral du pied,
+    ":footmedL":   ("sole_axis", "l", -1.0),   # construit depuis le plan
+    ":footlatR":   ("sole_axis", "r", +1.0),   # plantaire (7 marqueurs)
+    ":footmedR":   ("sole_axis", "r", -1.0),
     "LHJC":        ("bell_brand", "L"),                   # Bell-Brand from ASIS/PSIS
     "RHJC":        ("bell_brand", "R"),
     "LKJC":        ("midpoint", "LLFC", "LMFC"),          # knee JC = midpoint condyles
@@ -377,6 +388,40 @@ def _augment_trc_with_virtual_markers(
             tip_pos = (1.0 - lat_t) * positions[:, name_to_idx[tip_a], :] + \
                       lat_t * positions[:, name_to_idx[tip_b], :]
             new_pos = mcp_pos + forward_frac * (tip_pos - mcp_pos)
+        elif op == "sole_axis":
+            # Axe médio-latéral du pied construit depuis le PLAN de la semelle.
+            # Une simple paire de marqueurs plantaires ne convient pas : aucun
+            # couple n'est aligné en pur médio-latéral (s2 est 17 mm plus en
+            # avant que s3), ce qui biaise l'axe de ~24° et fait tourner le pied
+            # sans le corriger. Ici l'axe est le produit vectoriel avant × normale
+            # du plan : perpendiculaire à l'os PAR CONSTRUCTION. s3/s2 ne servent
+            # qu'à fixer le SIGNE (quel côté est latéral), ce pour quoi ils sont
+            # fiables.
+            side, sign = spec[1], float(spec[2])
+            sole = [name_to_idx[m] for m in marker_names
+                    if m.startswith("SOLE") and m.endswith(f"_{side}")]
+            s2n, s3n = f"SOLE_s2_{side}", f"SOLE_s3_{side}"
+            if len(sole) < 4 or s2n not in name_to_idx or s3n not in name_to_idx:
+                continue
+            P = positions[:, sole, :]
+            centre = P.mean(axis=1)
+            Q = P - centre[:, None, :]
+            # normale du plan = plus petite direction propre, par frame
+            normal = np.linalg.svd(Q)[2][:, 2, :]
+            s2 = positions[:, name_to_idx[s2n], :]
+            s3 = positions[:, name_to_idx[s3n], :]
+            heel = positions[:, name_to_idx[f"SOLE_s1_{side}"], :] \
+                if f"SOLE_s1_{side}" in name_to_idx else P[:, 0, :]
+            fwd = 0.5 * (s2 + s3) - heel
+            fwd /= np.maximum(np.linalg.norm(fwd, axis=1, keepdims=True), 1e-9)
+            lat = np.cross(fwd, normal)
+            lat /= np.maximum(np.linalg.norm(lat, axis=1, keepdims=True), 1e-9)
+            # oriente vers le côté LATÉRAL en s'appuyant sur (s3 - s2)
+            flip = np.sign(np.sum(lat * (s3 - s2), axis=1))
+            flip[flip == 0] = 1.0
+            lat *= flip[:, None]
+            scale = float(np.nanmedian(np.linalg.norm(s3 - s2, axis=1))) or 1.0
+            new_pos = centre + sign * lat * (0.5 * scale)
         elif op == "blend_lat":
             # Direction latérale interpolée entre deux paires (a = bas, b = haut).
             # On renvoie un POINT tel que (L - R) = direction mélangée unitaire.
