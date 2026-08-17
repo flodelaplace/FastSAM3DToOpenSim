@@ -1598,6 +1598,14 @@ def main(args):
     # qui lui gère l'ancrage vertical du bassin) : dès qu'un pied touche le sol,
     # il ne doit pas déraper. Désactivable via --no_anti_foot_skate.
     _antiskate_shifts = None
+    # Articulations de main : SAM3D les fournit nommees (4 par doigt), la ou le
+    # markerset ne portait que des points de PEAU — et, pour le majeur et
+    # l'annulaire, des positions INTERPOLEES (23,5 mm d'ecart mesure). On les
+    # ajoute au tableau de marqueurs, donc au TRC.
+    from sam_3d_body.export.hand_keypoints import append_hand_keypoints
+    markers_array, marker_names = append_hand_keypoints(
+        markers_array, marker_names, kpts_opensim)
+
     _anti_skate_on = (not getattr(args, "no_anti_foot_skate", False)) or args.contact_anchor
     # Mode tapis : le pied recule AVEC la bande → il DOIT glisser. On force
     # l'anti-skate OFF (sauf si --contact_anchor explicitement demandé).

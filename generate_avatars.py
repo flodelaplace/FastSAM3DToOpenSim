@@ -995,6 +995,14 @@ def main(args):
     # final → l'avatar retargeté a les pieds plantés (et le squelette post-IK
     # aussi). ACTIVÉ PAR DÉFAUT (indépendant de --contact_anchor) ; désactivable
     # via --no_anti_foot_skate.
+    # Articulations de main : SAM3D les fournit nommees (4 par doigt), la ou le
+    # markerset ne portait que des points de PEAU — et, pour le majeur et
+    # l'annulaire, des positions INTERPOLEES (23,5 mm d'ecart mesure). On les
+    # ajoute au tableau de marqueurs, donc au TRC.
+    from sam_3d_body.export.hand_keypoints import append_hand_keypoints
+    markers_array, marker_names = append_hand_keypoints(
+        markers_array, marker_names, kpts_opensim)
+
     _anti_skate_on = (not getattr(args, "no_anti_foot_skate", False)) or getattr(args, "contact_anchor", False)
     if _anti_skate_on and marker_names is not None:
         from sam_3d_body.export.coordinate_transform import anti_foot_skate_markers

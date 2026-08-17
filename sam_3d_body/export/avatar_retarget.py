@@ -77,15 +77,36 @@ MAKEHUMAN_BONE_TARGETS: dict[str, tuple[str, str, str | None, str | None]] = {
     # lowerarm02 = twist bone MakeHuman : capture uniquement la pronation via
     # LFAradius/LFAulna, sans changer la direction (héritée de lowerarm01).
     "lowerarm02.L": ("LEJC",      "LWrist_hand", "LFAradius", "LFAulna"),
-    # Left hand (2 DOF, only fingers with real markers in body-only TRC).
-    # Middle (metacarpal2) and ring (metacarpal3) are left at bind because the
-    # TRC has no LMiddle/LRing markers — using LIndexTip/LPinky as proxies made
-    # them splay weirdly. Will revisit when hand inference adds those markers.
+    # Left hand (2 DOF). NB : le TRC contient bien LMiddle/LRing depuis que la
+    # correspondance avatar les inclut — un ancien commentaire affirmait ici le
+    # contraire, ce qui a laisse les doigts sur des positions interpolees.
+    # Les metacarpiens restent en pose de bind (spread naturel du template).
     # Wrist L : flexion/extension via (LWrist_hand, LMiddle). Roll fixé par
     # LFAradius/LFAulna (mêmes aux que lowerarm02 et fingers → cohérent, pas
     # de conflit d'orientation entre palm et fingers).
     "wrist.L":      ("LWrist_hand", ":LMCP",      "LFAradius", "LFAulna"),
-    "finger1-1.L":  ("LWrist_hand", "LThumb",     None, None),
+    # Doigts pilotes par les CENTRES ARTICULAIRES fournis par SAM3D
+    # (mhr70.py : <side>-<doigt>-{first,second,third}-joint + tip), et non plus
+    # par des points de peau — ni, pour le majeur et l'annulaire, par des
+    # positions interpolees entre index et auriculaire (23,5 mm d'ecart mesure).
+    # SAM3D donne 4 points par doigt et l'avatar a 3 phalanges : la
+    # correspondance est exacte, une phalange par segment, au lieu d'une flexion
+    # globale du doigt entier.
+    "finger1-1.L":  ("LThumbMCP", "LThumbPIP", None, None),
+    "finger1-2.L":  ("LThumbPIP", "LThumbDIP", None, None),
+    "finger1-3.L":  ("LThumbDIP", "LThumbTIP", None, None),
+    "finger2-1.L":  ("LIndexMCP", "LIndexPIP", None, None),
+    "finger2-2.L":  ("LIndexPIP", "LIndexDIP", None, None),
+    "finger2-3.L":  ("LIndexDIP", "LIndexTIP", None, None),
+    "finger3-1.L":  ("LMiddleMCP", "LMiddlePIP", None, None),
+    "finger3-2.L":  ("LMiddlePIP", "LMiddleDIP", None, None),
+    "finger3-3.L":  ("LMiddleDIP", "LMiddleTIP", None, None),
+    "finger4-1.L":  ("LRingMCP", "LRingPIP", None, None),
+    "finger4-2.L":  ("LRingPIP", "LRingDIP", None, None),
+    "finger4-3.L":  ("LRingDIP", "LRingTIP", None, None),
+    "finger5-1.L":  ("LPinkyMCP", "LPinkyPIP", None, None),
+    "finger5-2.L":  ("LPinkyPIP", "LPinkyDIP", None, None),
+    "finger5-3.L":  ("LPinkyDIP", "LPinkyTIP", None, None),
     # Metacarpals L 1-4 : gardés en bind pose (spread naturel du template
     # MakeHuman). Le retarget du metacarpal donne un roll indéfini (2-DOF) ou
     # nécessite un bind_aux calibré par bone (3-DOF, non trivial pour finger).
@@ -95,21 +116,33 @@ MAKEHUMAN_BONE_TARGETS: dict[str, tuple[str, str, str | None, str | None]] = {
     # avec LFAradius/LFAulna). Éviter de définir le roll 2 fois avec des mains
     # axes différents (wrist main = LWrist→LMCP, finger main = LMCP→LTip) crée
     # un décalage cumulé visible.
-    "finger2-1.L":  ("LIndex",  "LIndexTip",  None, None),
-    "finger3-1.L":  (":LMiddle", ":LMiddleTip", None, None),
-    "finger4-1.L":  (":LRing",   ":LRingTip",   None, None),
-    "finger5-1.L":  ("LPinky",  "LPinkyTip",  None, None),
+    # Majeur et annulaire : marqueurs REELS. Ils etaient interpoles entre index
+    # et auriculaire (:LMiddle = interp 0,33) faute de les avoir dans le TRC a
+    # l'epoque — mais ils y sont depuis. Mesure de l'ecart entre la position
+    # inventee et la vraie : 23,5 mm sur le majeur, 12,3 mm sur l'annulaire.
+    # Sur une main dont les doigts sont espaces de 15-20 mm, le majeur se
+    # retrouvait quasiment a la place de l'annulaire — d'ou la main molle.
     # Right arm
     "upperarm01.R": ("RACR",      "REJC",       "RLEL",       "RMEL"),
     "lowerarm01.R": ("REJC",      "RWrist_hand", None,        None),
     "lowerarm02.R": ("REJC",      "RWrist_hand", "RFAradius", "RFAulna"),
     # Right hand — même stratégie : wrist flexion + metacarpals bind + phalanges flex/ext roll fixé.
     "wrist.R":      ("RWrist_hand", ":RMCP",      "RFAradius", "RFAulna"),
-    "finger1-1.R":  ("RWrist_hand", "RThumb",     None, None),
-    "finger2-1.R":  ("RIndex",  "RIndexTip",  None, None),
-    "finger3-1.R":  (":RMiddle", ":RMiddleTip", None, None),
-    "finger4-1.R":  (":RRing",   ":RRingTip",   None, None),
-    "finger5-1.R":  ("RPinky",  "RPinkyTip",  None, None),
+    "finger1-1.R":  ("RThumbMCP", "RThumbPIP", None, None),
+    "finger1-2.R":  ("RThumbPIP", "RThumbDIP", None, None),
+    "finger1-3.R":  ("RThumbDIP", "RThumbTIP", None, None),
+    "finger2-1.R":  ("RIndexMCP", "RIndexPIP", None, None),
+    "finger2-2.R":  ("RIndexPIP", "RIndexDIP", None, None),
+    "finger2-3.R":  ("RIndexDIP", "RIndexTIP", None, None),
+    "finger3-1.R":  ("RMiddleMCP", "RMiddlePIP", None, None),
+    "finger3-2.R":  ("RMiddlePIP", "RMiddleDIP", None, None),
+    "finger3-3.R":  ("RMiddleDIP", "RMiddleTIP", None, None),
+    "finger4-1.R":  ("RRingMCP", "RRingPIP", None, None),
+    "finger4-2.R":  ("RRingPIP", "RRingDIP", None, None),
+    "finger4-3.R":  ("RRingDIP", "RRingTIP", None, None),
+    "finger5-1.R":  ("RPinkyMCP", "RPinkyPIP", None, None),
+    "finger5-2.R":  ("RPinkyPIP", "RPinkyDIP", None, None),
+    "finger5-3.R":  ("RPinkyDIP", "RPinkyTIP", None, None),
     # Left leg (3 DOF for upperleg + lowerleg, 2 DOF for foot)
     "upperleg01.L": ("LHJC",      "LKJC",       "LLFC",       "LMFC"),
     "lowerleg01.L": ("LKJC",      "LAJC",       "LLMAL",      "LMMAL"),
@@ -584,6 +617,7 @@ def retarget_from_trc(
         # Walk down through twist children until we hit a "real" anatomical bone.
         # A MakeHuman twist bone has a name ending in "02" with the same prefix.
         current = ji
+        tail = None
         for _ in range(4):  # safety bound
             cs = children_of.get(current, [])
             if not cs:
@@ -599,6 +633,13 @@ def retarget_from_trc(
             current = best
         else:
             tail = rig.bind_world[current, :3, 3]
+        if tail is None:
+            # Os TERMINAL : aucun enfant dans le skin. C'est le cas des phalanges
+            # distales (finger*-3), premiers os terminaux jamais pilotes — d'ou
+            # un UnboundLocalError silencieusement avale par la boucle avatar.
+            # Convention MakeHuman : la direction d'un os est son axe local Y.
+            return rig.bind_world[ji, :3, 1] / (
+                np.linalg.norm(rig.bind_world[ji, :3, 1]) or 1.0)
         v = tail - head
         n = np.linalg.norm(v)
         if n < 1e-9:
