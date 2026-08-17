@@ -272,11 +272,23 @@ def parse_filename(basename):
         raise FilenameParseError(
             f"start ({trim_start}s) must be < end ({trim_end}s)"
         )
-    # Macro `bikefit` = --stationary + --lock-vertical + --no_lean_fix.
-    # Développée AVANT la sérialisation en flags CLI.
+    # Macro `bikefit` (home-trainer) = --stationary + --lock-vertical, plus le
+    # module cyclisme. Développée AVANT la sérialisation en flags CLI.
+    #
+    # Elle ajoutait aussi --no_lean_fix, ce qui était contre-productif : ce flag
+    # DÉSACTIVE la mise au sol (`if _floor_moge_on and not args.no_lean_fix`),
+    # donc le squelette sortait sous le sol et désaligné du mesh. Elle
+    # n'activait pas non plus de module, si bien qu'aucune analytics n'était
+    # produite pour un bikefit — le cas d'usage qui en a le plus besoin.
     if bikefit:
         stationary = True
         lock_vertical = True
+        if module is None:
+            module = "d3.cycling"
+        if cycling_position is None:
+            # Home-trainer : position de route par défaut, surchargeable par un
+            # token tt/comfort explicite dans le nom de fichier.
+            cycling_position = "road"
         if floor:
             raise FilenameParseError(
                 "Token 'bikefit' incompatible avec 'floor' — sur home-trainer "
@@ -307,10 +319,6 @@ def parse_filename(basename):
         extra.append("--contact_anchor")
     if lock_vertical:
         extra.append("--lock-vertical")
-    if bikefit:
-        # Macro : ajoute --no_lean_fix (les autres flags ont déjà été activés
-        # dans la section normalisation ci-dessus).
-        extra.append("--no_lean_fix")
 
     # Auto-analytics : ajoute --module + --mass_kg + --age + --sex + --level
     # si le nom de fichier fournit ces tokens. Le pipeline SAM3D relaie ces
