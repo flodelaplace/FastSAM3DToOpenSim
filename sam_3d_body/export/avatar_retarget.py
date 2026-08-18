@@ -660,6 +660,30 @@ def retarget_from_trc(
         dir_bind = bind_direction(bone)
         bone_meta.append((ji, dir_bind, pmark, cmark, aux_lat, aux_med, parent_rel))
 
+    # --- Retarget RELATIF des doigts -------------------------------------
+    # Les deux mains ont des poses de repos differentes (MHR 9,8 deg
+    # d'etalement lateral, avatar MakeHuman 28 deg) : imposer une direction
+    # absolue force une rotation ample et DIFFERENTE par doigt, dont le roulis
+    # — non contraint en 2 DOF — part de travers. On transfere donc la rotation
+    # depuis le neutre, exprimee dans le repere de la main : referentiel commun
+    # qui evite toute conversion de repere.
+    from sam_3d_body.export.relative_fingers import (
+        neutral_hand_dirs, hand_frames_per_frame)
+    _finger_pairs = {b: (t[0], t[1]) for b, t in bone_targets.items()
+                     if b.startswith("finger") and b in name_to_local}
+    _neutral_dirs = neutral_hand_dirs(_finger_pairs) if _finger_pairs else None
+    from sam_3d_body.export.finger_joint_angles import (
+        joint_angles, avatar_hand_axis, avatar_palm_normal)
+    _hand_frames = (hand_frames_per_frame(trc_positions, name_to_idx)
+                    if _neutral_dirs else {})
+    _wrist_idx = {s: name_to_local.get(f"wrist.{s}") for s in ("L", "R")}
+    _hand_axis = {s: avatar_hand_axis(rig, s) for s in ("L", "R")}
+    _palm_norm = {s: avatar_palm_normal(rig, s) for s in ("L", "R")}
+    bone_name_of = {name_to_local[b]: b for b in bone_targets
+                    if b in name_to_local}
+    _fangles = (joint_angles(trc_positions, name_to_idx, _hand_frames,
+                             list(_finger_pairs)) if _hand_frames else {})
+
     # For each frame, walk top-down: compute target world rotation for each driven
     # bone, then convert to local via parent's target world rotation.
     # We need the entire chain's target world rotations even for bones we don't drive,
@@ -803,6 +827,77 @@ def retarget_from_trc(
                     n = np.linalg.norm(dir_t_subj)
                     if n < 1e-6:
                         tw = parent_world @ R.from_quat(rig.bind_local_q[ji]).as_matrix()
+                    elif (bone_name_of.get(ji, "") in _fangles
+                          and _hand_axis.get(bone_name_of[ji][-1]) is not None
+                          and _wrist_idx.get(bone_name_of[ji][-1]) is not None):
+                        # ANGLE ARTICULAIRE. L'angle entre deux segments
+                        # consecutifs ne depend d'aucune pose de reference : on
+                        # le mesure chez le sujet et on l'impose a l'articulation
+                        # de l'avatar, en partant de la direction ANIMEE de son
+                        # propre parent. L'eventail naturel de l'avatar est donc
+                        # conserve, et l'abduction est exclue par construction
+                        # (l'angle est projete dans le plan de flexion).
+                        _bn = bone_name_of[ji]; _side = _bn[-1]
+                        _wi = _wrist_idx[_side]
+                        # axe de flexion, suivant le poignet anime
+                        _Rw = (target_world_rot[_wi]
+                               @ rig.bind_world[_wi, :3, :3].T)
+                        _ax0 = _Rw @ _hand_axis[_side]
+                        _ax0 = _ax0 / (np.linalg.norm(_ax0) + 1e-12)
+                        # direction animee du parent
+                        _pj = rig.joint_to_parent.get(ji, -1)
+                        if _pj >= 0 and _pj in bone_bind_dir_avatar:
+                            _dpb = bone_bind_dir_avatar[_pj]
+                        else:
+                            _dpb = bind_direction(rig.joint_names[_pj]) if _pj >= 0 \
+                                   else bone_bind_dir_avatar[ji]
+                        _dp = (target_world_rot[_pj] @ rig.bind_world[_pj, :3, :3].T
+                               @ _dpb) if _pj >= 0 else _dpb
+                        _dp = _dp / (np.linalg.norm(_dp) + 1e-12)
+                        # Axe de flexion PAR DOIGT : perpendiculaire au doigt
+                        # lui-meme et contenu dans le plan de la paume. Un axe
+                        # commun (le X de la main) n'est correct que pour un
+                        # doigt aligne dessus — d'ou index et auriculaire
+                        # corrects, mais majeur et annulaire deportes
+                        # lateralement, leur metacarpien s'en ecartant le plus.
+                        _nrm = _palm_norm.get(_side)
+                        if _nrm is not None:
+                            _ax = np.cross(_Rw @ _nrm, _dp)
+                            _na = np.linalg.norm(_ax)
+                            # garde le sens de flexion de l'axe commun
+                            _ax = (_ax / _na * np.sign(_ax @ _ax0 or 1.0)
+                                   if _na > 1e-9 else _ax0)
+                        else:
+                            _ax = _ax0
+                        # On ne remplace QUE la flexion. Chaque phalange porte
+                        # au repos une abduction propre (mesuree sur ce rig :
+                        # metacarpiens a -2,9/-6,9/-8,4/-2,7 deg, phalanges a
+                        # 11,3/16,9/15,8/20,3) — c'est elle qui rattrape
+                        # l'irregularite des metacarpiens et donne l'eventail.
+                        # La calculer depuis le seul parent la detruisait, d'ou
+                        # un eventail desordonne. On decompose donc la pose de
+                        # bind en (abduction, flexion) et on ne touche qu'a la
+                        # seconde.
+                        _nb = _Rw @ _nrm if _nrm is not None else None
+                        _bd = bone_bind_dir_avatar[ji]
+                        _dpb0 = _dpb / (np.linalg.norm(_dpb) + 1e-12)
+                        if _nb is not None:
+                            _nbind = _nrm / (np.linalg.norm(_nrm) + 1e-12)
+                            _wb = np.cross(_nbind, _dpb0)
+                            _wb /= (np.linalg.norm(_wb) + 1e-12)
+                            # composantes de la direction de bind de l'os
+                            _fx = np.arctan2(_bd @ _nbind, _bd @ _dpb0)   # abduction
+                            _th_bind = np.arctan2(_bd @ _wb, _bd @ _dpb0)  # flexion
+                        else:
+                            _fx = 0.0; _th_bind = 0.0
+                        _th = float(_fangles[_bn][t])
+                        _rot = R.from_rotvec(_ax * (_th - _th_bind)).as_matrix()
+                        main_av = _rot @ ((target_world_rot[_pj]
+                                           @ rig.bind_world[_pj, :3, :3].T @ _bd)
+                                          if _pj >= 0 else _bd)
+                        bind_main = bone_bind_dir_avatar[ji]
+                        _q = _quat_from_two_vectors(bind_main, main_av)
+                        tw = R.from_quat(_q).as_matrix() @ _bind_world_rot_of(rig, ji)
                     else:
                         # ABSOLUTE alignment. Main axis = bone direction.
                         main_av = _vec_into_avatar(dir_t_subj) / n
