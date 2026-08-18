@@ -46,6 +46,84 @@ def _resolve(data_dir, rel):
     return path
 
 
+def _hem_top_z(top):
+    """Altitude du point le plus haut de l'ourlet BAS du vêtement du haut.
+
+    Les hauts MakeHuman ont plusieurs bords ouverts (col, deux poignets, ourlet).
+    On les sépare en composantes connexes d'arêtes de bord et on retient celle
+    qui contient le point le plus bas : c'est l'ourlet.
+    """
+    import bmesh
+
+    bm = bmesh.new()
+    bm.from_mesh(top.data)
+    mw = top.matrix_world
+    z = {v.index: (mw @ v.co).z for v in bm.verts}
+
+    adj = {}
+    for e in bm.edges:
+        if len(e.link_faces) == 1:                     # arête de bord
+            a, b = e.verts[0].index, e.verts[1].index
+            adj.setdefault(a, set()).add(b)
+            adj.setdefault(b, set()).add(a)
+    if not adj:
+        bm.free()
+        return None
+
+    seen, loops = set(), []
+    for start in adj:
+        if start in seen:
+            continue
+        stack, comp = [start], []
+        seen.add(start)
+        while stack:
+            v = stack.pop()
+            comp.append(v)
+            for w in adj[v]:
+                if w not in seen:
+                    seen.add(w)
+                    stack.append(w)
+        loops.append(comp)
+    bm.free()
+
+    hem = min(loops, key=lambda c: min(z[v] for v in c))
+    return max(z[v] for v in hem)
+
+
+def _trim_waistband(top, lower):
+    """Supprime la partie du bas de vêtement qui dépasse au-dessus de l'ourlet.
+
+    Les ceintures MakeHuman sont modélisées dans le mesh du pantalon, à un rayon
+    plus grand que le haut : elles transpercent donc le pull au lieu de passer
+    dessous. Aucun matériau séparé ne permet de les isoler, et aucun haut du
+    catalogue n'est assez long pour les couvrir.
+
+    On coupe le pantalon à l'altitude du POINT LE PLUS HAUT de l'ourlet. Comme
+    l'ourlet est partout à cette altitude ou en dessous, le pull recouvre la
+    coupe sur tout le tour : pas de trou, et la ceinture disparaît.
+    """
+    import bmesh
+
+    if top is None or lower is None:
+        return
+    cut = _hem_top_z(top)
+    if cut is None:
+        print("[avatar]   ceinture : ourlet introuvable, découpe ignorée")
+        return
+
+    bm = bmesh.new()
+    bm.from_mesh(lower.data)
+    mw = lower.matrix_world
+    doomed = [v for v in bm.verts if (mw @ v.co).z > cut]
+    if doomed:
+        bmesh.ops.delete(bm, geom=doomed, context="VERTS")
+        bm.to_mesh(lower.data)
+        lower.data.update()
+    bm.free()
+    print(f"[avatar]   ceinture : {lower.name} coupé à z={cut:.3f} "
+          f"({len(doomed)} verts retirés)")
+
+
 def main():
     argv = sys.argv[sys.argv.index("--") + 1:]
     spec_path, out_path = argv[0], argv[1]
@@ -100,10 +178,18 @@ def main():
         print(f"[avatar]   {part:<9}: {rel}"
               + (f"  [matériau {mat_rel}]" if mat_rel else ""))
 
+    clothes_objs = []
     for rel in spec.get("clothes", []):
+        before_objs = set(bpy.context.scene.objects)
         HumanService.add_mhclo_asset(
             _resolve(data_dir, rel), basemesh, asset_type="Clothes")
+        new = [o for o in set(bpy.context.scene.objects) - before_objs
+               if o.type == "MESH"]
+        clothes_objs.append(new[0] if new else None)
         print(f"[avatar]   vêtement : {rel}")
+
+    if spec.get("trim_waistband") and len(clothes_objs) >= 2:
+        _trim_waistband(clothes_objs[0], clothes_objs[1])
 
     # MPFB masque la géométrie "helper" du corps (aide au drapé des vêtements,
     # cubes de repère articulaire) avec un modificateur MASK. L'export glTF
