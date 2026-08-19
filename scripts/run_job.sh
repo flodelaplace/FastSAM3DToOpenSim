@@ -195,17 +195,41 @@ fi
 # ---- Push results to S3 -----------------------------------------------------
 echo ">>> Uploading results to S3..."
 if [ "$MODE" = "avatar" ]; then
-    # Avatar : on n'envoie QUE les GLB avatars (pas le TRC, pas l'inference_meta).
-    # L'app kiné a juste besoin des avatars finaux.
+    # Avatar : on n'envoie QUE l'ANIMATION, pas les corps.
+    #
+    # Un GLB d'avatar animé pèse ~4,3 Mo dont 5,8 % seulement d'animation : 43 %
+    # de textures et 49 % de géométrie. Comme on produit 10 morphologies, on
+    # enverrait dix fois le même corps — 42,7 Mo par exercice. Or les 10 corps
+    # sont déjà publiés une fois pour toutes et mis en cache par l'app, qui
+    # recombine corps + animation à l'affichage.
+    #
+    # Rien n'est perdu : merge_avatar_animation.py reconstitue hors ligne un GLB
+    # fusionné bit-à-bit identique à partir du template et du clip.
+    #
+    # Les noms de sortie sont inchangés (<template_id>.glb) : le contrat côté
+    # app ne bouge pas, seul le poids change.
     AVATAR_COUNT=$(find "$OUTPUT_DIR" -maxdepth 1 -name "*_avatar_*.glb" | wc -l)
-    echo ">>> Uploading $AVATAR_COUNT avatar GLB(s) to $S3_OUTPUT_PATH"
+    echo ">>> Extracting animation from $AVATAR_COUNT avatar GLB(s)"
+    GLTF_PY=/opt/conda/envs/opensim/bin/python
+    [ -x "$GLTF_PY" ] || GLTF_PY=python
+    CLIP_DIR="$OUTPUT_DIR/_clips"
+    mkdir -p "$CLIP_DIR"
     for glb in "$OUTPUT_DIR"/*_avatar_*.glb; do
         [ -f "$glb" ] || continue
         # Strip the markers_<name>_avatar_ prefix → keep only "<template_id>.glb"
         # ex: markers_squat_001__h180_floor_avatar_female_young.glb → female_young.glb
         BASENAME=$(basename "$glb")
         TEMPLATE_ID=$(echo "$BASENAME" | sed -E 's/.*_avatar_(.+)\.glb$/\1.glb/')
-        aws s3 cp "$glb" "${S3_OUTPUT_PATH}${TEMPLATE_ID}" --no-progress
+        # pygltflib vit dans l'env `opensim`, pas dans le python par défaut.
+        if "$GLTF_PY" /app/scripts/extract_avatar_animation.py \
+                "$glb" "${CLIP_DIR}/${TEMPLATE_ID}" >/dev/null; then
+            aws s3 cp "${CLIP_DIR}/${TEMPLATE_ID}" \
+                "${S3_OUTPUT_PATH}${TEMPLATE_ID}" --no-progress
+        else
+            # Repli : mieux vaut un fichier lourd qu'un exercice manquant.
+            echo ">>> WARN: extraction échouée pour $BASENAME, envoi du GLB complet" >&2
+            aws s3 cp "$glb" "${S3_OUTPUT_PATH}${TEMPLATE_ID}" --no-progress
+        fi
     done
 else
     aws s3 cp "$OUTPUT_DIR" "$S3_OUTPUT_PATH" --recursive --no-progress
