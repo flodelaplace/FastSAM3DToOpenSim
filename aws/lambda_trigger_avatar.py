@@ -11,7 +11,7 @@ The lambda :
   - parses exercise_id from the filename (before "__")
   - parses meta tokens (height + flags)
   - submits a Batch job with MODE=avatar
-  - sets S3_OUTPUT_URI = s3://<bucket>/02-output-avatar/<user_id>/<exercise_id>/
+  - sets S3_OUTPUT_URI = s3://<bucket>/02-output-avatar/private/<user_id>/<exercise_id>/
   - the container will then upload {template}.glb directly under that prefix.
 
 Filename meta tokens (post `__`):
@@ -29,15 +29,15 @@ Multi-person is NOT supported in avatar mode (1 video = 1 subject = 4 avatars).
 Examples:
     01-input-avatar/kine_42/squat_001__h180_floor.mp4
         → submit avec --person_height 1.80 --floor
-        → output: s3://.../02-output-avatar/kine_42/squat_001/{female_young,male_young,...}.glb
+        → output: s3://.../02-output-avatar/private/kine_42/squat_001/{female_young,male_young,...}.glb
 
     01-input-avatar/kine_42/5sts_001__h165_seated_anchor.mp4
         → submit avec --person_height 1.65 --floor_seated --feet_anchor
-        → output: s3://.../02-output-avatar/kine_42/5sts_001/
+        → output: s3://.../02-output-avatar/private/kine_42/5sts_001/
 
     01-input-avatar/kine_42/rameur_001__h175.mp4
         → submit avec --person_height 1.75  (pas de floor — rameur assis machine)
-        → output: s3://.../02-output-avatar/kine_42/rameur_001/
+        → output: s3://.../02-output-avatar/private/kine_42/rameur_001/
 """
 import json
 import os
@@ -54,7 +54,12 @@ JOB_QUEUE = os.environ.get("JOB_QUEUE", "synkro-fastsam3d-queue")
 JOB_DEFINITION = os.environ.get("JOB_DEFINITION", "synkro-fastsam3d-avatar-job")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 S3_OUTPUT_BUCKET = os.environ.get("S3_OUTPUT_BUCKET", "data-synchro-video")
-S3_OUTPUT_PREFIX = os.environ.get("S3_OUTPUT_PREFIX", "02-output-avatar")
+# Le segment `private/` est structurant, pas decoratif : tout ce que le pipeline
+# genere appartient au compte du kine et n'est visible que de lui. La banque
+# communautaire vit sous `02-output-avatar/public/`, ou l'on ne PROMEUT que par
+# une copie explicite. Aucun job n'ecrit jamais directement dans public/ : c'est
+# ce qui garantit qu'un avatar ne devient pas communautaire par accident.
+S3_OUTPUT_PREFIX = os.environ.get("S3_OUTPUT_PREFIX", "02-output-avatar/private")
 S3_INPUT_PREFIX = os.environ.get("S3_INPUT_PREFIX", "01-input-avatar")
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
@@ -62,7 +67,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 HEIGHT_RE = re.compile(r"^h(\d{2,3})$")
 START_RE = re.compile(r"^s(\d+)$")
 END_RE = re.compile(r"^e(\d+)$")
-FLAG_TOKENS = {"st", "com", "floor", "seated", "anchor"}
+FLAG_TOKENS = {"st", "com", "floor", "seated", "anchor", "ca", "ll"}
 
 _SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
@@ -132,6 +137,8 @@ def parse_filename(basename):
     floor = False
     seated = False
     anchor = False
+    contact_anchor = False
+    lock_lateral = False
 
     for t in tokens:
         m = HEIGHT_RE.match(t)
@@ -167,6 +174,12 @@ def parse_filename(basename):
         if t == "anchor":
             anchor = True
             continue
+        if t == "ca":
+            contact_anchor = True
+            continue
+        if t == "ll":
+            lock_lateral = True
+            continue
         raise FilenameParseError(f"Unknown token: '{t}'")
 
     if height_cm is None:
@@ -181,7 +194,13 @@ def parse_filename(basename):
             "('seated' implique déjà --floor_seated)."
         )
 
-    extra = ["--person_height", f"{height_cm / 100.0:.2f}"]
+    # --floor_moge TOUJOURS explicite. Il s'active certes par defaut, mais
+    # UNIQUEMENT si ni --floor ni --floor_seated ne sont passes (cf.
+    # generate_avatars.py, `_floor_moge_on`). Sans cette ligne, les tokens
+    # `floor` et `seated` desactiveraient silencieusement la detection de sol
+    # MoGe — alors que le pipeline local (trim_and_run.py) la passe toujours.
+    # Les deux chemins doivent produire le meme resultat pour la meme video.
+    extra = ["--person_height", f"{height_cm / 100.0:.2f}", "--floor_moge"]
     if stationary:
         extra.append("--stationary")
     if compute_com:
@@ -192,6 +211,10 @@ def parse_filename(basename):
         extra.append("--floor_seated")
     if anchor:
         extra.append("--feet_anchor")
+    if contact_anchor:
+        extra.append("--contact_anchor")
+    if lock_lateral:
+        extra.append("--lock_lateral")
 
     return {
         "exercise_id": exercise_id,
