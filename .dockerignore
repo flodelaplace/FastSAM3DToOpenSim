@@ -20,6 +20,8 @@ synkro-analytics/docs/
 synkro-analytics/examples/
 synkro-analytics/.git/
 synkro-analytics/.venv/
+# Exclude opencap-processing build artifacts that may not exist locally
+opencap-processing/UtilsDynamicSimulations/OpenSimAD/opensimAD-install/
 *.pem
 *.bak*
 mhr2smpl/experiments/

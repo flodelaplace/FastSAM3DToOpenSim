@@ -46,6 +46,16 @@ class HumanDetector:
         self._tracker_cfg = tracker
         print(f"  [tracker] enabled {tracker} tracking")
 
+    def disable_tracking(self):
+        """Coupe le tracking.
+
+        Indispensable dans un worker persistant : `_tracking_enabled` est
+        collant, donc apres UNE video --multi_person toutes les suivantes
+        passeraient par `run_yolo_pose_tracked` (filtrage BoT-SORT different)
+        au lieu de `run_yolo_pose`. Detections differentes, silencieusement.
+        """
+        self._tracking_enabled = False
+
     def reset_tracker(self):
         """Reset the internal tracker state (call between videos)."""
         if self._tracking_enabled and hasattr(self.detector, 'predictor'):

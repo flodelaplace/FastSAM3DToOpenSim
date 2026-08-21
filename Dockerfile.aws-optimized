@@ -1,0 +1,163 @@
+# FastSAM3DToOpenSim — Docker image optimized for AWS
+# Multi-stage build: builder (with dev tools) → runtime (stripped, ~8-10 GB)
+#
+# KEY CHANGES vs. standard Dockerfile:
+# - Multi-stage: eliminates gcc, python3-dev, conda-build, node.js from final image
+# - Checkpoints + TensorRT engines pulled from S3 at runtime (not baked in)
+# - Aggressive cache cleanup and __pycache__ removal
+# - Runtime image ships only binaries, shared libs, and Python environments
+
+# =============================================================================
+# STAGE 1: Builder — compilation environment (discarded after build)
+# =============================================================================
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=5 \
+    PIP_NO_CACHE_DIR=1
+
+# Install build tools + system runtime libs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget git curl ca-certificates unzip \
+        ffmpeg \
+        libgl1 libglib2.0-0 \
+        libgomp1 libegl1 libxrender1 libxext6 \
+        libsm6 libx11-6 \
+        gcc g++ make python3-dev \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# AWS CLI v2
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip && \
+    unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install && rm -rf /tmp/aws /tmp/awscli.zip
+
+# s5cmd v2.2.2 (parallel S3 sync)
+RUN curl -fsSL "https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz" \
+    | tar xz -C /usr/local/bin/ s5cmd && chmod +x /usr/local/bin/s5cmd
+
+# Miniforge
+RUN wget -q \
+    https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
+    -O /tmp/miniforge.sh && \
+    bash /tmp/miniforge.sh -b -p /opt/conda && \
+    rm /tmp/miniforge.sh && \
+    /opt/conda/bin/conda clean -afy
+
+ENV PATH="/opt/conda/bin:$PATH"
+SHELL ["/bin/bash", "-c"]
+
+# =============================================================================
+# Build Environment 1: fast_sam_3d_body (Python 3.11)
+# =============================================================================
+
+RUN conda create -y -n fast_sam_3d_body python=3.11 pip && \
+    /opt/conda/envs/fast_sam_3d_body/bin/pip install \
+        numpy cython setuptools virtualenv
+
+RUN conda install -y -n fast_sam_3d_body -c conda-forge chumpy && \
+    conda clean -afy
+
+RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
+        torch==2.5.1+cu124 \
+        torchvision==0.20.1+cu124 \
+        --extra-index-url https://download.pytorch.org/whl/cu124
+
+RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
+        "tensorrt-cu12==10.7.0" "tensorrt-cu12-bindings==10.7.0" "tensorrt-cu12-libs==10.7.0"
+
+COPY docker/requirements_docker.txt /tmp/requirements_docker.txt
+RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
+        -r /tmp/requirements_docker.txt
+
+RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
+        "git+https://github.com/microsoft/MoGe.git@07444410f1e33f402353b99d6ccd26bd31e469e8" \
+        "git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6" \
+        "git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183"
+
+# Aggressive cleanup for builder
+RUN conda clean -afy && \
+    find /opt/conda -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true && \
+    find /opt/conda/envs/fast_sam_3d_body -name '*.pyc' -delete && \
+    find /opt/conda/envs/fast_sam_3d_body -name '*.dist-info' -type d -exec rm -rf {} + 2>/dev/null || true
+
+# =============================================================================
+# Build Environment 2: opensim (Python 3.10)
+# =============================================================================
+
+RUN conda create -y -n opensim -c opensim-org -c conda-forge python=3.10 opensim && \
+    conda clean -afy
+
+RUN /opt/conda/envs/opensim/bin/pip install --no-cache-dir \
+        scipy==1.10.0 pandas matplotlib ipython python-decouple \
+        maskpass==0.3.6 requests casadi pyyaml joblib cmake seaborn
+
+RUN /opt/conda/envs/opensim/bin/pip install --no-cache-dir \
+        torch --index-url https://download.pytorch.org/whl/cpu
+
+RUN /opt/conda/envs/opensim/bin/pip install --no-cache-dir \
+        nimblephysics accelerate einops \
+        weasyprint jinja2 pygltflib reportlab
+
+# Aggressive cleanup for builder
+RUN conda clean -afy && \
+    find /opt/conda -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true && \
+    find /opt/conda/envs/opensim -name '*.pyc' -delete && \
+    find /opt/conda/envs/opensim -name '*.dist-info' -type d -exec rm -rf {} + 2>/dev/null || true
+
+# synkro-analytics (pre-built in builder, will be copied to runtime)
+COPY synkro-analytics /tmp/synkro-analytics
+RUN /opt/conda/envs/opensim/bin/pip install --no-cache-dir -e /tmp/synkro-analytics && \
+    find /opt/conda -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+
+# =============================================================================
+# STAGE 2: Runtime — slim production image
+# =============================================================================
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=5 \
+    PIP_NO_CACHE_DIR=1
+
+# Runtime-only system dependencies (NO gcc, NO python3-dev, NO build tools)
+# Note: ffmpeg, libgl1, etc. are still needed for inference
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        wget git curl ca-certificates unzip \
+        ffmpeg \
+        libgl1 libglib2.0-0 \
+        libgomp1 libegl1 libxrender1 libxext6 \
+        libsm6 libx11-6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# AWS CLI v2 (needed for S3 operations in run_job.sh)
+RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip && \
+    unzip -q /tmp/awscli.zip -d /tmp && /tmp/aws/install && rm -rf /tmp/aws /tmp/awscli.zip
+
+# s5cmd v2.2.2 (parallel S3 sync)
+RUN curl -fsSL "https://github.com/peak/s5cmd/releases/download/v2.2.2/s5cmd_2.2.2_Linux-64bit.tar.gz" \
+    | tar xz -C /usr/local/bin/ s5cmd && chmod +x /usr/local/bin/s5cmd
+
+# Copy pre-built conda environments from builder
+COPY --from=builder /opt/conda /opt/conda
+
+ENV PATH="/opt/conda/bin:$PATH"
+ENV OPENSIM_PYTHON_PATH /opt/conda/envs/opensim/bin/python
+ENV OPENCAP_PROCESSING_PATH /app/opencap-processing
+
+# Application code
+WORKDIR /app
+COPY . /app
+
+# Ensure output/checkpoint dirs exist
+RUN mkdir -p /outputs /app/checkpoints /app/videos
+
+# Make scripts executable
+RUN chmod +x /app/docker/entrypoint.sh /app/scripts/run_job.sh && \
+    ln -sf /app/docker/entrypoint.sh /entrypoint.sh
+
+# Volumes for persistent data (engines, checkpoints, results)
+VOLUME ["/app/checkpoints", "/app/videos", "/outputs"]
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["bash"]

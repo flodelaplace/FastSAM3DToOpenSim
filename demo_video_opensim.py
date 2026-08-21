@@ -568,7 +568,13 @@ def _lean_angle_over_range(keypoints, center_frame, half_window=5):
     return float(np.median(angles))
 
 
-def main(args):
+def main(args, estimator=None, visualizer=None):
+    """Traite une video.
+
+    `estimator` / `visualizer` sont injectables pour qu'un worker persistant
+    charge les modeles UNE fois (73 s mesurees) au lieu d'a chaque video. En
+    ligne de commande ils restent None et le comportement est inchange.
+    """
     # Auto-generate timestamped output directory (matches SAM3D-OpenSim convention)
     if args.output_dir is None:
         video_name_raw = os.path.splitext(os.path.basename(args.video_path))[0]
@@ -617,16 +623,20 @@ def main(args):
         print(f"Using fixed intrinsics: fx={fx:.1f} fy={fy:.1f}")
 
     # ── Model loading ─────────────────────────────────────────────────────────
-    print("Loading SAM 3D Body model...")
-    t_load = time.time()
-    estimator = setup_sam_3d_body(
-        detector_name=args.detector,
-        detector_model=args.detector_model,
-        local_checkpoint_path=args.local_checkpoint,
-    )
-    visualizer = SkeletonVisualizer(line_width=2, radius=5)
-    visualizer.set_pose_meta(mhr70_pose_info)
-    print(f"Model loaded in {time.time() - t_load:.1f}s")
+    if estimator is None:
+        print("Loading SAM 3D Body model...")
+        t_load = time.time()
+        estimator = setup_sam_3d_body(
+            detector_name=args.detector,
+            detector_model=args.detector_model,
+            local_checkpoint_path=args.local_checkpoint,
+        )
+        print(f"Model loaded in {time.time() - t_load:.1f}s")
+    else:
+        print("Reusing preloaded SAM 3D Body model (worker persistant)")
+    if visualizer is None:
+        visualizer = SkeletonVisualizer(line_width=2, radius=5)
+        visualizer.set_pose_meta(mhr70_pose_info)
 
     # Optionally estimate floor tilt from MoGe on frame 0 and skip spine correction
     # when MoGe estimation is active (avoids overcorrection).
@@ -761,6 +771,46 @@ def main(args):
 
     frame_step = max(1, round(fps / args.target_fps)) if args.target_fps > 0 else 1
     out_fps    = fps / frame_step
+
+    # ── Intrinsèques caméra : une fois, pas à chaque frame ────────────────────
+    # Sans --fx, `cam_int` reste None et l'estimateur relance MoGe sur CHAQUE
+    # frame pour ré-estimer une focale qui ne bouge pas (10,4 s mesurées sur une
+    # vidéo de 285 frames, soit 18 % de la boucle d'inférence). On échantillonne
+    # N frames et on prend la médiane : plus rapide, et plus stable qu'une focale
+    # qui fluctue d'une frame à l'autre.
+    # Hypothèse : pas de zoom pendant la vidéo. C'est pourquoi c'est opt-in —
+    # une prise de vue moto avec zoom violerait cette hypothèse.
+    if cam_int is None and getattr(args, "fov_once", 0) > 0:
+        _fov = getattr(estimator, "fov_estimator", None)
+        if _fov is None:
+            print("  [fov_once] pas d'estimateur FOV, ignoré")
+        else:
+            _n = max(1, min(args.fov_once, max(1, total)))
+            _t_fov = time.time()
+            _fx_s, _fy_s = [], []
+            for _i in np.linspace(0, max(0, total - 1), _n).astype(int):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(_i))
+                _ok, _fr = cap.read()
+                if not _ok:
+                    continue
+                _K = _fov.get_cam_intrinsics(cv2.cvtColor(_fr, cv2.COLOR_BGR2RGB))
+                if hasattr(_K, "detach"):          # tensor torch
+                    _K = _K.detach().float().cpu().numpy()
+                _K = np.asarray(_K, dtype=np.float64).reshape(3, 3)
+                _fx_s.append(_K[0, 0])
+                _fy_s.append(_K[1, 1])
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)   # la boucle repart de zéro
+            if _fx_s:
+                _fx_m, _fy_m = float(np.median(_fx_s)), float(np.median(_fy_s))
+                cam_int = torch.tensor(
+                    [[_fx_m, 0.0, width / 2.0], [0.0, _fy_m, height / 2.0], [0.0, 0.0, 1.0]],
+                    dtype=torch.float32).unsqueeze(0).cuda()
+                _sp = float(np.std(_fx_s)) if len(_fx_s) > 1 else 0.0
+                print(f"  [fov_once] fx={_fx_m:.1f} fy={_fy_m:.1f} "
+                      f"(médiane de {len(_fx_s)}/{_n} frames, écart-type fx={_sp:.1f}, "
+                      f"{time.time() - _t_fov:.2f}s) → MoGe ne tournera plus par frame")
+            else:
+                print("  [fov_once] aucune frame exploitable, repli sur l'estimation par frame")
 
     video_name = os.path.splitext(os.path.basename(args.video_path))[0]
     prefix = f"markers_{video_name}"
@@ -1493,9 +1543,14 @@ def main(args):
     _auto_contact_anchor = args.module in ("d3.single_leg_squat",
                                             "d3.single_leg_hop")
     _stationary_effective = args.stationary or _auto_stationary
-    # Running/gait/sprint : feet peuvent lever naturellement → clamp désactivé
-    if args.module in ("d3.running", "d3.gait", "d3.sprint_start"):
-        os.environ["NO_FLOOR_CLAMP"] = "1"
+    # Running/gait/sprint : feet peuvent lever naturellement → clamp désactivé.
+    # Écrit à CHAQUE vidéo, y compris "0" : sinon la valeur posée par une vidéo
+    # de course resterait active pour les suivantes (squat, CMJ, STS, cycling)
+    # dans un process qui en traite plusieurs → marqueurs pieds décalés de
+    # plusieurs cm, TRC et IK faux, sans le moindre message d'erreur.
+    os.environ["NO_FLOOR_CLAMP"] = (
+        "1" if args.module in ("d3.running", "d3.gait", "d3.sprint_start") else "0"
+    )
 
     kpts_opensim, jcoords_opensim = transformer.transform(
         kpts_processed,
@@ -2433,7 +2488,13 @@ OpenSim workflow:
             print(f"[analytics] ⚠ Python env not found ({opensim_py}). Skipping. {e}")
 
 
-if __name__ == "__main__":
+def build_parser():
+    """Construit le parser CLI.
+
+    Extrait de `__main__` pour qu'un worker persistant rejoue EXACTEMENT la
+    meme ligne de commande que le CLI. Dupliquer les flags ailleurs serait la
+    garantie d'une divergence silencieuse dans six mois.
+    """
     parser = argparse.ArgumentParser(description="Fast SAM 3D Body – OpenSim Export")
     parser.add_argument("--video_path", default="./videos/aitor_garden_walk.mp4")
     parser.add_argument("--output_dir", default=None,
@@ -2686,8 +2747,18 @@ if __name__ == "__main__":
                         choices=[None, "single", "triple", "crossover", "timed6m"],
                         help="Type de saut pour d3.single_leg_hop (RTS) : single (défaut) / "
                              "triple / crossover / timed6m. Relayé à synkro-analytics.")
+    parser.add_argument("--fov_once", type=int, default=0, metavar="N",
+                        help="Estimer les intrinsèques caméra UNE fois (médiane de N "
+                             "frames échantillonnées) au lieu de relancer MoGe à chaque "
+                             "frame. 0 = désactivé (comportement historique). 8 est un bon "
+                             "point de départ. Gain mesuré ~10 s sur 285 frames. "
+                             "Suppose que la focale ne bouge pas pendant la vidéo : à "
+                             "éviter sur une prise de vue avec zoom.")
     parser.add_argument("--leg", default=None, choices=[None, "R", "L"],
                         help="Jambe testée pour les tests unipodaux RTS (single_leg_hop/squat). "
                              "Vide = auto-détection. Une vidéo = une jambe ; LSI agrégé côté app.")
-    args = parser.parse_args()
-    main(args)
+    return parser
+
+
+if __name__ == "__main__":
+    main(build_parser().parse_args())

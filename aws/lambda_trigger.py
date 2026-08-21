@@ -73,6 +73,16 @@ JOB_QUEUE = os.environ.get("JOB_QUEUE", "synkro-fastsam3d-queue")
 JOB_DEFINITION = os.environ.get("JOB_DEFINITION", "synkro-fastsam3d-job")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 
+# --- Aiguillage interactif / bulk -------------------------------------------
+# Le GPU principal est reserve aux analyses a l'unite (un kine qui attend son
+# resultat). Les gros lots partent sur un second GPU pour ne pas le monopoliser.
+BULK_JOB_QUEUE = os.environ.get("BULK_JOB_QUEUE", "synkro-fastsam3d-bulk-queue")
+# Un segment de cle S3 egal a ce mot suffit a router : 01-input-SAM3D/bulk/x.mp4
+BULK_PREFIX_MARKER = os.environ.get("BULK_PREFIX_MARKER", "bulk")
+# Filet de securite : au-dela de ce nombre de jobs deja en attente sur la voie
+# interactive, on considere que c'est un lot et on bascule les suivants.
+BULK_DEPTH_THRESHOLD = int(os.environ.get("BULK_DEPTH_THRESHOLD", "5"))
+
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 HEIGHT_RE = re.compile(r"^h(\d{2,3}(?:-\d{2,3})*)$")
@@ -393,6 +403,50 @@ def _job_name(raw_name):
     return f"fastsam-{safe}"
 
 
+def _pending_depth(batch, queue):
+    """Nombre de jobs pas encore termines sur une file.
+
+    On s'arrete des qu'on a depasse le seuil : savoir s'il y en a 6 ou 300
+    ne change rien a la decision, et ca borne le temps passe dans le Lambda.
+    """
+    seen = 0
+    for status in ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"):
+        token = None
+        while True:
+            kwargs = {"jobQueue": queue, "jobStatus": status, "maxResults": 100}
+            if token:
+                kwargs["nextToken"] = token
+            page = batch.list_jobs(**kwargs)
+            seen += len(page.get("jobSummaryList", []))
+            if seen > BULK_DEPTH_THRESHOLD:
+                return seen
+            token = page.get("nextToken")
+            if not token:
+                break
+    return seen
+
+
+def choose_queue(batch, key):
+    """Decide sur quelle file part cette video, et pourquoi.
+
+    Retourne (queue, raison). Toute panne d'API renvoie sur la voie
+    interactive : mieux vaut une analyse mal aiguillee qu'une analyse perdue.
+    """
+    segments = [s.lower() for s in key.split("/")[:-1]]
+    if BULK_PREFIX_MARKER.lower() in segments:
+        return BULK_JOB_QUEUE, f"prefixe '{BULK_PREFIX_MARKER}/' explicite"
+
+    try:
+        depth = _pending_depth(batch, JOB_QUEUE)
+    except Exception as err:                       # noqa: BLE001
+        print(f"WARN: profondeur de file illisible ({err}) -> voie interactive")
+        return JOB_QUEUE, "profondeur indisponible, repli interactif"
+
+    if depth > BULK_DEPTH_THRESHOLD:
+        return BULK_JOB_QUEUE, f"{depth} jobs deja en attente (seuil {BULK_DEPTH_THRESHOLD})"
+    return JOB_QUEUE, f"{depth} jobs en attente"
+
+
 def _publish_start(basename, parsed, job_id):
     """Send a human-readable 'analysis started' email via SNS."""
     sns = boto3.client("sns")
@@ -443,8 +497,10 @@ def lambda_handler(event, context):
 
         s3_input = f"s3://{bucket}/{key}"
         job_name = _job_name(parsed["raw_name"])
+        queue, why = choose_queue(batch, key)
 
         print(f"SUBMIT {s3_input} -> {job_name}")
+        print(f"  QUEUE={queue} ({why})")
         print(f"  EXTRA_ARGS={parsed['extra_args']}")
         print(f"  TRIM_START={parsed['trim_start']} TRIM_END={parsed['trim_end']}")
 
@@ -459,7 +515,7 @@ def lambda_handler(event, context):
 
         response = batch.submit_job(
             jobName=job_name,
-            jobQueue=JOB_QUEUE,
+            jobQueue=queue,
             jobDefinition=JOB_DEFINITION,
             containerOverrides={"environment": env_overrides},
         )
@@ -467,6 +523,7 @@ def lambda_handler(event, context):
             "jobId": response["jobId"],
             "jobName": response["jobName"],
             "input": s3_input,
+            "queue": queue,
         })
 
         # Fire-and-forget "analysis started" email. Never fail the Lambda if
@@ -560,9 +617,66 @@ def _self_test():
     return fail == 0
 
 
+class _FakeBatch:
+    """Client Batch factice : rend `depth` jobs repartis sur les statuts."""
+
+    def __init__(self, depth, boom=False):
+        self.depth, self.boom, self.calls = depth, boom, 0
+
+    def list_jobs(self, **kw):
+        self.calls += 1
+        if self.boom:
+            raise RuntimeError("AccessDenied simule")
+        # Tout est mis dans RUNNABLE, les autres statuts sont vides.
+        n = self.depth if kw["jobStatus"] == "RUNNABLE" else 0
+        return {"jobSummaryList": [{"jobId": str(i)} for i in range(n)]}
+
+
+def _routing_test():
+    ok = fail = 0
+    cases = [
+        # (cle S3, profondeur file, panne API, file attendue)
+        ("01-input-SAM3D/squat__h180.mp4", 0, False, JOB_QUEUE),
+        ("01-input-SAM3D/squat__h180.mp4", 5, False, JOB_QUEUE),
+        ("01-input-SAM3D/squat__h180.mp4", 6, False, BULK_JOB_QUEUE),
+        ("01-input-SAM3D/squat__h180.mp4", 40, False, BULK_JOB_QUEUE),
+        # Le prefixe explicite l'emporte, meme file vide, et sans appel API.
+        ("01-input-SAM3D/bulk/squat__h180.mp4", 0, False, BULK_JOB_QUEUE),
+        ("01-input-SAM3D/BULK/squat__h180.mp4", 0, False, BULK_JOB_QUEUE),
+        ("01-input-SAM3D/club-nice/bulk/x__h180.mp4", 0, False, BULK_JOB_QUEUE),
+        # Un fichier NOMME bulk n'est pas un lot : seul le dossier compte.
+        ("01-input-SAM3D/bulk__h180.mp4", 0, False, JOB_QUEUE),
+        # Panne d'API -> on n'echoue jamais, on retombe sur l'interactif.
+        ("01-input-SAM3D/squat__h180.mp4", 99, True, JOB_QUEUE),
+    ]
+    for key, depth, boom, want in cases:
+        fake = _FakeBatch(depth, boom)
+        got, why = choose_queue(fake, key)
+        label = f"{key} depth={depth}{' BOOM' if boom else ''}"
+        if got == want:
+            print(f"OK    [{label}] -> {got.split('-')[-2:][0]}… ({why})")
+            ok += 1
+        else:
+            print(f"FAIL  [{label}] -> {got}, attendu {want}")
+            fail += 1
+
+    # Le prefixe explicite ne doit couter aucun appel API.
+    fake = _FakeBatch(0)
+    choose_queue(fake, "01-input-SAM3D/bulk/x__h180.mp4")
+    if fake.calls == 0:
+        print("OK    [prefixe explicite] aucun appel Batch")
+        ok += 1
+    else:
+        print(f"FAIL  [prefixe explicite] {fake.calls} appels Batch inutiles")
+        fail += 1
+
+    print(f"\n=== routage : {ok} ok, {fail} fail ===")
+    return fail == 0
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--parse":
         # Usage: python lambda_trigger.py --parse <filename>
         print(json.dumps(parse_filename(sys.argv[2]), indent=2))
     else:
-        sys.exit(0 if _self_test() else 1)
+        sys.exit(0 if (_self_test() & _routing_test()) else 1)
