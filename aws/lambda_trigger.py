@@ -58,6 +58,7 @@ Examples:
     bikefit_alex__h180_m75_a40_bikefit_cycling.mp4         → bikefit + cycling
     titia_clm__h165_m55_a23_sxF_el_cycling_tt.mp4          → cycling position CLM
 """
+import datetime
 import json
 import os
 import re
@@ -82,6 +83,25 @@ BULK_PREFIX_MARKER = os.environ.get("BULK_PREFIX_MARKER", "bulk")
 # Filet de securite : au-dela de ce nombre de jobs deja en attente sur la voie
 # interactive, on considere que c'est un lot et on bascule les suivants.
 BULK_DEPTH_THRESHOLD = int(os.environ.get("BULK_DEPTH_THRESHOLD", "5"))
+
+# --- Worker persistant -------------------------------------------------------
+# Interrupteur : USE_WORKER=0 rebascule instantanement sur un job Batch par
+# video, sans redeploiement. A garder au moins un mois apres la bascule.
+USE_WORKER = os.environ.get("USE_WORKER", "0") == "1"
+WORK_QUEUE_URL = os.environ.get("WORK_QUEUE_URL", "")
+WORKER_JOB_DEFINITION = os.environ.get("WORKER_JOB_DEFINITION",
+                                       "synkro-fastsam3d-worker-job")
+WORKER_NAME_PREFIX = "fastsam-worker"
+# run_job.sh construit lui-meme <S3_OUTPUT_URI>/output_<TS>_<nom>/. Avec le
+# worker il n'y a plus de run_job.sh, donc le Lambda calcule le meme chemin —
+# meme convention, pour que rien ne bouge cote app.
+S3_OUTPUT_URI = os.environ.get("S3_OUTPUT_URI",
+                               "s3://data-synchro-video/02-output-SAM3D/")
+
+
+def chemin_sortie(raw_name):
+    horodatage = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return f"{S3_OUTPUT_URI.rstrip('/')}/output_{horodatage}_{raw_name}/"
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
@@ -447,6 +467,54 @@ def choose_queue(batch, key):
     return JOB_QUEUE, f"{depth} jobs en attente"
 
 
+def _worker_actif(batch):
+    """Un worker tourne-t-il deja sur la voie interactive ?
+
+    On ne veut pas en lancer un par video : c'est tout l'interet du worker de
+    survivre entre deux. Deux uploads simultanes peuvent en lancer deux, et ce
+    n'est pas un bug — juste du parallelisme, que la file SQS repartit seule.
+    """
+    for statut in ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"):
+        page = batch.list_jobs(jobQueue=JOB_QUEUE, jobStatus=statut, maxResults=100)
+        for j in page.get("jobSummaryList", []):
+            if j.get("jobName", "").startswith(WORKER_NAME_PREFIX):
+                return True
+    return False
+
+
+def deposer_sur_worker(batch, sqs, s3_input, parsed, s3_output):
+    """Depose la video sur SQS et reveille un worker si aucun ne tourne.
+
+    Retourne (message_id, worker_lance).
+    """
+    corps = {
+        "s3_input": s3_input,
+        "s3_output": s3_output,
+        "extra_args": parsed["extra_args"],
+    }
+    if parsed["trim_start"]:
+        corps["trim_start"] = parsed["trim_start"]
+    if parsed["trim_end"]:
+        corps["trim_end"] = parsed["trim_end"]
+
+    rep = sqs.send_message(QueueUrl=WORK_QUEUE_URL, MessageBody=json.dumps(corps))
+
+    lance = False
+    # Si le comptage echoue, on prefere lancer un worker de trop qu'aucun :
+    # un worker en trop s'eteint tout seul apres son delai d'inactivite,
+    # une video sans worker attend indefiniment.
+    try:
+        besoin = not _worker_actif(batch)
+    except Exception as err:                               # noqa: BLE001
+        print(f"WARN: etat worker illisible ({err}) -> on en lance un")
+        besoin = True
+    if besoin:
+        batch.submit_job(jobName=WORKER_NAME_PREFIX, jobQueue=JOB_QUEUE,
+                         jobDefinition=WORKER_JOB_DEFINITION)
+        lance = True
+    return rep["MessageId"], lance
+
+
 def _publish_start(basename, parsed, job_id):
     """Send a human-readable 'analysis started' email via SNS."""
     sns = boto3.client("sns")
@@ -498,6 +566,25 @@ def lambda_handler(event, context):
         s3_input = f"s3://{bucket}/{key}"
         job_name = _job_name(parsed["raw_name"])
         queue, why = choose_queue(batch, key)
+
+        # Voie worker : uniquement pour l'interactif. Les gros lots restent sur
+        # un job Batch par video — ils amortissent le re-chauffage sur 30 videos
+        # et beneficient du parallelisme, la ou le worker vise la latence.
+        if USE_WORKER and WORK_QUEUE_URL and queue == JOB_QUEUE:
+            sortie = chemin_sortie(parsed["raw_name"])
+            msg_id, lance = deposer_sur_worker(
+                batch, boto3.client("sqs"), s3_input, parsed, sortie)
+            print(f"SQS {s3_input} -> {sortie}")
+            print(f"  message={msg_id} worker_lance={lance} ({why})")
+            print(f"  EXTRA_ARGS={parsed['extra_args']}")
+            submitted.append({"messageId": msg_id, "input": s3_input,
+                              "output": sortie, "workerStarted": lance})
+            if SNS_TOPIC_ARN:
+                try:
+                    _publish_start(basename, parsed, f"sqs:{msg_id}")
+                except Exception as err:                   # noqa: BLE001
+                    print(f"WARN: SNS publish (start) failed: {err}")
+            continue
 
         print(f"SUBMIT {s3_input} -> {job_name}")
         print(f"  QUEUE={queue} ({why})")
@@ -617,6 +704,84 @@ def _self_test():
     return fail == 0
 
 
+class _FakeSqs:
+    def __init__(self):
+        self.envois = []
+
+    def send_message(self, **kw):
+        self.envois.append(kw)
+        return {"MessageId": "msg-1"}
+
+
+class _FakeBatchWorker:
+    """Batch factice : `worker` dit s'il y a deja un worker en cours."""
+
+    def __init__(self, worker=False, boom=False):
+        self.worker, self.boom, self.soumis = worker, boom, []
+
+    def list_jobs(self, **kw):
+        if self.boom:
+            raise RuntimeError("AccessDenied simule")
+        if self.worker and kw["jobStatus"] == "RUNNING":
+            return {"jobSummaryList": [{"jobName": "fastsam-worker"}]}
+        # Un job video ne doit PAS etre pris pour un worker.
+        if kw["jobStatus"] == "RUNNABLE":
+            return {"jobSummaryList": [{"jobName": "fastsam-squat"}]}
+        return {"jobSummaryList": []}
+
+    def submit_job(self, **kw):
+        self.soumis.append(kw)
+        return {"jobId": "j-1", "jobName": kw["jobName"]}
+
+
+def _worker_test():
+    ok = fail = 0
+
+    def verifie(label, cond):
+        nonlocal ok, fail
+        print(f"{'OK   ' if cond else 'FAIL '} [{label}]")
+        ok, fail = (ok + 1, fail) if cond else (ok, fail + 1)
+
+    parsed = {"extra_args": "--person_height 1.80 --floor_moge",
+              "trim_start": "3", "trim_end": "12", "raw_name": "squat"}
+
+    # Aucun worker en cours -> on en lance un.
+    b, q = _FakeBatchWorker(worker=False), _FakeSqs()
+    mid, lance = deposer_sur_worker(b, q, "s3://b/in.mp4", parsed, "s3://b/out/")
+    verifie("aucun worker -> on en lance un", lance and len(b.soumis) == 1)
+    corps = json.loads(q.envois[0]["MessageBody"])
+    verifie("le message porte entree, sortie, args et trim",
+            corps["s3_input"] == "s3://b/in.mp4"
+            and corps["s3_output"] == "s3://b/out/"
+            and corps["trim_start"] == "3" and corps["trim_end"] == "12"
+            and "--person_height 1.80" in corps["extra_args"])
+
+    # Un worker tourne deja -> on n'en relance pas.
+    b, q = _FakeBatchWorker(worker=True), _FakeSqs()
+    _, lance = deposer_sur_worker(b, q, "s3://b/in.mp4", parsed, "s3://b/out/")
+    verifie("worker deja actif -> aucun nouveau", (not lance) and not b.soumis)
+    verifie("la video est quand meme deposee", len(q.envois) == 1)
+
+    # API muette -> on lance quand meme : un worker de trop s'eteint seul,
+    # une video sans worker attend indefiniment.
+    b, q = _FakeBatchWorker(boom=True), _FakeSqs()
+    _, lance = deposer_sur_worker(b, q, "s3://b/in.mp4", parsed, "s3://b/out/")
+    verifie("etat illisible -> on lance par securite", lance and len(b.soumis) == 1)
+
+    # Un job video en RUNNABLE ne doit pas passer pour un worker.
+    verifie("un job video n'est pas pris pour un worker",
+            not _worker_actif(_FakeBatchWorker(worker=False)))
+
+    # Le chemin de sortie suit la convention de run_job.sh.
+    c = chemin_sortie("squat_jean")
+    verifie("chemin de sortie conforme",
+            c.startswith(S3_OUTPUT_URI.rstrip("/") + "/output_")
+            and c.endswith("_squat_jean/"))
+
+    print(f"\n=== worker : {ok} ok, {fail} fail ===")
+    return fail == 0
+
+
 class _FakeBatch:
     """Client Batch factice : rend `depth` jobs repartis sur les statuts."""
 
@@ -679,4 +844,4 @@ if __name__ == "__main__":
         # Usage: python lambda_trigger.py --parse <filename>
         print(json.dumps(parse_filename(sys.argv[2]), indent=2))
     else:
-        sys.exit(0 if (_self_test() & _routing_test()) else 1)
+        sys.exit(0 if (_self_test() & _routing_test() & _worker_test()) else 1)

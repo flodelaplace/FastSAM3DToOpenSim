@@ -33,3 +33,7 @@ onnxruntime-gpu>=1.17.0
 omegaconf
 ultralytics
 networkx==3.2.1
+# Le worker persistant (worker/loop.py) consomme SQS et pousse sur S3/SNS depuis
+# Python. L'AWS CLI presente dans l'image ne suffit pas : c'est un binaire, pas
+# le SDK. run_job.sh, lui, n'a jamais eu besoin que du CLI.
+boto3

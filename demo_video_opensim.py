@@ -568,6 +568,35 @@ def _lean_angle_over_range(keypoints, center_frame, half_window=5):
     return float(np.median(angles))
 
 
+def _activer_determinisme():
+    """Rend l'inference reproductible au bit pres, sur une meme machine.
+
+    Mesure du 2026-08-21 : deux appels sur la MEME image dans le MEME process
+    donnaient des sommets differents de ~8e-07 m — un noyau CUDA a reduction non
+    deterministe (atomicAdd). Ce micron devient 0,3 a 2,7 mm en bout de chaine :
+    le shape-lock prend une mediane sur les frames, donc un ecart infinitesimal
+    fait basculer QUELLE frame est la mediane, et tout suit.
+
+    Attention : ca ne rend PAS local et AWS identiques. Une Ada et une T4
+    n'executent pas les memes noyaux. Le contrat est « meme video, meme machine,
+    meme resultat ».
+    """
+    # cuBLAS exige que ce soit pose avant la creation de son handle, donc avant
+    # toute initialisation CUDA. En CLI on est bon ; dans un worker qui a deja
+    # charge les modeles, c'est trop tard — d'ou l'avertissement.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    if torch.cuda.is_initialized():
+        print("  [determinisme] ATTENTION : CUDA deja initialise, "
+              "CUBLAS_WORKSPACE_CONFIG arrive trop tard — le determinisme "
+              "peut etre partiel.")
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.manual_seed(0)
+    np.random.seed(0)
+    print("  [determinisme] algorithmes deterministes actives")
+
+
 def main(args, estimator=None, visualizer=None):
     """Traite une video.
 
@@ -575,6 +604,9 @@ def main(args, estimator=None, visualizer=None):
     charge les modeles UNE fois (73 s mesurees) au lieu d'a chaque video. En
     ligne de commande ils restent None et le comportement est inchange.
     """
+    if getattr(args, "deterministic", False):
+        _activer_determinisme()
+
     # Auto-generate timestamped output directory (matches SAM3D-OpenSim convention)
     if args.output_dir is None:
         video_name_raw = os.path.splitext(os.path.basename(args.video_path))[0]
@@ -2747,6 +2779,12 @@ def build_parser():
                         choices=[None, "single", "triple", "crossover", "timed6m"],
                         help="Type de saut pour d3.single_leg_hop (RTS) : single (défaut) / "
                              "triple / crossover / timed6m. Relayé à synkro-analytics.")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Rend l'inference reproductible au bit près sur une même "
+                             "machine (algorithmes CUDA déterministes + seeds). Sans ce "
+                             "flag, deux analyses de la même vidéo diffèrent de 0,3 à "
+                             "2,7 mm sur les marqueurs. N'égalise PAS local et AWS : "
+                             "GPU différents, noyaux différents.")
     parser.add_argument("--fov_once", type=int, default=0, metavar="N",
                         help="Estimer les intrinsèques caméra UNE fois (médiane de N "
                              "frames échantillonnées) au lieu de relancer MoGe à chaque "
