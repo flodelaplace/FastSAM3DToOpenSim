@@ -77,3 +77,8 @@ upstream-sam3d/
 # Contient numero de compte, sous-reseaux, security group et profil d'instance.
 /aws/bake_ami.sh
 assets/correspondence_synkro_avatar.json.bak_pre_sole
+
+# Poids de skinning extraits de mhr_model.pt : donnee derivee des poids
+# SAM 3D Body, licence ambigue. Ne jamais pousser sur le fork PUBLIC.
+# Regenerable — voir sam_3d_body/export/mesh_skinning.py
+_skin_mhr.npz
