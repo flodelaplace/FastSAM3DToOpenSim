@@ -1514,7 +1514,13 @@ def write_mesh_glb(
 
     # ── Animation samplers + channels ─────────────────────────────────────────
     anim_samplers = [
-        {"input": acc_t, "output": acc_w, "interpolation": "STEP"},          # morph weights
+        # Poids de morph en LINEAR, pas en STEP : les poids sont binaires (une
+        # seule cible a 1 par image), donc le fondu 1->0 / 0->1 entre deux images
+        # revient exactement a interpoler lineairement les positions de sommets —
+        # le meme modele que les translations du squelette. En STEP le mesh gelait
+        # la pose de l'image N jusqu'a l'image N+1, soit une demi-image de retard
+        # en moyenne sur le squelette, visible aux epaules pendant un saut.
+        {"input": acc_t, "output": acc_w, "interpolation": "LINEAR"},        # morph weights
     ]
     anim_channels = [
         {"sampler": 0, "target": {"node": 0, "path": "weights"}},
@@ -1790,7 +1796,8 @@ def write_combined_mesh_glb(
 
     # Shared morph weights sampler (reused by all persons)
     s_weights = len(anim_samplers)
-    anim_samplers.append({"input": acc_t, "output": acc_w, "interpolation": "STEP"})
+    # LINEAR et non STEP — voir la note sur les poids de morph plus haut.
+    anim_samplers.append({"input": acc_t, "output": acc_w, "interpolation": "LINEAR"})
 
     # Per-person materials, meshes, nodes, animation channels
     for pi, pd in enumerate(per_person_data):
