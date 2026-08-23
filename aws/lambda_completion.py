@@ -23,6 +23,87 @@ S3_OUTPUT_URI = os.environ.get(
 
 # g4dn.xlarge Spot eu-west-3 — approximate (price varies ±10%).
 SPOT_PRICE_USD_PER_HOUR = 0.16
+# Prefixe des jobs worker persistant, aligne sur aws/lambda_trigger.py.
+WORKER_NAME_PREFIX = os.environ.get("WORKER_NAME_PREFIX", "fastsam-worker")
+
+
+def _prevenir_worker_eteint(job_id, job_name, created_at, started_at,
+                            stopped_at, log_stream):
+    """Le worker s'est eteint normalement — le dire, et dire que ce n'en est pas une.
+
+    Sans ce mail, l'extinction serait silencieuse. Avec l'ancien mail generique,
+    elle passait pour « une analyse terminee en 14 min 39 » — alors que ces 14
+    minutes couvrent DEUX videos traitees en 131 et 114 s, plus dix minutes
+    d'attente avant extinction. Le titre et la premiere ligne doivent donc lever
+    l'ambiguite avant meme qu'on lise les chiffres.
+    """
+    demarrage = (started_at - created_at) if (started_at and created_at) else None
+    session = (stopped_at - started_at) if (stopped_at and started_at) else None
+    cout = (session / 3_600_000 * SPOT_PRICE_USD_PER_HOUR) if session else None
+
+    l = ["EXTINCTION DU WORKER — ceci n'est PAS une analyse.", "",
+         "Le worker persistant s'est eteint apres son delai d'inactivite, et la",
+         "machine GPU a ete liberee. C'est le fonctionnement normal : il se",
+         "rallumera au prochain depot de video.", "",
+         "Les analyses qu'il a traitees ont fait l'objet d'un mail CHACUNE.",
+         "Les durees ci-dessous sont celles de la SESSION, pas d'une analyse.", "",
+         f"Job           : {job_name}", f"Job ID        : {job_id}"]
+    if demarrage is not None:
+        l.append(f"Demarrage     : {_fmt_duration(demarrage)}  (boot Spot + image)")
+    if session is not None:
+        l.append(f"Session       : {_fmt_duration(session)}  (chargement des modeles"
+                 " + analyses + attente)")
+    if cout is not None:
+        l.append(f"Cout session  : ~{cout:.4f} $  (g4dn.xlarge Spot eu-west-3)")
+    if log_stream:
+        l += ["", "─── Logs ───",
+              f"aws logs tail /aws/batch/synkro-fastsam3d "
+              f"--log-stream-names {log_stream} --region eu-west-3"]
+    boto3.client("sns").publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject="[SAM3D] 💤 Worker eteint (fin de session, pas une analyse)"[:100],
+        Message="\n".join(l))
+    print(f"WORKER SHUTDOWN {job_name} — mail d'extinction envoye")
+    return {"statusCode": 200, "body": "worker shutdown notified"}
+
+
+def _prevenir_worker_en_echec(detail, job_id, job_name, status, status_reason,
+                              exit_code, log_stream):
+    """Alerte quand un worker meurt anormalement.
+
+    Un worker qui s'eteint apres son delai d'inactivite est un evenement normal
+    et silencieux. Un worker qui tombe, en revanche, laisse des videos en file
+    sans personne pour les traiter — et c'est le seul cas ou il faut prevenir.
+
+    Le code 75 est reserve aux etats CUDA irrecuperables (voir worker/loop.py) :
+    le worker sort volontairement pour que Batch en relance un propre, plutot
+    que de continuer sur un GPU corrompu et produire des resultats faux.
+    """
+    lignes = [f"Worker persistant SAM3D — {status} ⚠", "",
+              f"Job           : {job_name}", f"Job ID        : {job_id}"]
+    if exit_code is not None:
+        lignes.append(f"Exit code     : {exit_code}")
+        if exit_code == 75:
+            lignes += ["",
+                       "Code 75 = erreur CUDA. Le worker s'est arrete VOLONTAIREMENT :",
+                       "l'etat du GPU etait irrecuperable et continuer aurait produit des",
+                       "resultats faux sans le signaler. Batch relance un worker propre.",
+                       "Les videos en cours reviennent en file automatiquement."]
+    if status_reason:
+        lignes.append(f"Raison        : {status_reason}")
+    lignes += ["",
+               "Les videos non traitees restent dans la file SQS et seront reprises",
+               "par le prochain worker. Apres trois tentatives elles partent dans",
+               "synkro-fastsam3d-dlq.", ""]
+    if log_stream:
+        lignes += ["─── Logs ───",
+                   f"aws logs tail /aws/batch/synkro-fastsam3d "
+                   f"--log-stream-names {log_stream} --region eu-west-3"]
+    boto3.client("sns").publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject=f"[SAM3D] ⚠ Worker en echec — {status}"[:100],
+        Message="\n".join(lignes))
+    return {"statusCode": 200, "body": "worker failure notified"}
 
 # Estimated time for a warm container restart on an already-running instance
 # (docker container restart + TRT engine cache fetch from S3). Used to split
@@ -187,6 +268,23 @@ def lambda_handler(event, context):
     container = detail.get("container", {}) or {}
     exit_code = container.get("exitCode")
     log_stream = container.get("logStreamName", "")
+
+    # Un worker persistant n'est pas une analyse : il en enchaine plusieurs puis
+    # attend son delai d'inactivite avant de s'eteindre. Ce mail-ci, declenche
+    # par la fin du JOB Batch, annoncerait donc « analyse terminee en 14 min 39 »
+    # pour deux videos traitees en 131 s et 114 s, suivies de dix minutes
+    # d'attente. Exactement la mauvaise impression : celle d'une analyse qui rame.
+    #
+    # C'est le worker lui-meme qui notifie, video par video (worker/loop.py).
+    # Ici on se contente d'un recapitulatif de session, et seulement s'il a
+    # echoue — un worker qui s'eteint normalement n'interesse personne.
+    if job_name.startswith(WORKER_NAME_PREFIX):
+        if status == "SUCCEEDED":
+            return _prevenir_worker_eteint(job_id, job_name, created_at,
+                                           started_at, stopped_at, log_stream)
+        print(f"WORKER FAILED {job_name} — mail d'alerte")
+        return _prevenir_worker_en_echec(detail, job_id, job_name, status,
+                                         status_reason, exit_code, log_stream)
 
     raw_name = job_name.removeprefix("fastsam-")
     video_name = _get_video_name(detail) or raw_name
