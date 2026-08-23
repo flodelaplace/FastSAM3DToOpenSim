@@ -53,7 +53,6 @@ import json
 import os
 import shutil
 import struct
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -84,93 +83,6 @@ from sam_3d_body.export.opensim_ik_runner import (
 # drive individual intervertebral DOFs in OpenSim IK.
 _POSE2SIM_MODEL_TEMPLATE = os.path.join(parent_dir, "assets", "pose2sim_wholebody_model.osim")
 
-
-
-_GLTFPACK = os.environ.get("GLTFPACK_PATH") or shutil.which("gltfpack") or ""
-
-def _fix_morph_weights(data: bytes) -> bytes:
-    """Fix gltfpack's illegal quantization of morph weight animation outputs.
-
-    gltfpack converts morph weight outputs to UNSIGNED_BYTE/normalized, which violates
-    the glTF spec (weights must be FLOAT). This re-encodes them back to float32.
-    """
-    import json as _json
-    json_len = struct.unpack_from('<I', data, 12)[0]
-    gltf = _json.loads(data[20:20+json_len])
-    bin_data = bytearray(data[20+json_len+8:])
-
-    anim = gltf.get('animations', [{}])[0]
-    weights_channels = [c for c in anim.get('channels', []) if c['target']['path'] == 'weights']
-    fixed = False
-    for ch in weights_channels:
-        sampler = anim['samplers'][ch['sampler']]
-        acc = gltf['accessors'][sampler['output']]
-        if acc['componentType'] == 5126:   # already float32
-            continue
-        # Decode from quantized type → float32
-        bv = gltf['bufferViews'][acc['bufferView']]
-        offset = bv.get('byteOffset', 0) + acc.get('byteOffset', 0)
-        count = acc['count']
-        ct = acc['componentType']
-        normalized = acc.get('normalized', False)
-        dtype_map = {5120: np.int8, 5121: np.uint8, 5122: np.int16, 5123: np.uint16}
-        raw = np.frombuffer(bytes(bin_data[offset:offset + count * np.dtype(dtype_map[ct]).itemsize]),
-                            dtype=dtype_map[ct])
-        if normalized:
-            scale = {5120: 1/127, 5121: 1/255, 5122: 1/32767, 5123: 1/65535}[ct]
-            values = raw.astype(np.float32) * scale
-        else:
-            values = raw.astype(np.float32)
-        float_bytes = values.tobytes()
-        # Append float32 data to end of binary buffer and add a new bufferView
-        new_bv_offset = len(bin_data)
-        bin_data.extend(float_bytes)
-        pad = (4 - len(float_bytes) % 4) % 4
-        bin_data.extend(b'\x00' * pad)
-        new_bv_idx = len(gltf['bufferViews'])
-        gltf['bufferViews'].append({'buffer': 0, 'byteOffset': new_bv_offset, 'byteLength': len(float_bytes)})
-        acc['bufferView'] = new_bv_idx
-        acc['byteOffset'] = 0
-        acc['componentType'] = 5126
-        acc.pop('normalized', None)
-        fixed = True
-
-    if not fixed:
-        return data
-
-    gltf['buffers'][0]['byteLength'] = len(bin_data)
-    json_bytes = _json.dumps(gltf, separators=(',', ':')).encode('utf-8')
-    pad_j = (4 - len(json_bytes) % 4) % 4
-    json_bytes += b' ' * pad_j
-    bin_bytes = bytes(bin_data)
-    pad_b = (4 - len(bin_bytes) % 4) % 4
-    bin_bytes += b'\x00' * pad_b
-    json_chunk = struct.pack('<II', len(json_bytes), 0x4E4F534A) + json_bytes
-    bin_chunk  = struct.pack('<II', len(bin_bytes),  0x004E4942) + bin_bytes
-    header = struct.pack('<III', 0x46546C67, 2, 12 + len(json_chunk) + len(bin_chunk))
-    return header + json_chunk + bin_chunk
-
-
-def _compress_glb(path: str) -> None:
-    """Run gltfpack -c on a GLB, fix illegal weight quantization, replace in-place."""
-    if not os.path.isfile(_GLTFPACK):
-        return
-    tmp = path + ".tmp.glb"
-    result = subprocess.run(
-        [_GLTFPACK, "-c", "-i", path, "-o", tmp],
-        capture_output=True, text=True,
-    )
-    if result.returncode == 0 and os.path.isfile(tmp):
-        orig_mb = os.path.getsize(path) / 1e6
-        fixed = _fix_morph_weights(open(tmp, 'rb').read())
-        open(tmp, 'wb').write(fixed)
-        comp_mb = os.path.getsize(tmp) / 1e6
-        os.replace(tmp, path)
-        print(f"  [gltfpack] {orig_mb:.1f} MB → {comp_mb:.1f} MB ({100*comp_mb/orig_mb:.0f}%)")
-    else:
-        if os.path.isfile(tmp):
-            os.remove(tmp)
-        print(f"  [gltfpack] compression failed: {result.stderr[-200:]}")
 
 
 def draw_results_on_frame(img_bgr, outputs, visualizer):
@@ -2340,8 +2252,15 @@ def main(args, estimator=None, visualizer=None):
                        body_only=body_only,
                        verts_in_world=True)
 
-        # gltfpack disabled: incompatible with viewer (KHR_mesh_quantization breaks morph targets)
-        # _compress_glb(mesh_glb)
+        # Compression par reduction de la base de formes. Remplace le fichier :
+        # une seule sortie mesh, deja compressee. Aucune extension glTF n'est
+        # declaree, donc Blender et le viewer l'ouvrent sans greffon —
+        # contrairement a gltfpack, retire en 2026-08, qui imposait
+        # KHR_mesh_quantization (casse les morph targets dans le viewer) et
+        # EXT_meshopt_compression (illisible par Blender sans decodeur).
+        # Mesure sur 6 s de course : 82 Mo -> 22 Mo pour 0,047 mm d'ecart max.
+        from sam_3d_body.export.morph_compression import compresser_en_place
+        compresser_en_place(mesh_glb)
 
     # NOTE: découplé de --no_mesh_glb (2026-08). Ce bloc ne dépend que du
     # .osim scalé + .mot IK : le désactiver avec le mesh supprimait aussi le

@@ -39,6 +39,9 @@ Tokens RTS (tests unipodaux — une vidéo = une jambe, LSI agrégé côté app)
 
 Flags avancés (auto-dispatch par --module rend ces flags souvent redondants) :
     st                   --stationary   (auto pour cmj/squat/sts/cycling)
+    insitu               --stationary, pour course/marche EN PLACE hors tapis
+                         (X/Z figés, rebond vertical conservé, anti-skate ON).
+                         Sur tapis, préférer tm<kmh> qui coupe l'anti-skate.
     com                  --compute_com
     floor                --floor        (mode aggressive : per-frame ground align)
     lv                   --lock-vertical
@@ -112,7 +115,8 @@ SEX_RE = re.compile(r"^sx([MF])$")
 START_RE = re.compile(r"^s(\d+)$")
 END_RE = re.compile(r"^e(\d+)$")
 TREADMILL_RE = re.compile(r"^tm(\d+)$")  # vitesse tapis en km/h (tm12 = 12 km/h)
-FLAG_TOKENS = {"st", "com", "floor", "lv", "ll", "bikefit", "ca", "seated"}
+FLAG_TOKENS = {"st", "insitu", "com", "floor", "lv", "ll", "bikefit", "ca",
+               "seated"}
 LEVEL_TOKENS = {"tr": "trained", "re": "recreational",
                 "cl": "clinical", "el": "elite"}
 # Module token → --module value (d3 par défaut pour SAM3D 3D pipeline)
@@ -242,6 +246,18 @@ def parse_filename(basename):
             module = MODULE_TOKENS[t]
             continue
         if t == "st":
+            stationary = True
+            continue
+        # `insitu` = course/marche EN PLACE filmée hors tapis (sujet qui piétine,
+        # caméra fixe). Même effet que `st` — X/Z figés, verticale rendue par
+        # l'injection cam_t.Y — mais nommé pour être lisible dans un nom de
+        # fichier. Distinct du mode tapis `tm<kmh>` : celui-ci coupe en plus
+        # l'anti-glissement (le pied recule avec la bande), ce qui serait FAUX
+        # ici puisque le pied reste posé au sol.
+        # Sans ce jeton, `run` seul laisse la translation globale active : le
+        # bassin dérive en profondeur et son oscillation verticale s'écrase
+        # (13 mm mesurés au lieu des 60-100 mm attendus), sans aucune alerte.
+        if t == "insitu":
             stationary = True
             continue
         if t == "com":
