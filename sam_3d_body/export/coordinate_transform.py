@@ -86,6 +86,9 @@ class CoordinateTransformer:
         lock_vertical: bool = False,
         lock_lateral: bool = False,
         contact_anchor: bool = False,
+        stable_floor: bool = False,
+        plantar_indices: Optional[np.ndarray] = None,
+        stable_floor_drift: str = "linear+stance",
         fps: float = 30.0,
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
@@ -94,6 +97,25 @@ class CoordinateTransformer:
         Args:
             keypoints_3d : (N, 70, 3)  MHR70 keypoints in camera space
             jcoords_3d   : (N, 127, 3) MHR armature joints in camera space (optional)
+
+        Args (suite) :
+            stable_floor : mise au sol « stable » portee de Mesh2Sim
+                (`sam_3d_body/export/ground_plane.py`). Remplace le trio
+                clamp per-frame / align_to_ground / contact_anchor par une
+                transformation a peu de parametres calculee UNE FOIS pour
+                l'essai : rotation globale du plan du sol, derive verticale,
+                offset constant. Voir `docs/portage_sol_contact_mesh2sim.md`.
+                DEFAUT OFF : le comportement historique est inchange tant que
+                l'appelant ne demande rien.
+            plantar_indices : indices, DANS LE TABLEAU ``jcoords_3d``, des points
+                plantaires (marqueurs SOLE_*). Le pipeline concatene les
+                marqueurs anatomiques derriere les 127 joints MHR
+                (`demo_video_opensim.py`), donc ces indices valent
+                127 + rang du marqueur. Sans eux, ``stable_floor`` retombe sur
+                les 4 keypoints CUTANES de ``_FOOT_INDICES``, ce qui pose le sol
+                3 cm trop haut et fait battre la reference au rythme du deroule
+                du pied — c'est justement ce qu'on cherche a eviter.
+            stable_floor_drift : "none", "linear", "stance" ou "linear+stance".
 
         Returns:
             keypoints_opensim              if jcoords_3d is None
@@ -189,14 +211,34 @@ class CoordinateTransformer:
                 _src = "foot-traj"
             else:
                 _pitch, _roll, _src = 0.0, 0.0, None
-            if _src is not None and abs(_pitch) > 0.5:
-                print(f"  [floor lean] {_src} pitch {_pitch:+.2f}° → correcting")
-                kpts, jc = self._rotate_around_pelvis_z(kpts, jc, _pitch)
-                self._last_floor_angle_deg = _pitch
-            if _src is not None and abs(_roll) > 0.5:
-                print(f"  [floor lean] {_src} roll  {_roll:+.2f}° → correcting")
-                kpts, jc = self._rotate_around_pelvis_x(kpts, jc, _roll)
-                self._last_roll_angle_deg = _roll
+            # MODE REPERE MONDE, opt-in par MOGE_WORLD_FRAME=1.
+            #
+            # Porte la recette Mesh2Sim : conversion OpenCV -> monde par
+            # (x, -y, -z), angle appliquE EN ENTIER, et rotation GLOBALE unique
+            # de la scene au lieu d une rotation par image autour du bassin.
+            # Le chemin historique reste le defaut et n est pas touche.
+            import os as _os_wf
+            _world_frame = (_src == "MoGe"
+                            and bool(int(_os_wf.environ.get("MOGE_WORLD_FRAME", "0"))))
+            if _world_frame:
+                # Les angles recus sont deja multiplies par LEAN_SCALE ; ce mode
+                # veut l angle MESURE, donc on defait ce facteur. Si le clamp a
+                # 60 deg a mordu, la reconstruction serait fausse — on ne peut
+                # pas le savoir ici, mais un pitch a la borne est deja anormal.
+                _ls = float(_os_wf.environ.get("MOGE_LEAN_SCALE", "0.5")) or 1.0
+                _p_raw, _r_raw = _pitch / _ls, -_roll / _ls   # le roll etait nie
+                kpts, jc = self._apply_world_frame_leveling(kpts, jc, _p_raw, _r_raw)
+                self._last_floor_angle_deg = _p_raw
+                self._last_roll_angle_deg = _r_raw
+            else:
+                if _src is not None and abs(_pitch) > 0.5:
+                    print(f"  [floor lean] {_src} pitch {_pitch:+.2f}° → correcting")
+                    kpts, jc = self._rotate_around_pelvis_z(kpts, jc, _pitch)
+                    self._last_floor_angle_deg = _pitch
+                if _src is not None and abs(_roll) > 0.5:
+                    print(f"  [floor lean] {_src} roll  {_roll:+.2f}° → correcting")
+                    kpts, jc = self._rotate_around_pelvis_x(kpts, jc, _roll)
+                    self._last_roll_angle_deg = _roll
 
             # Body-vertical correction : utilise la posture du sujet pour
             # forcer midfoot→neck à être vertical. Suppose le sujet DEBOUT.
@@ -214,11 +256,44 @@ class CoordinateTransformer:
         # 4. Align feet to Y=0
         self._last_ground_offsets_m = None
         self._last_constant_offset_m = None
+        self._last_stable_floor = None
         # Offset de mise au sol partage entre les appels successifs a
         # apply_pipeline_to_verts (mesh / kpts / jcoords).
         self._replay_constant_offset_m = None
         self._last_penetration_clamp_m = None  # (N,) per-frame safety-net shift
-        if contact_anchor:
+        if stable_floor:
+            # SOL STABLE (portage Mesh2Sim). Exclusif des trois autres modes :
+            # contact_anchor, align_to_ground et le clamp per-frame sont
+            # precisement ce qu'il remplace. Le comportement historique reste
+            # accessible en laissant stable_floor=False.
+            from .ground_plane import apply_stable_floor, stable_floor_transform
+            if plantar_indices is not None and jc is not None and len(plantar_indices):
+                pidx = np.asarray(plantar_indices, dtype=int)
+                plantar = jc[:, pidx, :]
+                # `plantar_indices` est attendu ordonne pied droit puis pied
+                # gauche (SOLE_s1..s7_r puis _l), d'ou la coupe au milieu.
+                split = len(pidx) // 2 if len(pidx) >= 2 else None
+                src = f"{len(pidx)} points plantaires"
+            else:
+                plantar = kpts[:, _FOOT_INDICES, :]
+                split = 2
+                src = "4 keypoints cutanes (pas de points plantaires fournis)"
+            sf = stable_floor_transform(plantar, float(fps), per_foot_split=split,
+                                        drift_model=stable_floor_drift,
+                                        min_span_travel_m=2.0)
+            print(f"  [stable floor] source : {src} | rotation "
+                  f"{'OUI' if sf.rotation_applied else 'non'} "
+                  f"(inclinaison {sf.fit.tilt_deg:.2f}deg, {sf.fit.reason or 'ok'}) | "
+                  f"derive {'OUI' if sf.drift_applied else 'non'} "
+                  f"({sf.drift_m_per_s*100:+.2f} cm/s, appui "
+                  f"{sf.stance_coverage*100:.0f}%) | offset {sf.offset_m*100:+.1f} cm"
+                  + (f" | {sf.notes}" if sf.notes else ""))
+            kpts = apply_stable_floor(kpts, sf, float(fps))
+            if jc is not None:
+                jc = apply_stable_floor(jc, sf, float(fps))
+            self._last_stable_floor = sf
+            self._last_stable_floor_fps = float(fps)
+        elif contact_anchor:
             # Ancrage conscient du contact : re-ancre le pied en contact SOUTENU
             # (squat → bassin descend) mais tient l'offset pendant un vol BREF
             # (course/saut → pas de "saut"). Unifie --floor (per-frame) et le
@@ -410,7 +485,26 @@ class CoordinateTransformer:
             pre_ground.append(w)
 
         # Étape 5 — Ground alignment (mode-dependent)
-        if ground_offset_mode == "per_frame":
+        _sf = getattr(self, "_last_stable_floor", None)
+        if _sf is not None:
+            # Sol stable : la MEME transformation que pour les kpts, rejouee a
+            # l'identique image par image. Rigide par image, donc le mesh reste
+            # exactement colle au squelette (ecart nul par construction).
+            for i, w in enumerate(pre_ground):
+                if w is None:
+                    continue
+                if _sf.rotation_applied:
+                    w = (w - _sf.pivot) @ _sf.R.T + _sf.pivot
+                dy = _sf.offset_m
+                if _sf.drift_m_per_s:
+                    dy += _sf.drift_m_per_s / float(self._last_stable_floor_fps) \
+                          * (i - _sf.t0_frame)
+                if _sf.stance_shift_m is not None and i < len(_sf.stance_shift_m):
+                    dy += float(_sf.stance_shift_m[i])
+                w = w.copy()
+                w[:, 1] -= dy
+                pre_ground[i] = w
+        elif ground_offset_mode == "per_frame":
             # Réutilise les offsets calculés sur kpts. Souci possible : si le
             # mesh a des vertices plus bas que les feet markers (toes, heels),
             # le mesh descendra sous Y=0.
@@ -1208,6 +1302,207 @@ class CoordinateTransformer:
             "roll_std_deg": roll_std,
             "per_frame": per_frame,
         }
+
+    # ------------------------------------------------------------------
+    # MODE REPERE MONDE (MOGE_WORLD_FRAME=1) — portage de la recette Mesh2Sim
+    # ------------------------------------------------------------------
+    @staticmethod
+    def world_up_from_moge_angles(pitch_deg: float, roll_deg: float) -> np.ndarray:
+        """Vecteur "haut" du monde, reconstruit depuis les angles MoGe bruts.
+
+        POURQUOI CETTE CONVERSION EXISTE. MoGe rend ses points dans la convention
+        OpenCV : x a droite, y vers le BAS, z vers l avant. Le monde OpenSim est
+        x a droite, y vers le HAUT, z vers l arriere. Le passage de l un a
+        l autre est (x, -y, -z) — une ROTATION de 180 degres autour de x.
+
+        LE PIEGE, documente par Mesh2Sim et paye 22 degres d erreur chez eux :
+        nier le vecteur ENTIER (-x, -y, -z) pour le retourner n est pas la meme
+        chose. C est une REFLEXION, elle inverse l axe gauche-droite, donc le
+        SIGNE DU ROULIS. Leurs deux estimateurs tombaient alors "d accord" sur un
+        roulis faux, et leur mode consensus ne pouvait structurellement pas
+        fonctionner. Se tromper ici penche le sujet de plusieurs degres sans
+        produire la moindre erreur visible.
+
+        Notre chaine historique ne fait AUCUNE conversion : elle calcule le pitch
+        et le roll directement depuis la normale en repere OpenCV, ou +y pointe
+        vers le bas. Deux compensations empiriques la rattrapent en pratique — le
+        facteur LEAN_SCALE et la negation du roulis — et le sol reconstruit
+        ressort horizontal a plus ou moins 1 degre sur nos courses. Ce mode-ci ne
+        les utilise pas : il convertit le repere, puis applique l angle entier.
+
+        Args:
+            pitch_deg, roll_deg: angles BRUTS (non multiplies par LEAN_SCALE),
+                tels que definis par la chaine MoGe : pitch = atan2(n_z, n_y),
+                roll = atan2(n_x, n_y), normale en repere OpenCV avec n_y > 0.
+
+        Returns:
+            (3,) vecteur unitaire "haut" en repere monde (y > 0).
+        """
+        ny = 1.0
+        n_cv = np.array([ny * np.tan(np.radians(roll_deg)),
+                         ny,
+                         ny * np.tan(np.radians(pitch_deg))], dtype=np.float64)
+        n_cv /= (np.linalg.norm(n_cv) or 1.0)
+        # OpenCV -> monde : rotation de 180 deg autour de x, PAS une negation.
+        n_w = n_cv * np.array([1.0, -1.0, -1.0])
+        if n_w[1] < 0:          # normale de signe libre : on veut "vers le haut"
+            n_w = -n_w
+        return n_w / (np.linalg.norm(n_w) or 1.0)
+
+    @staticmethod
+    def floor_up_from_points_m2s(points, mask, person_bbox=None, orig_hw=None,
+                                 floor_frac: float = 0.30, n_samples: int = 6000):
+        """Normale du sol depuis une grille de points MoGe — portage fidele Mesh2Sim.
+
+        Reproduit `stages/orientation_moge/.../estimate.py:floor_up_from_points`.
+        Renvoie le vecteur "haut" BRUT en repere camera (OpenCV), sans facteur
+        d echelle, ou None.
+
+        DEUX DIFFERENCES AVEC NOTRE CHAINE HISTORIQUE, et la seconde est celle qui
+        compte :
+
+        1. Parametres : bande de sol a 30 pour cent des lignes (nous : 25),
+           6000 points echantillonnes (nous : 4000), RANSAC a 300 iterations
+           (nous : 200). Reglages, sans consequence de principe.
+
+        2. ORIENTATION DE LA NORMALE. Une normale de plan a un signe libre ; il
+           faut le fixer. Eux le font GEOMETRIQUEMENT : la normale "haut" doit
+           pointer du sol VERS la camera, donc son produit scalaire avec le point
+           de sol moyen doit etre negatif. Nous forcons `normal[1] > 0`, un test
+           sur un AXE — dans un repere ou +y pointe justement vers le BAS. Le
+           critere geometrique ne depend d aucune convention d axe et ne peut pas
+           se tromper de repere ; le notre le peut, et c est exactement la famille
+           d erreur qui leur a coute 22 degres.
+        """
+        points = np.asarray(points)
+        if points.ndim != 3:
+            return None
+        H, W = points.shape[:2]
+        valid = np.asarray(mask).astype(bool)
+        floor_row_min = None
+        if person_bbox is not None and orig_hw is not None:
+            oh, ow = orig_hw
+            x1, y1, x2, y2 = person_bbox
+            gx1, gy1 = int(x1 / ow * W), int(y1 / oh * H)
+            gx2, gy2 = int(x2 / ow * W), int(y2 / oh * H)
+            mx = max(1, int((gx2 - gx1) * 0.10))
+            my = max(1, int((gy2 - gy1) * 0.10))
+            valid[max(0, gy1 - my):min(H, gy2 + my) + 1,
+                  max(0, gx1 - mx):min(W, gx2 + mx) + 1] = False
+            below = max(1, int((gy2 - gy1) * 0.05))
+            floor_row_min = min(H - 1, gy2 + below)
+            band = np.zeros_like(valid)
+            band[floor_row_min:, :] = True
+            valid = valid & band
+
+        pv = points.reshape(-1, 3).astype(np.float64)[valid.reshape(-1)]
+        if len(pv) < 50:
+            return None
+        if floor_row_min is not None:
+            floor_pts = pv
+        else:
+            # Y-DOWN (OpenCV) : le sol est du cote des GRANDS Y/Z (bas de l image)
+            yz = pv[:, 1] / pv[:, 2]
+            floor_pts = pv[yz >= np.percentile(yz, (1.0 - floor_frac) * 100)]
+        if len(floor_pts) < 20:
+            return None
+        if len(floor_pts) > n_samples:
+            floor_pts = floor_pts[np.random.default_rng(0).choice(
+                len(floor_pts), n_samples, replace=False)]
+
+        normal, _ = CoordinateTransformer._ransac_plane_normal(
+            floor_pts, n_iter=300, dist_thresh=0.05, min_inliers=50)
+        if normal is None:
+            centroid = floor_pts.mean(axis=0)
+            _, _, Vt = np.linalg.svd(floor_pts - centroid, full_matrices=False)
+            normal = Vt[-1]
+        normal = normal / (np.linalg.norm(normal) or 1.0)
+        # ORIENTATION GEOMETRIQUE : du sol vers la camera (l origine).
+        if float(normal @ floor_pts.mean(axis=0)) > 0:
+            normal = -normal
+        return normal
+
+    @staticmethod
+    def aggregate_ups_m2s(ups, max_dev_deg: float = 8.0):
+        """Direction mediane robuste sur plusieurs images — portage Mesh2Sim.
+
+        Reproduit `_aggregate_ups` : on aligne tous les vecteurs en signe sur le
+        premier, on prend la moyenne unitaire, on ECARTE les images a plus de
+        ``max_dev_deg`` de cette moyenne, puis on remoyenne. L etendue angulaire
+        restante est un signal de stabilite : une seule image aberrante est
+        rejetee au lieu de contaminer l estimation.
+
+        Notre chaine historique moyenne 8 images sans ecarter les aberrantes.
+
+        Returns:
+            (up_moyen, n_gardees, n_total, etendue_deg) ou (None, 0, 0, 0.0).
+        """
+        ups = [np.asarray(u, dtype=np.float64) for u in ups if u is not None]
+        if not ups:
+            return None, 0, 0, 0.0
+        V = np.array([u / (np.linalg.norm(u) or 1.0) for u in ups])
+        V[V @ V[0] < 0] *= -1                      # alignement de signe
+        moy = V.mean(axis=0); moy /= (np.linalg.norm(moy) or 1.0)
+        dev = np.degrees(np.arccos(np.clip(V @ moy, -1, 1)))
+        garde = dev <= max_dev_deg
+        if garde.sum() >= 1:
+            moy = V[garde].mean(axis=0); moy /= (np.linalg.norm(moy) or 1.0)
+            dev_g = np.degrees(np.arccos(np.clip(V[garde] @ moy, -1, 1)))
+        else:
+            dev_g = dev
+        return moy, int(garde.sum()), int(len(V)), float(dev_g.max() if len(dev_g) else 0.0)
+
+    @staticmethod
+    def cam_up_to_world_m2s(up_cam: np.ndarray) -> np.ndarray:
+        """Repere camera OpenCV -> repere monde. Portage de `run_mono_view.py:418-424`.
+
+        (x, -y, -z) est une ROTATION de 180 degres autour de x. Nier le vecteur
+        entier serait une REFLEXION : elle inverse l axe gauche-droite, donc le
+        signe du ROULIS. C est le bug qu ils documentent, 22 degres d erreur
+        cumulee, et leur mode consensus ne pouvait pas fonctionner tant qu il
+        etait la.
+        """
+        u = np.asarray(up_cam, dtype=np.float64)
+        u = u * np.array([1.0, -1.0, -1.0])
+        if u[1] < 0:
+            u = -u
+        return u / (np.linalg.norm(u) or 1.0)
+
+    @staticmethod
+    def rotation_align(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Rotation minimale amenant le vecteur a sur le vecteur b (Rodrigues)."""
+        a = np.asarray(a, dtype=np.float64); a /= (np.linalg.norm(a) or 1.0)
+        b = np.asarray(b, dtype=np.float64); b /= (np.linalg.norm(b) or 1.0)
+        v = np.cross(a, b)
+        c = float(np.dot(a, b))
+        s = float(np.linalg.norm(v))
+        if s < 1e-12:
+            return np.eye(3) if c > 0 else -np.eye(3)
+        vx = np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
+        return np.eye(3) + vx + vx @ vx * ((1.0 - c) / (s * s))
+
+    def _apply_world_frame_leveling(self, kpts, jc, pitch_deg, roll_deg):
+        """Redresse la SCENE ENTIERE par une rotation globale unique.
+
+        Difference de fond avec la chaine historique, qui tourne le squelette
+        AUTOUR DU BASSIN : le bassin bouge d une image a l autre, donc cette
+        rotation-la n est pas une transformation rigide du monde. Elle redresse
+        la pose sans redresser la trajectoire. Ici on applique une rotation
+        unique autour de l origine, comme Mesh2Sim (ground_anchor/mono.py:836),
+        ce qui preserve la geometrie relative de tout l essai et permet ensuite
+        de definir un sol constant.
+        """
+        up = self.world_up_from_moge_angles(pitch_deg, roll_deg)
+        R = self.rotation_align(up, np.array([0.0, 1.0, 0.0]))
+        incl = float(np.degrees(np.arccos(np.clip(up[1], -1.0, 1.0))))
+        print(f"  [world frame] up monde = [{up[0]:+.3f},{up[1]:+.3f},{up[2]:+.3f}] "
+              f"| inclinaison corrigee {incl:.2f}° | rotation GLOBALE")
+        kpts = (kpts.reshape(-1, 3) @ R.T).reshape(kpts.shape)
+        if jc is not None:
+            jc = (jc.reshape(-1, 3) @ R.T).reshape(jc.shape)
+        self._last_world_frame_R = R
+        self._last_world_frame_tilt_deg = incl
+        return kpts, jc
 
     def _rotate_around_pelvis_z(
         self,
