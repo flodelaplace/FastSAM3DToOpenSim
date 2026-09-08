@@ -1720,7 +1720,7 @@ def main(args, estimator=None, visualizer=None):
         from sam_3d_body.export.coordinate_transform import anti_foot_skate_markers
         markers_array, _antiskate_shifts = anti_foot_skate_markers(
             markers_array, marker_names, fps=out_fps)
-        print("  [anti-skate] gel XZ des pieds en contact appliqué au TRC final")
+        print("  [anti-glissement] decalage global XZ applique au TRC final")
 
     # ── --feet_anchor : shift global per-frame pour que le midpoint des
     # pieds reste à sa position médiane sur toute la vidéo. Translate tout
@@ -2191,7 +2191,29 @@ def main(args, estimator=None, visualizer=None):
         # marqueurs de pied et les 40 autres, et se fait defaire. Ici il n'y a
         # plus d'arbitrage. La transformation etant rigide, elle ne change aucun
         # angle : on ne reecrit que pelvis_tx/tz et les positions du TRC post-IK.
-        if getattr(args, "lateral_anchor", False):
+        # Actif PAR DEFAUT sur les gestes qui avancent dans l'espace : marche,
+        # course, depart sprint. Meme regle d'exclusion que l'anti-glissement,
+        # et pour les memes raisons — sur tapis le sujet ne progresse pas, et
+        # camera portee le referentiel bouge. La fonction a de toute facon son
+        # propre garde-fou (moins de 0,5 m de progression = inerte), mais on
+        # coupe explicitement pour que le journal dise pourquoi.
+        _lat_on = getattr(args, "lateral_anchor", False)
+        if args.module in ("d3.running", "d3.gait", "d3.sprint_start"):
+            _lat_motif = None
+            if _is_treadmill:
+                _lat_motif = "tapis (le sujet ne progresse pas, pas d'axe d'avance)"
+            elif getattr(args, "handheld", False):
+                _lat_motif = "camera portee (le referentiel bouge)"
+            elif getattr(args, "no_lateral_anchor", False):
+                _lat_motif = "--no_lateral_anchor"
+            if _lat_motif:
+                print(f"  [recalage lateral] DESACTIVE : {_lat_motif}")
+            else:
+                if not _lat_on:
+                    print(f"  [recalage lateral] ACTIF PAR DEFAUT ({args.module}, "
+                          "camera fixe). --no_lateral_anchor pour couper.")
+                _lat_on = True
+        if _lat_on:
             from sam_3d_body.export.opensim_ik_runner import (
                 apply_lateral_anchor_post_ik)
             _lat_ok = apply_lateral_anchor_post_ik(
@@ -2694,6 +2716,9 @@ def build_parser():
                              "(5,52 cm avant IK -> 9,71 cm apres). Ne s'active que sur "
                              "les gestes avec avancee franche (> 0,5 m) et sur des "
                              "appuis de moins d'une seconde. (Opt-in.)")
+    parser.add_argument("--no_lateral_anchor", action="store_true",
+                        help="Coupe le recalage lateral la ou il est actif par "
+                             "defaut (marche, course, depart sprint, camera fixe).")
     parser.add_argument("--lateral_settle", type=float, default=0.30,
                         help="Courbe de tassement du recalage lateral, en secondes. "
                              "Sans elle l'epinglage est dur : derive minimale mais "

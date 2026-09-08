@@ -116,7 +116,7 @@ START_RE = re.compile(r"^s(\d+)$")
 END_RE = re.compile(r"^e(\d+)$")
 TREADMILL_RE = re.compile(r"^tm(\d+)$")  # vitesse tapis en km/h (tm12 = 12 km/h)
 FLAG_TOKENS = {"st", "insitu", "com", "floor", "lv", "ll", "bikefit", "ca",
-               "seated", "handheld", "nosf"}
+               "seated", "handheld", "nosf", "nolat"}
 LEVEL_TOKENS = {"tr": "trained", "re": "recreational",
                 "cl": "clinical", "el": "elite"}
 # Module token → --module value (d3 par défaut pour SAM3D 3D pipeline)
@@ -181,6 +181,7 @@ def parse_filename(basename):
     stationary = False
     handheld = False
     no_stable_floor = False
+    no_lateral_anchor = False
     compute_com = False
     floor = False
     lock_vertical = False
@@ -259,6 +260,14 @@ def parse_filename(basename):
         if t == "nosf":
             # Coupe le sol stable sans declarer la camera mobile.
             no_stable_floor = True
+            continue
+        if t == "nolat":
+            # Coupe le recalage lateral, actif par defaut sur marche, course et
+            # depart sprint. Mesure : il laisse 771 des 791 metriques identiques
+            # au bit (c'est une translation rigide, aucun angle ne bouge) et ne
+            # deplace que la translation du bassin. A couper si l'on veut la
+            # trajectoire brute du bassin, non recalee.
+            no_lateral_anchor = True
             continue
         if t == "st":
             stationary = True
@@ -370,6 +379,8 @@ def parse_filename(basename):
         extra.append("--handheld")
     if no_stable_floor:
         extra.append("--no_stable_floor")
+    if no_lateral_anchor:
+        extra.append("--no_lateral_anchor")
     if stationary:
         extra.append("--stationary")
     if compute_com:
