@@ -1531,11 +1531,33 @@ def main(args, estimator=None, visualizer=None):
     # pas que la camera l'est. Un tapis de course est stationnaire et filme fixe.
     # D'ou un drapeau distinct, --handheld, plutot qu'une heuristique qui se
     # tromperait un jour sans le dire.
-    _sf_auto = (args.module in ("d3.running", "d3.sprint_start")
+    # PARTOUT SAUF LE CYCLISME. Le sol stable est une reference VERTICALE : il
+    # vaut des que le sujet a les pieds au sol — marche, course, sprint, squat,
+    # saut, lever de chaise — et il reste valide SUR TAPIS, ou la hauteur du sol
+    # ne bouge pas. C'est l'ANTI-GLISSEMENT qui est faux sur tapis, pas le sol :
+    # la bande recule sous le pied, donc celui-ci DOIT glisser (traite plus bas
+    # par `_is_treadmill`, deux corrections independantes qu'il ne faut pas
+    # confondre).
+    #
+    # Le cyclisme est exclu parce que les pieds sont sur les pedales : les points
+    # plantaires n'y touchent aucun sol, et le plan ajuste dessus n'a pas de sens
+    # (mesure sur nos essais velo : pente apparente de +3 a +5 degres, alors que
+    # les courses et les squats sortent a plus ou moins 1). La quadrupedie pose
+    # le meme probleme.
+    #
+    # Pour les gestes ou le pied ne quitte jamais le sol (squat, lever de
+    # chaise), les garde-fous internes du sol stable refusent d'eux-memes faute
+    # de poses distinctes a mesurer : l'activer par defaut est sans effet plutot
+    # que risque.
+    _sf_exclu = ("cycling", "birddog")
+    _sf_auto = (args.module is not None
+                and not any(x in args.module for x in _sf_exclu)
                 and not args.handheld and not args.no_stable_floor)
     if _sf_auto and not args.stable_floor:
-        print("  [stable floor] ACTIF PAR DEFAUT (course/sprint, camera fixe). "
-              "--handheld si la camera bouge, --no_stable_floor pour couper.")
+        print(f"  [stable floor] ACTIF PAR DEFAUT ({args.module}, camera fixe). "
+              "--handheld si la camera bouge, --no_stable_floor pour couper. "
+              "Ses propres garde-fous refusent la correction quand l'essai ne "
+              "permet pas de l'observer.")
     _stable_floor = (args.stable_floor or _sf_auto) and not args.no_stable_floor
     if args.handheld and args.stable_floor:
         print("  [stable floor] demande explicitement malgre --handheld : "
@@ -1659,11 +1681,41 @@ def main(args, estimator=None, visualizer=None):
     markers_array, marker_names = append_hand_keypoints(
         markers_array, marker_names, kpts_opensim)
 
+    # ANTI-GLISSEMENT : actif des que le pied se pose sur un sol FIXE, dans un
+    # referentiel FIXE.
+    #
+    # Il corrige un pied qui derape alors qu'il est pose. Cela suppose deux
+    # choses, et deux seulement : que le sol soit immobile sous le pied, et que
+    # le referentiel ne bouge pas. Le type de geste n'entre pas en ligne de
+    # compte — un squat a un pied pose tout autant qu'une marche.
+    #
+    #   - TAPIS : la bande recule sous le pied, donc celui-ci DOIT glisser. Le
+    #     bloquer inventerait une avancee qui n'existe pas.
+    #   - CAMERA PORTEE : le mouvement de la camera se lit comme un deplacement
+    #     du sujet ; ancrer le pied dessus fige le mauvais referentiel.
+    #   - CYCLISME : les pieds sont sur les pedales, il n'y a aucun sol sous eux.
+    #
+    # Le squat, le lever de chaise et le saut le GARDENT : le pied y est pose sur
+    # un sol fixe, donc il ne doit pas deraper — meme si le sujet n'avance pas.
+    # C'est bien un glissement de pied qu'on corrige, pas une avancee qu'on
+    # protege. --contact_anchor y ajoute l'ancrage vertical du bassin, qui est
+    # une autre correction.
+    #
+    # --contact_anchor force l'anti-glissement quel que soit le geste : c'est une
+    # demande explicite, on la respecte.
     _anti_skate_on = (not getattr(args, "no_anti_foot_skate", False)) or args.contact_anchor
-    # Mode tapis : le pied recule AVEC la bande → il DOIT glisser. On force
-    # l'anti-skate OFF (sauf si --contact_anchor explicitement demandé).
-    if _is_treadmill and not args.contact_anchor:
-        _anti_skate_on = False
+    if not args.contact_anchor:
+        _motif = None
+        if _is_treadmill:
+            _motif = "tapis (le pied recule avec la bande, il DOIT glisser)"
+        elif getattr(args, "handheld", False):
+            _motif = "camera portee (le referentiel bouge, ancrer le pied dessus fige le mauvais repere)"
+        elif args.module is not None and "cycling" in args.module:
+            _motif = "cyclisme (les pieds sont sur les pedales, aucun sol sous eux)"
+        if _motif:
+            if _anti_skate_on:
+                print(f"  [anti-glissement] DESACTIVE : {_motif}")
+            _anti_skate_on = False
     if _anti_skate_on and marker_names is not None:
         from sam_3d_body.export.coordinate_transform import anti_foot_skate_markers
         markers_array, _antiskate_shifts = anti_foot_skate_markers(
