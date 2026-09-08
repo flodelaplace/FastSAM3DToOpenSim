@@ -116,7 +116,7 @@ START_RE = re.compile(r"^s(\d+)$")
 END_RE = re.compile(r"^e(\d+)$")
 TREADMILL_RE = re.compile(r"^tm(\d+)$")  # vitesse tapis en km/h (tm12 = 12 km/h)
 FLAG_TOKENS = {"st", "insitu", "com", "floor", "lv", "ll", "bikefit", "ca",
-               "seated"}
+               "seated", "handheld", "nosf"}
 LEVEL_TOKENS = {"tr": "trained", "re": "recreational",
                 "cl": "clinical", "el": "elite"}
 # Module token → --module value (d3 par défaut pour SAM3D 3D pipeline)
@@ -179,6 +179,8 @@ def parse_filename(basename):
     trim_start = None
     trim_end = None
     stationary = False
+    handheld = False
+    no_stable_floor = False
     compute_com = False
     floor = False
     lock_vertical = False
@@ -244,6 +246,19 @@ def parse_filename(basename):
             if module is not None:
                 raise FilenameParseError(f"Duplicate module token: '{t}'")
             module = MODULE_TOKENS[t]
+            continue
+        if t == "handheld":
+            # La CAMERA bouge (portee, embarquee). Distinct de `st`/`insitu`,
+            # qui disent que le SUJET est en place : un tapis de course est
+            # stationnaire ET filme camera fixe. Ce jeton coupe le sol stable,
+            # actif par defaut en course et au depart sprint, parce que celui-ci
+            # suppose un sol constant sur l'essai — hypothese fausse des que la
+            # camera bouge (derive mesuree : 20 cm sur 6 s contre 4,4 fixe).
+            handheld = True
+            continue
+        if t == "nosf":
+            # Coupe le sol stable sans declarer la camera mobile.
+            no_stable_floor = True
             continue
         if t == "st":
             stationary = True
@@ -351,6 +366,10 @@ def parse_filename(basename):
             "--run_ik_per_person",
             "--write_combined_trc",
         ]
+    if handheld:
+        extra.append("--handheld")
+    if no_stable_floor:
+        extra.append("--no_stable_floor")
     if stationary:
         extra.append("--stationary")
     if compute_com:

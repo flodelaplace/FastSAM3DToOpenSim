@@ -1496,6 +1496,57 @@ def main(args, estimator=None, visualizer=None):
         "1" if args.module in ("d3.running", "d3.gait", "d3.sprint_start") else "0"
     )
 
+    # Indices des points PLANTAIRES dans le tableau jcoords_processed. Les
+    # marqueurs anatomiques sont concatenes DERRIERE les 127 joints MHR (voir
+    # 1b ci-dessus), donc l'indice vaut 127 + rang du marqueur. Ordre impose :
+    # pied droit puis pied gauche, ce que `transform()` suppose pour couper le
+    # tableau en deux pieds.
+    _plantar_idx = None
+    if markerset == "flodelaplace" and N_anat:
+        _base = jcoords_processed.shape[1] - N_anat
+        _mk = list(florian_converter.marker_names)
+        _r = [_base + _mk.index(n) for n in
+              [f"SOLE_s{i}_r" for i in range(1, 8)] if n in _mk]
+        _l = [_base + _mk.index(n) for n in
+              [f"SOLE_s{i}_l" for i in range(1, 8)] if n in _mk]
+        if _r and len(_r) == len(_l):
+            _plantar_idx = np.asarray(_r + _l, dtype=int)
+    # SOL STABLE PAR DEFAUT sur la course et le depart sprint, camera fixe.
+    #
+    # Mesure du 2026-09-08 sur Sprint_start.mp4 (camera fixe, 200 images) : la
+    # dispersion de la hauteur du pied entre les poses passe de 6,50 a 1,42 cm,
+    # sous le seuil de 2 cm en dessous duquel une detection de contact par
+    # hauteur devient exploitable. La pente residuelle du sol tombe de -1,95 a
+    # -0,72 degre.
+    #
+    # POURQUOI SEULEMENT CAMERA FIXE. Le sol stable suppose un sol CONSTANT sur
+    # l'essai. Une camera qui bouge verse son propre mouvement dans la verticale
+    # du sujet : mesure sur une course filmee a la main, la hauteur du pied a la
+    # pose derive de 20,2 cm sur 6 s et la derive est correlee au temps
+    # (r = +0,43), contre 4,4 cm et aucune correlation en camera fixe. Le sol
+    # stable ameliore quand meme ce cas (20,2 -> 10,1) mais n'atteint pas le
+    # seuil, et surtout l'hypothese qui le fonde est fausse.
+    #
+    # --stationary NE SUFFIT PAS a trancher : il dit que le SUJET est en place,
+    # pas que la camera l'est. Un tapis de course est stationnaire et filme fixe.
+    # D'ou un drapeau distinct, --handheld, plutot qu'une heuristique qui se
+    # tromperait un jour sans le dire.
+    _sf_auto = (args.module in ("d3.running", "d3.sprint_start")
+                and not args.handheld and not args.no_stable_floor)
+    if _sf_auto and not args.stable_floor:
+        print("  [stable floor] ACTIF PAR DEFAUT (course/sprint, camera fixe). "
+              "--handheld si la camera bouge, --no_stable_floor pour couper.")
+    _stable_floor = (args.stable_floor or _sf_auto) and not args.no_stable_floor
+    if args.handheld and args.stable_floor:
+        print("  [stable floor] demande explicitement malgre --handheld : "
+              "le sol ne sera pas constant, resultat a interpreter avec reserve.")
+        _stable_floor = True
+
+    if _stable_floor and _plantar_idx is None:
+        print("  [stable floor] AVERTISSEMENT : aucun marqueur SOLE_* trouve, "
+              "le sol sera pose sur les keypoints CUTANES (3 cm trop haut, "
+              "reference qui bat au rythme du deroule du pied).")
+
     kpts_opensim, jcoords_opensim = transformer.transform(
         kpts_processed,
         jcoords_3d=jcoords_processed,
@@ -1509,6 +1560,9 @@ def main(args, estimator=None, visualizer=None):
         lock_vertical=args.lock_vertical,
         lock_lateral=args.lock_lateral or _auto_lock_lateral,
         contact_anchor=args.contact_anchor or _auto_contact_anchor,
+        stable_floor=_stable_floor,
+        plantar_indices=_plantar_idx,
+        stable_floor_drift=args.stable_floor_drift,
         fps=out_fps,
     )
 
@@ -2550,6 +2604,36 @@ def build_parser():
                              "soutenu (squat → bassin descend) mais préserve la phase de vol "
                              "(course/saut). Unifie et remplace --floor/défaut. Recommandé pour "
                              "avatars + mouvements libres. (Opt-in en cours de validation.)")
+    parser.add_argument("--handheld", action="store_true",
+                        help="La CAMERA bouge (portee a la main, embarquee). Distinct "
+                             "de --stationary, qui dit que le SUJET est en place : un "
+                             "tapis de course est stationnaire ET camera fixe. Ce "
+                             "drapeau desactive le sol stable par defaut, parce que "
+                             "celui-ci suppose un sol constant sur l'essai — mesure sur "
+                             "une course filmee a la main : la hauteur du pied a la pose "
+                             "derive de 20 cm sur 6 s, contre 4,4 cm camera fixe.")
+    parser.add_argument("--no_stable_floor", action="store_true",
+                        help="Desactive le sol stable meme la ou il est actif par "
+                             "defaut (course et depart sprint, camera fixe).")
+    parser.add_argument("--stable_floor", action="store_true",
+                        help="Mise au sol STABLE (portage Mesh2Sim, voir "
+                             "docs/portage_sol_contact_mesh2sim.md). Remplace le clamp "
+                             "per-frame / align_to_ground / contact_anchor par une "
+                             "transformation a peu de parametres calculee UNE FOIS pour "
+                             "l'essai (rotation globale du plan du sol, derive verticale, "
+                             "offset constant), mesuree sur les points PLANTAIRES SOLE_* et "
+                             "non sur la peau. Mesure : etendue de la hauteur du sol entre "
+                             "appuis 4,6 -> 1,0 cm sur RUN_6224, 17,4 -> 7,2 cm sur "
+                             "IMG_6238. OPT-IN : sans ce drapeau, rien ne change.")
+    parser.add_argument("--stable_floor_drift", default="linear+stance",
+                        choices=["none", "linear", "stance", "linear+stance"],
+                        help="Modele de derive verticale du sol pour --stable_floor. "
+                             "'linear' = 1 parametre (cm/s), corrige la derive monotone "
+                             "introduite par l'injection cam_t.Y en mode --stationary sur "
+                             "une camera portee. 'stance' = correction conditionnee a "
+                             "l'appui, interpolee pendant le vol (forme prescrite par "
+                             "Mesh2Sim §4 pour la course). Defaut : les deux, dans cet "
+                             "ordre (la detection d'appui a besoin d'un sol de-derive).")
     parser.add_argument("--person_height", type=float, default=None,
                         help="Known person height in metres (e.g. 1.69). Scales all 3D output "
                              "so the skeleton height matches this value. Applied to all persons "
