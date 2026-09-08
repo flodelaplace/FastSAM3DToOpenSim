@@ -1776,15 +1776,25 @@ def anti_foot_skate_markers(
     # Repères de pied : on prend toute la semelle disponible plutôt que le seul
     # couple talon/orteil. Un appui se juge mieux sur 5 points (calcanéus,
     # orteil, 5e méta, malléoles) que sur 2, et les marqueurs de semelle SOLE
-    # (`*_s1`..`*_s7`, absents des TRC anciens) sont pris s'ils existent.
+    # sont pris s'ils existent.
     # Jeu repris de l'étage ground_anchor de Mesh2Sim, rodé sur de la marche.
+    #
+    # ⚠️ La règle des semelles cherchait des noms de la forme `Rs1` — nos points
+    # s'appellent `SOLE_s1_r`. Elle ne renvoyait donc RIEN, des deux côtés,
+    # alors que le TRC porte bien 14 points plantaires (constaté 2026-09-08).
+    # L'anti-glissement ne voyait que des marqueurs CUTANÉS, qui ne descendent
+    # jamais sous ~3 cm du sol : le seuil de hauteur jugeait un contact sur des
+    # points qui ne touchent jamais. On accepte les deux nominations.
     _base = ("CAL", "TOE", "MT5", "LMAL", "MMAL")
     side_markers = {}
     for side in ("L", "R"):
+        suf = "_" + side.lower()
         idx = [name_to_idx[side + n] for n in _base if side + n in name_to_idx]
         idx += [i for n, i in name_to_idx.items()
+                if n.startswith("SOLE_") and n.endswith(suf)]
+        idx += [i for n, i in name_to_idx.items()
                 if n.startswith(side) and len(n) > 2 and n[1] == "s" and n[2:].isdigit()]
-        side_markers[side] = idx
+        side_markers[side] = sorted(set(idx))
     min_len = max(2, int(round(min_contact_s * fps)))
 
     # Axe de marche et position du bassin — nécessaires au critère de recul.
