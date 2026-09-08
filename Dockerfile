@@ -110,6 +110,30 @@ RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
         "git+https://github.com/EasternJournalist/pipeline.git@866f059d2a05cde05e4a52211ec5051fd5f276d6" \
         "git+https://github.com/EasternJournalist/utils3d.git@3fab839f0be9931dac7c8488eb0e1600c236e183"
 
+# Step 7: GeoCalib (~1 min) — SECOND estimateur de la verticale.
+# Verifie le 2026-09-08 dans cette image : l installation ne touche PAS torch
+# (2.5.1+cu124 avant comme apres), alors que Mesh2Sim l isole dans son propre
+# env conda par prudence. Poids ~15 Mo, telecharges au premier appel.
+# Il sert d ARBITRE : MoGe seul derive (pitchs de 24 a 81 deg selon l image sur
+# un meme depart sprint), GeoCalib garde 7/7 images a 0,43 deg d etendue. Les
+# deux doivent s accorder a moins de 8 deg pour que la verticale soit appliquee.
+# Licence : code Apache-2.0, poids CC-BY-4.0.
+RUN /opt/conda/envs/fast_sam_3d_body/bin/pip install \
+        "git+https://github.com/cvg/GeoCalib.git"
+
+# Poids GeoCalib cuits dans l image, dans un cache LISIBLE PAR TOUS.
+# Sans cela ils se telechargent au premier appel, sous le HOME du process — donc
+# a chaque job AWS, et pas du tout si le conteneur n a pas de sortie reseau. Or
+# notre code attrape l echec et affiche « geocalib indisponible » : on perdrait
+# l ARBITRE en silence et l on retomberait sur MoGe seul, c est-a-dire
+# exactement la configuration qui derive. TORCH_HOME est fige pour que le cache
+# soit le meme au build (root) et a l execution (uid 1000).
+ENV TORCH_HOME=/opt/torch_home
+RUN mkdir -p /opt/torch_home && \
+    /opt/conda/envs/fast_sam_3d_body/bin/python -c "from geocalib import GeoCalib; GeoCalib()" && \
+    chmod -R a+rX /opt/torch_home && \
+    du -sh /opt/torch_home
+
 # Final cleanup
 RUN conda clean -afy && \
     find /opt/conda -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true

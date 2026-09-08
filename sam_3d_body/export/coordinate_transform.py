@@ -57,6 +57,7 @@ class CoordinateTransformer:
     # avant toute instanciation du transformateur, et c est le seul endroit ou
     # la grille de points MoGe existe encore.
     _ups_cam_m2s: list = []
+    _gc_up_world_m2s = None
 
     CAMERA_TO_OPENSIM = np.array(
         [
@@ -257,26 +258,62 @@ class CoordinateTransformer:
                     # robuste avec rejet a 8 deg, conversion de repere, rotation
                     # globale unique. C est la recette Mesh2Sim complete.
                     _u, _ng, _nt, _spread = self.aggregate_ups_m2s(_ups)
-                    _up_w = self.cam_up_to_world_m2s(_u)
+                    _mg = self.cam_up_to_world_m2s(_u)
+                    _gc = getattr(CoordinateTransformer, "_gc_up_world_m2s", None)
+
+                    # CONSENSUS GeoCalib ⊕ MoGe — leur regle, mot pour mot :
+                    # angle entre les deux, au-dela de 8 deg on ne fait pas
+                    # confiance, sinon la verticale est la somme normalisee.
+                    # Une seule source disponible : on la prend telle quelle
+                    # (elle vaut 0,7-2,7 deg sur leur banc de 27 cameras).
+                    if _gc is not None:
+                        _ang = float(np.degrees(np.arccos(
+                            np.clip(float(_mg @ _gc), -1.0, 1.0))))
+                        if _ang > 8.0:
+                            print(f"  [world frame] GeoCalib⊕MoGe EN DESACCORD "
+                                  f"({_ang:.1f}° > 8) → verticale non fiable, "
+                                  f"repli sur la mediane des angles.")
+                            _world_frame = False
+                            _up_w = _mg
+                        else:
+                            _up_w = _gc + _mg
+                            _up_w = _up_w / (np.linalg.norm(_up_w) or 1.0)
+                            print(f"  [world frame] GeoCalib⊕MoGe d accord "
+                                  f"({_ang:.1f}°) → verticale de consensus")
+                    else:
+                        _up_w = _mg
+                        print("  [world frame] GeoCalib indisponible → MoGe seul")
+
                     _R = self.rotation_align(_up_w, np.array([0.0, 1.0, 0.0]))
                     _incl = float(np.degrees(np.arccos(np.clip(_up_w[1], -1.0, 1.0))))
-                    _min_kept = max(2, int(round(_nt * 0.5)))
-                    _max_incl = float(_os_wf.environ.get("MOGE_WF_MAX_TILT_DEG", "20"))
-                    if _ng < _min_kept or _incl > _max_incl:
-                        print(f"  [world frame] REFUSE : {_ng}/{_nt} images "
-                              f"d accord (il en faut {_min_kept}), inclinaison "
-                              f"{_incl:.2f}° (max {_max_incl:.0f}°). Sans second "
-                              f"estimateur pour arbitrer, on retombe sur la "
-                              f"mediane des angles.")
-                        _world_frame = False
-                    else:
+                    if _world_frame:
                         print(f"  [world frame] {_ng}/{_nt} images gardees, "
                               f"etendue {_spread:.2f}° | up monde = "
                               f"[{_up_w[0]:+.3f},{_up_w[1]:+.3f},{_up_w[2]:+.3f}]"
                               f" | inclinaison {_incl:.2f}° | rotation GLOBALE")
+                        # ⚠️ REPOSER LA SCENE APRES LA ROTATION.
+                        # La rotation est globale, donc centree sur l origine
+                        # CAMERA. Un sujet a 3-4 m tourne de 13 deg se retrouve
+                        # deplace de pres d un metre en hauteur : mesure sur
+                        # `Squat.MP4`, offset -88,9 cm, et le sol stable refuse
+                        # ensuite de corriger 90,6 cm parce que son garde-fou de
+                        # 30 cm a ete regle pour une chaine sans rotation globale.
+                        # Chez Mesh2Sim la rotation est suivie de leur etage
+                        # ground_anchor ; ici on remet simplement le point le plus
+                        # bas de la sequence a la hauteur qu il avait avant. C est
+                        # une TRANSLATION, elle ne change aucun angle.
+                        _y0 = float(np.nanmin(kpts[..., 1])) if kpts.size else 0.0
                         kpts = (kpts.reshape(-1, 3) @ _R.T).reshape(kpts.shape)
                         if jc is not None:
                             jc = (jc.reshape(-1, 3) @ _R.T).reshape(jc.shape)
+                        if kpts.size:
+                            _dy = _y0 - float(np.nanmin(kpts[..., 1]))
+                            if np.isfinite(_dy) and abs(_dy) > 1e-6:
+                                kpts[..., 1] += _dy
+                                if jc is not None:
+                                    jc[..., 1] += _dy
+                                print(f"  [world frame] scene reposee : {_dy*100:+.1f} cm "
+                                      f"en Y (la rotation globale l avait soulevee)")
                         self._last_world_frame_R = _R
                         self._last_world_frame_tilt_deg = _incl
                         self._last_floor_angle_deg = _incl
@@ -1276,6 +1313,23 @@ class CoordinateTransformer:
         sample_idx = np.linspace(margin, total - margin - 1, n_samples).astype(int)
         sample_idx = np.unique(sample_idx)
 
+        # SECOND ESTIMATEUR (GeoCalib) sur LES MEMES images. Chez Mesh2Sim, MoGe
+        # n est jamais seul : les deux doivent s accorder a moins de 8 deg, sinon
+        # la verticale est jugee non fiable. Mesure du 2026-09-08 sur
+        # `Sprint_start` : MoGe donne des pitchs de 24 a 81 deg selon l image et
+        # son agregation s effondre a 1 image sur 8, quand GeoCalib garde 7/7
+        # avec 0,43 deg d etendue et 1,24 deg d inclinaison. C est exactement le
+        # role d arbitre que joue GeoCalib chez eux.
+        import os as _os_gc
+        CoordinateTransformer._gc_up_world_m2s = None
+        if bool(int(_os_gc.environ.get("MOGE_WORLD_FRAME", "1"))):
+            try:
+                CoordinateTransformer._gc_up_world_m2s = (
+                    CoordinateTransformer.geocalib_up_world_m2s(
+                        video_path, [int(i) for i in sample_idx]))
+            except Exception as _e_gc:
+                print(f"  [geocalib] indisponible ({str(_e_gc)[:70]})")
+
         per_frame = []
         pitches, rolls, weights = [], [], []
         for idx in sample_idx:
@@ -1427,6 +1481,75 @@ class CoordinateTransformer:
         if n_w[1] < 0:          # normale de signe libre : on veut "vers le haut"
             n_w = -n_w
         return n_w / (np.linalg.norm(n_w) or 1.0)
+
+    @staticmethod
+    def geocalib_up_world_m2s(video_path: str, frames, camera_model: str = "pinhole"):
+        """Verticale de la scene par GeoCalib — portage de leur etage mono.
+
+        Reproduit `stages/calibration_mono_geocalib/.../estimate.py` : `up` vaut
+        `-gravity.vec3d`, estime sur plusieurs images, puis la MEME agregation
+        que pour MoGe (alignement de signe, moyenne, rejet au-dela de 8 deg,
+        re-moyenne).
+
+        ⚠️ LE DETAIL QUI DECIDE DE TOUT, et qu ils ont paye 22 deg d erreur pour
+        trouver : `-gravity.vec3d` tombe deja en y haut / z arriere, mais avec
+        l axe X **INVERSE** par rapport a la calibration, a MoGe et a la colonne
+        (roulis de signe oppose mesure sur deux cameras : +3,35 contre -3,8 deg,
+        +10,96 contre -10,7). On inverse donc x, et RIEN d autre — surtout pas
+        une negation du vecteur entier, qui serait une reflexion. Sans cette
+        correction les deux sources tombent « d accord » sur un roulis faux et le
+        consensus ne peut structurellement pas fonctionner.
+
+        Returns:
+            (3,) vecteur unitaire "haut" en repere MONDE, ou None.
+        """
+        import os as _os_g, tempfile as _tf
+        import cv2 as _cv
+        import torch as _t
+        from geocalib import GeoCalib as _GC
+
+        _t.set_grad_enabled(False)
+        dev = "cuda" if _t.cuda.is_available() else "cpu"
+        model = _GC().to(dev)
+        ups = []
+        for f in frames:
+            cap = _cv.VideoCapture(video_path)
+            cap.set(_cv.CAP_PROP_POS_FRAMES, int(f))
+            ok, bgr = cap.read()
+            cap.release()
+            if not ok or bgr is None:
+                continue
+            tmp = _tf.mktemp(suffix=".png")
+            try:
+                _cv.imwrite(tmp, bgr)
+                img = model.load_image(tmp).to(dev)
+            finally:
+                if _os_g.path.exists(tmp):
+                    _os_g.unlink(tmp)
+            r = model.calibrate(img, camera_model=camera_model)
+            u = -r["gravity"].vec3d[0].cpu().numpy()
+            n = float(np.linalg.norm(u))
+            if n > 1e-9:
+                ups.append(u / n)
+        if not ups:
+            return None
+        V = np.array(ups)
+        V[V @ V[0] < 0] *= -1
+        mean = V.mean(axis=0)
+        mean /= (np.linalg.norm(mean) or 1.0)
+        dev_deg = np.degrees(np.arccos(np.clip(V @ mean, -1, 1)))
+        keep = dev_deg <= 8.0
+        if keep.sum() >= 1:
+            mean = V[keep].mean(axis=0)
+            mean /= (np.linalg.norm(mean) or 1.0)
+        # X inverse — voir l avertissement du docstring.
+        out = mean * np.array([-1.0, 1.0, 1.0])
+        out /= (np.linalg.norm(out) or 1.0)
+        print(f"  [geocalib] {int(keep.sum())}/{len(V)} images gardees, etendue "
+              f"{float(dev_deg[keep].max()) if keep.any() else 0.0:.2f}° | up monde "
+              f"= [{out[0]:+.3f},{out[1]:+.3f},{out[2]:+.3f}] | inclinaison "
+              f"{np.degrees(np.arccos(np.clip(abs(out[1]), -1, 1))):.2f}°")
+        return out
 
     @staticmethod
     def floor_up_from_points_m2s(points, mask, person_bbox=None, orig_hw=None,
