@@ -519,6 +519,19 @@ def main(args, estimator=None, visualizer=None):
     if getattr(args, "deterministic", False):
         _activer_determinisme()
 
+    # La masse du sujet vit dans DEUX arguments distincts, et c'est un piege :
+    #   --subject_mass  sert au Scale Tool, donc a la masse portee par le .osim
+    #   --mass_kg       sert aux analytics (GRF, normes)
+    # La lambda AWS n'emet QUE --mass_kg depuis le jeton `m<kg>` du nom de
+    # fichier. Consequence constatee le 2026-09-08 sur un job reel : le nom
+    # disait `m74`, les metriques recevaient bien 74, et le modele partait
+    # quand meme a 70 kg — le defaut. Les angles n'en souffrent pas (l'IK est
+    # geometrique), mais le .osim livre porte une masse fausse, et c'est lui
+    # que consomment l'estimation de GRF et le muscle-driven a venir.
+    # On aligne donc le modele sur la masse declaree, sauf demande explicite.
+    if getattr(args, "subject_mass", None) is None:
+        args.subject_mass = float(args.mass_kg) if getattr(args, "mass_kg", None) else 70.0
+
     # Auto-generate timestamped output directory (matches SAM3D-OpenSim convention)
     if args.output_dir is None:
         video_name_raw = os.path.splitext(os.path.basename(args.video_path))[0]
@@ -2757,9 +2770,12 @@ def build_parser():
                              "assigned left-to-right as seen in the video. "
                              "E.g. --person_heights 1.69,1.82  (person on the left=1.69m, "
                              "person on the right=1.82m). Overrides --person_height.")
-    parser.add_argument("--subject_mass", type=float, default=70.0,
-                        help="Subject mass in kg (default 70.0). Used for model scaling only; "
-                             "does not affect kinematics.")
+    parser.add_argument("--subject_mass", type=float, default=None,
+                        help="Masse du sujet en kg pour le Scale Tool, donc pour la masse "
+                             "portee par le .osim. Par defaut on reprend --mass_kg si elle "
+                             "est fournie, sinon 70,0. N'affecte pas la cinematique (l'IK "
+                             "est geometrique) mais bien tout ce qui derive du modele : "
+                             "estimation de GRF, dynamique inverse, muscle-driven.")
     parser.add_argument("--floor_level", action="store_true",
                         help="(Legacy flag) Per-frame ground alignment is always applied.")
     parser.add_argument("--floor", action="store_true",
