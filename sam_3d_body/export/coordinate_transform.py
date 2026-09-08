@@ -291,17 +291,21 @@ class CoordinateTransformer:
                               f"etendue {_spread:.2f}° | up monde = "
                               f"[{_up_w[0]:+.3f},{_up_w[1]:+.3f},{_up_w[2]:+.3f}]"
                               f" | inclinaison {_incl:.2f}° | rotation GLOBALE")
-                        # ⚠️ REPOSER LA SCENE APRES LA ROTATION.
-                        # La rotation est globale, donc centree sur l origine
-                        # CAMERA. Un sujet a 3-4 m tourne de 13 deg se retrouve
-                        # deplace de pres d un metre en hauteur : mesure sur
-                        # `Squat.MP4`, offset -88,9 cm, et le sol stable refuse
-                        # ensuite de corriger 90,6 cm parce que son garde-fou de
-                        # 30 cm a ete regle pour une chaine sans rotation globale.
-                        # Chez Mesh2Sim la rotation est suivie de leur etage
-                        # ground_anchor ; ici on remet simplement le point le plus
-                        # bas de la sequence a la hauteur qu il avait avant. C est
-                        # une TRANSLATION, elle ne change aucun angle.
+                        # Reposer la scene apres la rotation : elle est globale,
+                        # donc centree sur l origine CAMERA, et elle deplace donc
+                        # le sujet en hauteur. On rend au point le plus bas de la
+                        # sequence la hauteur qu il avait avant. C est une
+                        # TRANSLATION, elle ne change aucun angle. Chez Mesh2Sim
+                        # ce role est tenu par leur etage ground_anchor.
+                        #
+                        # ⚠️ Ne PAS lui attribuer l offset de ~90 cm que le sol
+                        # stable signale sur les squats. J avais fait ce lien, la
+                        # mesure le dement : le temoin `--no_world_frame` donne
+                        # deja -85,7 cm avec un refus a 86,5 cm, contre -94,8 avec
+                        # le repere monde. L offset PREEXISTE ; la rotation n en
+                        # ajoute que ~9 cm. Ici le recalage ne vaut que 5,7 cm.
+                        # Le refus du sol stable sur les squats est un sujet a
+                        # part, ouvert au registre.
                         _y0 = float(np.nanmin(kpts[..., 1])) if kpts.size else 0.0
                         kpts = (kpts.reshape(-1, 3) @ _R.T).reshape(kpts.shape)
                         if jc is not None:
