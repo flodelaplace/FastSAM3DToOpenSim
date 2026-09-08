@@ -51,6 +51,13 @@ class CoordinateTransformer:
     giving a single exact scale with no magic correction factors.
     """
 
+    # Normales de sol par image, en repere camera OpenCV, remplies par
+    # `robust_floor_angle_multi_frame` quand MOGE_WORLD_FRAME=1. Attribut de
+    # CLASSE parce que l estimation multi-images est statique : elle tourne
+    # avant toute instanciation du transformateur, et c est le seul endroit ou
+    # la grille de points MoGe existe encore.
+    _ups_cam_m2s: list = []
+
     CAMERA_TO_OPENSIM = np.array(
         [
             [0,  0, 1],   # X_opensim = Z_camera
@@ -225,11 +232,35 @@ class CoordinateTransformer:
                 # veut l angle MESURE, donc on defait ce facteur. Si le clamp a
                 # 60 deg a mordu, la reconstruction serait fausse — on ne peut
                 # pas le savoir ici, mais un pitch a la borne est deja anormal.
-                _ls = float(_os_wf.environ.get("MOGE_LEAN_SCALE", "0.5")) or 1.0
-                _p_raw, _r_raw = _pitch / _ls, -_roll / _ls   # le roll etait nie
-                kpts, jc = self._apply_world_frame_leveling(kpts, jc, _p_raw, _r_raw)
-                self._last_floor_angle_deg = _p_raw
-                self._last_roll_angle_deg = _r_raw
+                _ups = list(getattr(CoordinateTransformer, "_ups_cam_m2s", []))
+                if _ups:
+                    # CHEMIN FIDELE : vraies normales par image, agregation
+                    # robuste avec rejet a 8 deg, conversion de repere, rotation
+                    # globale unique. C est la recette Mesh2Sim complete.
+                    _u, _ng, _nt, _spread = self.aggregate_ups_m2s(_ups)
+                    _up_w = self.cam_up_to_world_m2s(_u)
+                    _R = self.rotation_align(_up_w, np.array([0.0, 1.0, 0.0]))
+                    _incl = float(np.degrees(np.arccos(np.clip(_up_w[1], -1.0, 1.0))))
+                    print(f"  [world frame] {_ng}/{_nt} images gardees, etendue "
+                          f"{_spread:.2f}° | up monde = [{_up_w[0]:+.3f},"
+                          f"{_up_w[1]:+.3f},{_up_w[2]:+.3f}] | inclinaison "
+                          f"{_incl:.2f}° | rotation GLOBALE")
+                    kpts = (kpts.reshape(-1, 3) @ _R.T).reshape(kpts.shape)
+                    if jc is not None:
+                        jc = (jc.reshape(-1, 3) @ _R.T).reshape(jc.shape)
+                    self._last_world_frame_R = _R
+                    self._last_world_frame_tilt_deg = _incl
+                    self._last_floor_angle_deg = _incl
+                else:
+                    # REPLI : aucune normale collectee (angles fournis a la main,
+                    # ou estimation mono-image). On reconstitue depuis les angles
+                    # bruts : ca teste la conversion de repere et la rotation
+                    # globale, mais ni l orientation geometrique ni le rejet.
+                    _ls = float(_os_wf.environ.get("MOGE_LEAN_SCALE", "0.5")) or 1.0
+                    _p_raw, _r_raw = _pitch / _ls, -_roll / _ls
+                    kpts, jc = self._apply_world_frame_leveling(kpts, jc, _p_raw, _r_raw)
+                    self._last_floor_angle_deg = _p_raw
+                    self._last_roll_angle_deg = _r_raw
             else:
                 if _src is not None and abs(_pitch) > 0.5:
                     print(f"  [floor lean] {_src} pitch {_pitch:+.2f}° → correcting")
@@ -1243,6 +1274,22 @@ class CoordinateTransformer:
                     person_bbox = None
 
             orig_hw = (frame_bgr.shape[0], frame_bgr.shape[1])
+
+            # MODE REPERE MONDE : on retient AUSSI la normale brute de cette
+            # image, en repere camera. C est le SEUL endroit du pipeline ou la
+            # grille de points MoGe existe ; plus loin il ne reste que des angles
+            # deja reduits, dont on ne peut reconstituer ni l orientation
+            # geometrique ni le rejet d image.
+            import os as _os_wf2
+            if bool(int(_os_wf2.environ.get("MOGE_WORLD_FRAME", "0"))):
+                try:
+                    _u = CoordinateTransformer.floor_up_from_points_m2s(
+                        pts, mask, person_bbox=person_bbox, orig_hw=orig_hw)
+                    if _u is not None:
+                        CoordinateTransformer._ups_cam_m2s.append(_u)
+                except Exception:
+                    pass
+
             try:
                 p, r, raw_p, raw_r = CoordinateTransformer.floor_angle_from_moge_points(
                     pts, mask, person_bbox=person_bbox, orig_hw=orig_hw,
