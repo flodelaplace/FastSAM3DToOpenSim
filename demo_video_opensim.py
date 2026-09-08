@@ -519,6 +519,25 @@ def main(args, estimator=None, visualizer=None):
     if getattr(args, "deterministic", False):
         _activer_determinisme()
 
+    # Le repere monde se lit par variable d environnement (il est consomme au
+    # fond de la chaine de transformation, la ou `args` n arrive pas). Le drapeau
+    # CLI la pose ici, pour que le reglage reste exprime en une seule place.
+    if getattr(args, "no_world_frame", False):
+        os.environ["MOGE_WORLD_FRAME"] = "0"
+    else:
+        os.environ.setdefault("MOGE_WORLD_FRAME", "1")
+
+    # Les normales du sol par image sont accumulees dans un attribut DE CLASSE.
+    # Le worker persistant enchaine les videos dans le meme process : sans cette
+    # remise a zero, la deuxieme video agregerait les normales de la premiere et
+    # redresserait la scene avec le sol de quelqu un d autre — sans un message.
+    # C est la meme famille de fuite que NO_FLOOR_CLAMP, deja payee une fois.
+    try:
+        from sam_3d_body.export.coordinate_transform import CoordinateTransformer
+        CoordinateTransformer._ups_cam_m2s = []
+    except Exception:
+        pass
+
     # La masse du sujet vit dans DEUX arguments distincts, et c'est un piege :
     #   --subject_mass  sert au Scale Tool, donc a la masse portee par le .osim
     #   --mass_kg       sert aux analytics (GRF, normes)
@@ -1686,6 +1705,7 @@ def main(args, estimator=None, visualizer=None):
     # qui lui gère l'ancrage vertical du bassin) : dès qu'un pied touche le sol,
     # il ne doit pas déraper. Désactivable via --no_anti_foot_skate.
     _antiskate_shifts = None
+    _lateral_shifts = None
     # Articulations de main : SAM3D les fournit nommees (4 par doigt), la ou le
     # markerset ne portait que des points de PEAU — et, pour le majeur et
     # l'annulaire, des positions INTERPOLEES (23,5 mm d'ecart mesure). On les
@@ -2229,11 +2249,11 @@ def main(args, estimator=None, visualizer=None):
         if _lat_on:
             from sam_3d_body.export.opensim_ik_runner import (
                 apply_lateral_anchor_post_ik)
-            _lat_ok = apply_lateral_anchor_post_ik(
+            _lateral_shifts = apply_lateral_anchor_post_ik(
                 post_ik_trc_path, ik_mot_path, fps=out_fps,
                 settle_s=getattr(args, "lateral_settle", 0.30))
             print("  [recalage lateral] applique au TRC post-IK et au .mot"
-                  if _lat_ok else
+                  if _lateral_shifts is not None else
                   "  [recalage lateral] inactif (pas d'avancee franche, pas de "
                   "marqueurs de semelle, ou appuis trop longs pour etre des pas)")
 
@@ -2381,6 +2401,28 @@ def main(args, estimator=None, visualizer=None):
                 if jc_world[i] is not None:
                     jc_world[i][:, 0] += dxz[0]
                     jc_world[i][:, 2] += dxz[1]
+        # Recalage lateral : le GLB anatomique est pilote par le `.mot`, que la
+        # correction a modifie ; le mesh vient des sommets MHR et ne l'a pas
+        # vue. Sans ce report, les deux GLB divergent EXACTEMENT du montant du
+        # recalage — constate par Florian sur un depart sprint le 2026-09-08,
+        # ou le mesh ne suivait plus la trajectoire de l'anatomique.
+        # L'IK peut avoir saute des images non resolues : on reechantillonne
+        # sur l'index normalise plutot que de tronquer, sinon la correction
+        # glisserait d'une image a l'autre sur la fin de la sequence.
+        if _lateral_shifts is not None and len(verts_world):
+            _ls = _lateral_shifts
+            if len(_ls) != len(verts_world):
+                _src = np.linspace(0.0, 1.0, len(_ls))
+                _dst = np.linspace(0.0, 1.0, len(verts_world))
+                _ls = np.stack([np.interp(_dst, _src, _ls[:, k])
+                                for k in range(2)], axis=1)
+            for i in range(len(verts_world)):
+                lx, lz = float(_ls[i][0]), float(_ls[i][1])
+                for _arr in (verts_world, kpts_world, jc_world):
+                    if _arr[i] is not None:
+                        _arr[i][:, 0] += lx
+                        _arr[i][:, 2] += lz
+
         # Anti-skate : applique le MÊME shift XZ (en mètres) au mesh GLB pour
         # qu'il suive le TRC anti-slidé (sinon le mesh dérape alors que le
         # squelette est ancré).
@@ -2729,6 +2771,16 @@ def build_parser():
                              "(5,52 cm avant IK -> 9,71 cm apres). Ne s'active que sur "
                              "les gestes avec avancee franche (> 0,5 m) et sur des "
                              "appuis de moins d'une seconde. (Opt-in.)")
+    parser.add_argument("--no_world_frame", action="store_true",
+                        help="Revient a l ancienne chaine de redressement du sol. "
+                             "Par defaut on utilise le REPERE MONDE (recette "
+                             "Mesh2Sim) : normale du sol par image, orientation "
+                             "geometrique, agregation robuste avec rejet au-dela "
+                             "de 8 deg, conversion OpenCV->monde par (x,-y,-z) et "
+                             "rotation GLOBALE unique. L ancienne chaine estimait "
+                             "le sol image par image sans les reconcilier (mesure "
+                             "sur un job reel : pitch +56,75 / +75,36 / +30,39 deg "
+                             "sur la meme video).")
     parser.add_argument("--no_lateral_anchor", action="store_true",
                         help="Coupe le recalage lateral la ou il est actif par "
                              "defaut (marche, course, depart sprint, camera fixe).")

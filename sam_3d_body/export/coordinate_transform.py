@@ -218,15 +218,34 @@ class CoordinateTransformer:
                 _src = "foot-traj"
             else:
                 _pitch, _roll, _src = 0.0, 0.0, None
-            # MODE REPERE MONDE, opt-in par MOGE_WORLD_FRAME=1.
+            # MODE REPERE MONDE — DEFAUT depuis le 2026-09-08.
+            # `MOGE_WORLD_FRAME=0` revient a l ancienne chaine.
             #
-            # Porte la recette Mesh2Sim : conversion OpenCV -> monde par
-            # (x, -y, -z), angle appliquE EN ENTIER, et rotation GLOBALE unique
-            # de la scene au lieu d une rotation par image autour du bassin.
-            # Le chemin historique reste le defaut et n est pas touche.
+            # Porte la recette Mesh2Sim : normale du sol par image depuis la
+            # grille MoGe, orientation GEOMETRIQUE de cette normale, agregation
+            # robuste avec rejet au-dela de 8 deg, conversion OpenCV -> monde par
+            # (x, -y, -z) — une ROTATION, pas une negation — angle applique EN
+            # ENTIER, et rotation GLOBALE unique de la scene plutot qu une
+            # rotation par image autour du bassin.
+            #
+            # ⚠️ FILET DE SECURITE, et pourquoi il est indispensable.
+            # Chez Mesh2Sim, l agregation MoGe n est JAMAIS seule : elle doit
+            # s accorder a moins de 8 deg avec GeoCalib, sinon la valeur est
+            # rejetee. Nous n avons pas ce second estimateur. Or leur agregation
+            # prend la MOYENNE des normales avant de rejeter au-dela de 8 deg :
+            # quand les images sont tres dispersees, la moyenne est deja tiree
+            # par les aberrantes et il ne survit presque rien.
+            # Mesure du 2026-09-08 sur `Sprint_start` : 1 image sur 8 gardee,
+            # scene inclinee de 32,20 deg, sol stable derriere a 17,29 deg et
+            # -97,7 cm d offset. Inexploitable.
+            # L ancienne chaine, elle, prend la MEDIANE des angles avec controle
+            # d ecart-type — plus robuste a forte dispersion, et c est pourquoi
+            # elle tient en production.
+            # On garde donc leur agregation telle quelle, et l on retombe sur la
+            # mediane des que le consensus est trop maigre pour etre credible.
             import os as _os_wf
             _world_frame = (_src == "MoGe"
-                            and bool(int(_os_wf.environ.get("MOGE_WORLD_FRAME", "0"))))
+                            and bool(int(_os_wf.environ.get("MOGE_WORLD_FRAME", "1"))))
             if _world_frame:
                 # Les angles recus sont deja multiplies par LEAN_SCALE ; ce mode
                 # veut l angle MESURE, donc on defait ce facteur. Si le clamp a
@@ -241,16 +260,26 @@ class CoordinateTransformer:
                     _up_w = self.cam_up_to_world_m2s(_u)
                     _R = self.rotation_align(_up_w, np.array([0.0, 1.0, 0.0]))
                     _incl = float(np.degrees(np.arccos(np.clip(_up_w[1], -1.0, 1.0))))
-                    print(f"  [world frame] {_ng}/{_nt} images gardees, etendue "
-                          f"{_spread:.2f}° | up monde = [{_up_w[0]:+.3f},"
-                          f"{_up_w[1]:+.3f},{_up_w[2]:+.3f}] | inclinaison "
-                          f"{_incl:.2f}° | rotation GLOBALE")
-                    kpts = (kpts.reshape(-1, 3) @ _R.T).reshape(kpts.shape)
-                    if jc is not None:
-                        jc = (jc.reshape(-1, 3) @ _R.T).reshape(jc.shape)
-                    self._last_world_frame_R = _R
-                    self._last_world_frame_tilt_deg = _incl
-                    self._last_floor_angle_deg = _incl
+                    _min_kept = max(2, int(round(_nt * 0.5)))
+                    _max_incl = float(_os_wf.environ.get("MOGE_WF_MAX_TILT_DEG", "20"))
+                    if _ng < _min_kept or _incl > _max_incl:
+                        print(f"  [world frame] REFUSE : {_ng}/{_nt} images "
+                              f"d accord (il en faut {_min_kept}), inclinaison "
+                              f"{_incl:.2f}° (max {_max_incl:.0f}°). Sans second "
+                              f"estimateur pour arbitrer, on retombe sur la "
+                              f"mediane des angles.")
+                        _world_frame = False
+                    else:
+                        print(f"  [world frame] {_ng}/{_nt} images gardees, "
+                              f"etendue {_spread:.2f}° | up monde = "
+                              f"[{_up_w[0]:+.3f},{_up_w[1]:+.3f},{_up_w[2]:+.3f}]"
+                              f" | inclinaison {_incl:.2f}° | rotation GLOBALE")
+                        kpts = (kpts.reshape(-1, 3) @ _R.T).reshape(kpts.shape)
+                        if jc is not None:
+                            jc = (jc.reshape(-1, 3) @ _R.T).reshape(jc.shape)
+                        self._last_world_frame_R = _R
+                        self._last_world_frame_tilt_deg = _incl
+                        self._last_floor_angle_deg = _incl
                 else:
                     # REPLI : aucune normale collectee (angles fournis a la main,
                     # ou estimation mono-image). On reconstitue depuis les angles
@@ -261,7 +290,10 @@ class CoordinateTransformer:
                     kpts, jc = self._apply_world_frame_leveling(kpts, jc, _p_raw, _r_raw)
                     self._last_floor_angle_deg = _p_raw
                     self._last_roll_angle_deg = _r_raw
-            else:
+            # Chaine historique : le defaut quand le repere monde est coupe, ET
+            # le repli quand il vient de se refuser lui-meme faute de consensus.
+            # Sans ce second cas, un refus laisserait la scene NON redressee.
+            if not _world_frame:
                 if _src is not None and abs(_pitch) > 0.5:
                     print(f"  [floor lean] {_src} pitch {_pitch:+.2f}° → correcting")
                     kpts, jc = self._rotate_around_pelvis_z(kpts, jc, _pitch)
@@ -1281,7 +1313,7 @@ class CoordinateTransformer:
             # deja reduits, dont on ne peut reconstituer ni l orientation
             # geometrique ni le rejet d image.
             import os as _os_wf2
-            if bool(int(_os_wf2.environ.get("MOGE_WORLD_FRAME", "0"))):
+            if bool(int(_os_wf2.environ.get("MOGE_WORLD_FRAME", "1"))):
                 try:
                     _u = CoordinateTransformer.floor_up_from_points_m2s(
                         pts, mask, person_bbox=person_bbox, orig_hw=orig_hw)

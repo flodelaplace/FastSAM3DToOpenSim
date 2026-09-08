@@ -1303,22 +1303,25 @@ def apply_lateral_anchor_post_ik(
     restent ainsi cohérents entre eux. Les deux sont consommés par
     synkro-analytics.
 
-    Returns True si une correction a été appliquée, False si elle ne s'active
-    pas (geste sans avancée franche, pas de marqueurs de semelle, appuis trop
-    longs pour être des pas).
+    Returns les décalages (T, 2) en mètres appliqués, ou None si la correction
+    ne s'active pas (geste sans avancée franche, pas de marqueurs de semelle,
+    appuis trop longs pour être des pas). L'appelant DOIT les appliquer aussi
+    au mesh GLB : le GLB anatomique est piloté par le `.mot`, donc il suit la
+    correction, tandis que le mesh vient des sommets MHR et ne la voit pas —
+    sans quoi les deux divergent exactement du montant du recalage.
     """
     from .coordinate_transform import lateral_root_shift
 
     if not (os.path.isfile(post_ik_trc_path) and os.path.isfile(mot_path)):
-        return False
+        return None
     lines = Path(post_ik_trc_path).read_text().splitlines()
     if len(lines) < 6:
-        return False
+        return None
     meta = lines[2].split("\t")
     unit = 1000.0 if (len(meta) > 4 and meta[4].strip() == "mm") else 1.0
     names = [n.strip() for n in lines[3].split("\t")[2:] if n.strip()]
     if not names:
-        return False
+        return None
     body = [ln for ln in lines[5:] if ln.strip()]
     rows = []
     for ln in body:
@@ -1331,7 +1334,7 @@ def apply_lateral_anchor_post_ik(
 
     _, shifts = lateral_root_shift(xyz, names, fps=fps, settle_s=settle_s)
     if shifts is None or not np.any(np.abs(shifts) > 1e-9):
-        return False
+        return None
 
     # TRC post-IK : on réécrit les colonnes X et Z, en gardant le formatage.
     for t, ln in enumerate(body):
@@ -1351,10 +1354,10 @@ def apply_lateral_anchor_post_ik(
     try:
         end = next(i for i, l in enumerate(mot) if l.strip().lower() == "endheader")
     except StopIteration:
-        return True
+        return shifts
     cols = mot[end + 1].split("\t")
     if "pelvis_tx" not in cols or "pelvis_tz" not in cols:
-        return True
+        return shifts
     ix, iz, it = cols.index("pelvis_tx"), cols.index("pelvis_tz"), 0
     out = mot[: end + 2]
     data = [l for l in mot[end + 2:] if l.strip()]
@@ -1367,4 +1370,4 @@ def apply_lateral_anchor_post_ik(
         p[iz] = f"{float(p[iz]) + dz[t]:.8f}"
         out.append("\t".join(p))
     Path(mot_path).write_text("\n".join(out) + "\n")
-    return True
+    return shifts
