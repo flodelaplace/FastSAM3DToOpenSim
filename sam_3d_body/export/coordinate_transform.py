@@ -2000,3 +2000,139 @@ def anti_foot_skate_markers(
     # shifts retournés en MÈTRES (pour appliquer le même décalage au mesh GLB,
     # qui est en mètres), quelle que soit l'unité de markers_array.
     return result, shifts / _unit
+
+def lateral_root_shift(
+    markers_array: np.ndarray,
+    marker_names: list,
+    fps: float = 30.0,
+    settle_s: float = 0.30,
+    band_m: float = 0.030,
+    min_contact_s: float = 0.06,
+    max_contact_s: float = 1.00,
+    max_corr_m: float = 0.30,
+    min_travel_m: float = 0.50,
+):
+    """Recale LATÉRALEMENT le corps entier, à appliquer APRÈS l'IK.
+
+    Mesuré le 2026-09-08 sur `Sprint_start` et `IMG_6224` : la dérive du pied
+    pendant l'appui ne vit PAS le long de l'axe d'avance mais sur le côté —
+    7,5 cm en latéral contre 4,2 cm en progression. C'est pourquoi l'« axe X
+    seul » de Mesh2Sim ne se transpose pas tel quel : X est LEUR axe d'avance.
+    Corriger la seule progression ne retire quasi rien (9,71 → 7,84 cm) ;
+    corriger le seul latéral retire l'essentiel (→ 4,16 cm).
+
+    On ne touche qu'à la composante latérale, délibérément : la progression est
+    la mesure (vitesse, longueur de foulée) et la réécrire reviendrait à
+    reconstruire la trajectoire depuis les pieds. Le mouvement de côté, lui,
+    n'est mesuré par rien et n'est que du bruit de reconstruction.
+
+    La transformation est une TRANSLATION RIGIDE : elle ne change aucun angle
+    articulaire (vérifié, écart max 7e-14°). C'est ce qui la rend applicable
+    APRÈS l'IK — il n'y a plus de moindres carrés derrière pour la défaire, et
+    elle ne met aucun marqueur en concurrence avec les 40 autres. C'est la
+    différence de fond avec une correction pré-IK, qui elle se fait laver.
+
+    `settle_s` est la courbe de tassement (moyenne glissante centrée). Sans
+    elle, l'épinglage est dur : dérive nulle, mais accélération du bassin de
+    32 → 151 m/s², soit un pas de 5,7 m/s au pic — le corps est téléporté.
+    À 0,30 s la dérive tombe à 4,05 cm POUR UN COÛT NUL (33 contre 32 m/s²).
+
+    Deux garde-fous, tous deux motivés par un échec mesuré (`wk_squat`, sujet
+    qui marche 1 m puis s'accroupit) : l'appui de 1,8 s du squat était pris pour
+    un pas, la correction montait à 40 cm et la dérive EMPIRAIT (10,9 → 11,4 cm).
+      • `max_contact_s` — au-delà d'une seconde, ce n'est pas un pas, c'est une
+        station debout. Le « glissement » qu'on y mesure est l'oscillation
+        posturale réelle du sujet, qu'il ne faut surtout pas annuler.
+      • `max_corr_m` — filet de sécurité contre l'emballement, pas un réglage.
+        Mesuré : c'est la DURÉE qui fait tout le travail (squat marché 11,4 →
+        9,2 cm), l'amplitude seule ne corrige rien et, serrée à 15 cm, elle
+        rejette de VRAIS appuis de sprint (5,86 → 7,65 cm). Laissée large.
+
+    Returns:
+        (markers_corrigés, shifts) — shifts (T, 2) = (dx, dz) en MÈTRES, à
+        appliquer aussi à `pelvis_tx` / `pelvis_tz` du `.mot` pour garder les
+        deux sorties cohérentes.
+    """
+    if markers_array is None or markers_array.ndim != 3 or markers_array.shape[0] < 4:
+        return markers_array, None
+    result = markers_array.copy()
+    T = result.shape[0]
+    unit = 1000.0 if np.nanmax(np.abs(markers_array)) > 50.0 else 1.0
+    name_to_idx = {n: i for i, n in enumerate(marker_names)}
+
+    # Axe de progression = déplacement net du bassin. Sans avancée franche, le
+    # « latéral » n'a pas de définition : on ne corrige rien plutôt que de
+    # corriger dans une direction arbitraire.
+    pel = [name_to_idx[m] for m in ("RASI", "LASI", "RPSI", "LPSI")
+           if m in name_to_idx]
+    if not pel:
+        return result, np.zeros((T, 2))
+    pelvis_xz = np.nanmean(result[:, pel, :][:, :, [0, 2]], axis=1)
+    net = np.nanmean(pelvis_xz[-5:], axis=0) - np.nanmean(pelvis_xz[:5], axis=0)
+    if not np.all(np.isfinite(net)) or np.linalg.norm(net) < min_travel_m * unit:
+        return result, np.zeros((T, 2))
+    fwd = net / np.linalg.norm(net)
+    lat = np.array([-fwd[1], fwd[0]])          # normale à l'axe d'avance, dans XZ
+
+    # Points de contact : la SEMELLE. Les marqueurs cutanés ne descendent jamais
+    # sous ~3 cm du sol ; seuls les points plantaires touchent réellement, et
+    # c'est ce qui rend un seuil de hauteur utilisable.
+    episodes = []
+    for side in ("r", "l"):
+        pts = [i for n, i in name_to_idx.items()
+               if n.startswith("SOLE_") and n.endswith("_" + side)]
+        if not pts:
+            continue
+        y = np.nanmin(result[:, pts, 1], axis=1)
+        if not np.isfinite(y).any():
+            continue
+        on = (y - np.nanmin(y)) <= band_m * unit
+        min_len = max(3, int(round(min_contact_s * fps)))
+        max_len = max(min_len + 1, int(round(max_contact_s * fps)))
+        i = 0
+        while i < T:
+            if on[i]:
+                j = i
+                while j < T and on[j]:
+                    j += 1
+                if min_len <= (j - i) <= max_len:
+                    episodes.append((i, j, pts))
+                i = j
+            else:
+                i += 1
+    if not episodes:
+        return result, np.zeros((T, 2))
+    episodes.sort()
+
+    # Ancre par épisode, en coordonnées DÉJÀ corrigées : le décalage acquis au
+    # pas précédent est conservé, sinon chaque pose rappellerait le corps en
+    # arrière et la marche n'avancerait plus.
+    shifts = np.zeros((T, 2), dtype=np.float64)
+    carry = np.zeros(2)
+    for a, b, pts in episodes:
+        seg = result[a:b][:, pts, :]
+        # Référence = le point plantaire le plus bas de TOUT l'épisode, fixe.
+        # Suivre « le plus bas par image » ferait sauter la référence d'un point
+        # à l'autre à la bascule talon→orteil.
+        low = int(np.nanargmin(np.nanmin(seg[:, :, 1], axis=0)))
+        h = seg[:, low, :][:, [0, 2]]
+        ref = h[0]
+        corr = np.zeros((b - a, 2))
+        for k in range(b - a):
+            if np.all(np.isfinite(h[k])):
+                corr[k] = ((ref - h[k]) @ lat) * lat      # latéral SEULEMENT
+        if float(np.abs(corr).max()) > max_corr_m * unit:
+            continue                                     # pas un glissement
+        shifts[a:b] += carry + corr
+        carry = carry + corr[-1]
+        shifts[b:] += corr[-1]
+
+    # Courbe de tassement : moyenne glissante centrée, zéro-phase.
+    win = max(1, int(round(settle_s * fps)))
+    if win > 1:
+        for j in range(2):
+            shifts[:, j] = uniform_filter1d(shifts[:, j], size=win, mode="nearest")
+
+    result[:, :, 0] += shifts[:, 0][:, None]
+    result[:, :, 2] += shifts[:, 1][:, None]
+    return result, shifts / unit

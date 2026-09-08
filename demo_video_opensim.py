@@ -2186,6 +2186,22 @@ def main(args, estimator=None, visualizer=None):
             output_trc_path=post_ik_trc_path,
         )
 
+        # Recalage lateral APRES l'IK. C'est le seul moment ou il tient : une
+        # correction pre-IK est arbitree par les moindres carres entre les 8
+        # marqueurs de pied et les 40 autres, et se fait defaire. Ici il n'y a
+        # plus d'arbitrage. La transformation etant rigide, elle ne change aucun
+        # angle : on ne reecrit que pelvis_tx/tz et les positions du TRC post-IK.
+        if getattr(args, "lateral_anchor", False):
+            from sam_3d_body.export.opensim_ik_runner import (
+                apply_lateral_anchor_post_ik)
+            _lat_ok = apply_lateral_anchor_post_ik(
+                post_ik_trc_path, ik_mot_path, fps=out_fps,
+                settle_s=getattr(args, "lateral_settle", 0.30))
+            print("  [recalage lateral] applique au TRC post-IK et au .mot"
+                  if _lat_ok else
+                  "  [recalage lateral] inactif (pas d'avancee franche, pas de "
+                  "marqueurs de semelle, ou appuis trop longs pour etre des pas)")
+
     # Per-marker IK error analysis — computes mean/max distance in mm between
     # each TRC marker trajectory and the model's marker FK positions. Useful
     # to spot bony landmarks that fit poorly (bad vertex pick or bad .osim
@@ -2664,6 +2680,27 @@ def build_parser():
                              "celui-ci suppose un sol constant sur l'essai — mesure sur "
                              "une course filmee a la main : la hauteur du pied a la pose "
                              "derive de 20 cm sur 6 s, contre 4,4 cm camera fixe.")
+    parser.add_argument("--lateral_anchor", action="store_true",
+                        help="Recale LATERALEMENT le corps entier APRES l'IK, pour "
+                             "supprimer le glissement de cote du pied en appui. "
+                             "Mesure le 2026-09-08 : la derive ne vit PAS dans l'axe "
+                             "d'avance mais sur le cote (7,5 cm contre 4,2 cm), ce qui "
+                             "est pourquoi l'axe X seul de Mesh2Sim ne se transpose "
+                             "pas tel quel — X est LEUR axe d'avance. La correction "
+                             "est une translation rigide : elle ne touche AUCUN angle "
+                             "articulaire (ecart max 6e-14 deg), seulement pelvis_tx/tz "
+                             "et le TRC post-IK. C'est ce qui la rend applicable apres "
+                             "l'IK, la ou une correction pre-IK se fait laver "
+                             "(5,52 cm avant IK -> 9,71 cm apres). Ne s'active que sur "
+                             "les gestes avec avancee franche (> 0,5 m) et sur des "
+                             "appuis de moins d'une seconde. (Opt-in.)")
+    parser.add_argument("--lateral_settle", type=float, default=0.30,
+                        help="Courbe de tassement du recalage lateral, en secondes. "
+                             "Sans elle l'epinglage est dur : derive minimale mais "
+                             "acceleration du bassin de 32 a 136 m/s2, le corps est "
+                             "teleporte. Mesure sur depart sprint : 0,10 s -> 4,65 cm "
+                             "a 48 m/s2 ; 0,30 s -> 5,86 cm au COUT NUL (32 m/s2, soit "
+                             "la valeur sans correction). Defaut 0,30.")
     parser.add_argument("--no_stable_floor", action="store_true",
                         help="Desactive le sol stable meme la ou il est actif par "
                              "defaut (course et depart sprint, camera fixe).")

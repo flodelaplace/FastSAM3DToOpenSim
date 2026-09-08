@@ -18,6 +18,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
+
 # ── Rajagopal mocap markerset (--markerset flodelaplace) ────────────────────────
 # Weighting philosophy:
 #   2.0  bony landmarks (vertex picks + acromion + foot) — most reproducible
@@ -1279,3 +1281,90 @@ def _get_trc_time_range(trc_path: str) -> tuple[float, float]:
     if not times:
         return 0.0, 0.0
     return times[0], times[-1]
+
+def apply_lateral_anchor_post_ik(
+    post_ik_trc_path: str,
+    mot_path: str,
+    fps: float = 30.0,
+    settle_s: float = 0.30,
+) -> bool:
+    """Recale latéralement le corps entier APRÈS l'IK — TRC post-IK ET `.mot`.
+
+    C'est le seul endroit où cette correction a un sens. Appliquée AVANT l'IK
+    elle se fait laver : mesuré le 2026-09-08 sur `Sprint_start`, la dérive du
+    pied pendant l'appui passe de 5,52 cm avant IK à 9,71 cm après — les
+    moindres carrés arbitrent entre les 8 marqueurs de pied contraints et les
+    40 autres, et ramènent le pied là où la jambe peut aller. Après l'IK, il n'y
+    a plus d'arbitrage possible.
+
+    La correction est une translation rigide : aucun angle articulaire n'est
+    touché (écart max mesuré 6e-14°). On ne réécrit donc que la translation de
+    la racine — `pelvis_tx` / `pelvis_tz` — et les positions du TRC post-IK, qui
+    restent ainsi cohérents entre eux. Les deux sont consommés par
+    synkro-analytics.
+
+    Returns True si une correction a été appliquée, False si elle ne s'active
+    pas (geste sans avancée franche, pas de marqueurs de semelle, appuis trop
+    longs pour être des pas).
+    """
+    from .coordinate_transform import lateral_root_shift
+
+    if not (os.path.isfile(post_ik_trc_path) and os.path.isfile(mot_path)):
+        return False
+    lines = Path(post_ik_trc_path).read_text().splitlines()
+    if len(lines) < 6:
+        return False
+    meta = lines[2].split("\t")
+    unit = 1000.0 if (len(meta) > 4 and meta[4].strip() == "mm") else 1.0
+    names = [n.strip() for n in lines[3].split("\t")[2:] if n.strip()]
+    if not names:
+        return False
+    body = [ln for ln in lines[5:] if ln.strip()]
+    rows = []
+    for ln in body:
+        parts = ln.split("\t")
+        rows.append([float(x) if x.strip() else np.nan for x in parts])
+    n_col = 2 + len(names) * 3
+    arr = np.array([r[:n_col] + [np.nan] * (n_col - len(r)) for r in rows])
+    trc_t = arr[:, 1].copy()
+    xyz = arr[:, 2:n_col].reshape(len(arr), len(names), 3) / unit
+
+    _, shifts = lateral_root_shift(xyz, names, fps=fps, settle_s=settle_s)
+    if shifts is None or not np.any(np.abs(shifts) > 1e-9):
+        return False
+
+    # TRC post-IK : on réécrit les colonnes X et Z, en gardant le formatage.
+    for t, ln in enumerate(body):
+        parts = ln.split("\t")
+        for k in range(len(names)):
+            cx, cz = 2 + k * 3, 4 + k * 3
+            for c, d in ((cx, shifts[t, 0]), (cz, shifts[t, 1])):
+                if c < len(parts) and parts[c].strip():
+                    parts[c] = f"{float(parts[c]) + d * unit:.6f}"
+        body[t] = "\t".join(parts)
+    Path(post_ik_trc_path).write_text("\n".join(lines[:5] + body) + "\n")
+
+    # `.mot` : même translation sur la racine, rien d'autre. L'IK peut avoir
+    # sauté des images non résolues, donc on rééchantillonne sur le TEMPS et
+    # pas sur l'index — sinon la correction glisserait d'une image à l'autre.
+    mot = Path(mot_path).read_text().splitlines()
+    try:
+        end = next(i for i, l in enumerate(mot) if l.strip().lower() == "endheader")
+    except StopIteration:
+        return True
+    cols = mot[end + 1].split("\t")
+    if "pelvis_tx" not in cols or "pelvis_tz" not in cols:
+        return True
+    ix, iz, it = cols.index("pelvis_tx"), cols.index("pelvis_tz"), 0
+    out = mot[: end + 2]
+    data = [l for l in mot[end + 2:] if l.strip()]
+    mot_t = np.array([float(l.split("\t")[it]) for l in data])
+    dx = np.interp(mot_t, trc_t, shifts[:, 0])
+    dz = np.interp(mot_t, trc_t, shifts[:, 1])
+    for t, l in enumerate(data):
+        p = l.split("\t")
+        p[ix] = f"{float(p[ix]) + dx[t]:.8f}"
+        p[iz] = f"{float(p[iz]) + dz[t]:.8f}"
+        out.append("\t".join(p))
+    Path(mot_path).write_text("\n".join(out) + "\n")
+    return True
