@@ -167,6 +167,27 @@ class CoordinateTransformer:
                 jc[:, :, 0] += xz_deltas[:, 0:1]
                 jc[:, :, 2] += xz_deltas[:, 2:3]
             self._last_xz_deltas_m = xz_deltas.copy()  # (N, 3) in meters
+            # VERTICALE DE LA TRANSLATION CAMERA — manquait depuis l'origine.
+            # `pred_keypoints_3d` est RELATIF A LA RACINE (sam3d_body.py :
+            # `j3d_cam = j3d + pred_cam_t` ne sert qu'a la projection 2D), et
+            # `_apply_global_translation` n'applique que X et Z. Le bassin
+            # restait donc a hauteur constante : sur un squat ce sont les PIEDS
+            # qui montaient de 20 cm au fond (`outputs/SQUAT_VIT`, 2026-09-09,
+            # « ses jambes remontent pendant le squat »). Le sprint, la marche et
+            # la course n'en souffraient pas visiblement : leur bassin ne varie
+            # que de 5 a 8 cm. Squat, saut, lever de chaise et hop vivaient en
+            # mode stationnaire, ou cette injection existait deja (ci-dessous) ;
+            # c'est en sortant le squat du stationnaire qu'elle a manque.
+            # Meme injection, meme rejeu cote mesh (`apply_pipeline_to_verts`).
+            if not lock_vertical:
+                _ct = camera_translation
+                if _ct.ndim == 1:
+                    _ct = np.tile(_ct, (kpts.shape[0], 1))
+                ct_os = (_ct @ self.CAMERA_TO_OPENSIM.T * scale).astype(np.float64)
+                kpts[:, :, 1] += ct_os[:, 1:2]
+                if jc is not None:
+                    jc[:, :, 1] += ct_os[:, 1:2]
+                self._last_stationary_cam_t_y_m = ct_os[:, 1].copy()
         elif center_pelvis:
             shift = self._pelvis_shifts(kpts)      # (N, 3) with Y=0
             kpts = kpts - shift[:, None, :]
@@ -683,6 +704,10 @@ class CoordinateTransformer:
                 d = self._last_xz_deltas_m[i]
                 w[:, 0] += d[0]
                 w[:, 2] += d[2]
+                # Verticale de la translation camera, rejouee comme transform().
+                if (self._last_stationary_cam_t_y_m is not None
+                        and i < len(self._last_stationary_cam_t_y_m)):
+                    w[:, 1] += self._last_stationary_cam_t_y_m[i]
             elif self._last_pelvis_shifts_m is not None and i < len(self._last_pelvis_shifts_m):
                 shift = self._last_pelvis_shifts_m[i]
                 w -= shift[None, :]
@@ -2182,6 +2207,12 @@ def anti_foot_skate_markers(
     vel_gate_window_s: float = 0.30,
     vel_gate_std_m: float = 0.02,
     recede_tol_ms: float = 0.05,
+    planted_min_s: float = 0.35,
+    en_place: bool = False,
+    anchor_hold_s: float = 0.0,
+    shift_lowpass_hz: float = 2.0,
+    max_shift_m: float = 0.0,
+    planted_speed_ms: float = 5.0,
     walk_min_travel_m: float = 0.40,
     stance_band_fraction: float = 0.35,
 ):
@@ -2203,6 +2234,38 @@ def anti_foot_skate_markers(
     """
     if markers_array is None or markers_array.ndim != 3 or markers_array.shape[0] < 2:
         return markers_array, None
+    # DEUX JEUX DE SEUILS. Demande de Florian, 2026-09-09 : « fais un
+    # anti-glissement avec des seuils differents de celui qui sert pour la
+    # locomotion ». Un geste EN PLACE (squat, lever de chaise, saut vertical)
+    # et une foulee ne se ressemblent en rien :
+    #   * en place, le pied reste pose des secondes et ne doit PAS bouger ; une
+    #     perte de contact d'un dixieme de seconde est un rate de detection,
+    #     pas un envol, et jeter l'ancre pour cela revient a baptiser
+    #     legitime le glissement deja accumule ;
+    #   * en locomotion, un vol de 0,15 s est reel et l'ancre DOIT expirer,
+    #     sinon le sujet ne progresse plus.
+    # Mesure sur `outputs/SQUAT_XZ` (2026-09-09) : le pied droit reposait son
+    # ancre cinq fois, la consigne oscillait entre -8,8 et +5 cm au lieu de
+    # suivre une derive de 20 cm, et 3 cm seulement etaient corriges. Un
+    # ancrage rigide sur la position initiale des deux pieds ramene, lui,
+    # l'excursion de 21/19 a 4/3 cm : la correction est disponible, c'est
+    # l'expiration des ancres qui l'empechait.
+    if en_place:
+        min_contact_s = max(min_contact_s, 0.25)
+        max_gap_s = max(max_gap_s, 0.40)
+        anchor_hold_s = max(anchor_hold_s, 0.60)
+        shift_lowpass_hz = max(shift_lowpass_hz, 8.0)
+        # BORNE SUR LA CORRECTION CUMULEE. Un geste en place ne demande que
+        # quelques centimetres : mesure sur `outputs/SQUAT_PLACE`, 12 cm
+        # suffisent pendant les squats. Au-dela, ce n'est plus du glissement.
+        # Florian, 2026-09-09 : « le mec marche un pas apres, et au moment ou le
+        # pied de devant se fixe tout le corps recule sur le pied arriere ».
+        # C'est ce qui arrive quand un second pied se plante : il ajoute une
+        # contrainte, la moyenne des deux consignes tire le corps en arriere, et
+        # rien ne bornait l'ampleur (74 cm sur l'essai complet). La borne laisse
+        # le geste intact et empeche la derive de fin.
+        if max_shift_m <= 0:
+            max_shift_m = 0.25
     result = markers_array.copy()
     T = result.shape[0]
     # Auto-détection unité (mm vs m) : les marqueurs Flodelaplace peuvent être
@@ -2260,10 +2323,19 @@ def anti_foot_skate_markers(
                     axis = -axis
                 walk_axis = axis
 
+    # Centroide XZ de chaque pied, calcule AVANT la detection : le critere de
+    # recul ci-dessous prend l'autre pied pour reference et a donc besoin des
+    # deux d'emblee.
+    centro = {}
+    for side, idx in side_markers.items():
+        if idx:
+            centro[side] = np.nanmean(result[:, idx, :][:, :, [0, 2]], axis=1)
+
     # Contact + position XZ par côté.
     foot_xz = {}
     foot_y = {}
     contact = {}
+    planted = {}
     for side, idx in side_markers.items():
         if not idx:
             continue
@@ -2325,8 +2397,31 @@ def anti_foot_skate_markers(
         # commun s'annule par différence. Un pied en appui RECULE par rapport au
         # bassin pendant que le corps avance ; un pied en vol AVANCE. C'est ce
         # qui discrimine appui et oscillation, pas la hauteur.
-        if walk_axis is not None and pelvis_xz is not None:
-            rel = (np.nanmean(sub[:, :, [0, 2]], axis=1) - pelvis_xz) @ walk_axis
+        # ... mais mesure PAR RAPPORT A L'AUTRE PIED, pas au bassin.
+        #
+        # Le critere separe l'appui du vol, et sa force est de s'affranchir du
+        # bruit commun par difference. Encore faut-il que la reference soit
+        # immobile quand le pied l'est. Le BASSIN ne l'est pas : en squat il
+        # descend et recule, si bien que les pieds « avancent » par rapport a
+        # lui alors qu'ils sont plantes. Mesure sur `outputs/SQUAT_VY`
+        # (2026-09-09) : la hauteur voyait le pied au sol sur 97 a 100 % des
+        # images, ce critere ramenait a 70 % et DECOUPAIT l'appui en quatre a
+        # cinq phases. Or chaque nouvelle phase repose une ancre a la position
+        # COURANTE du pied — la ou il a deja glisse : le glissement etait
+        # valide cinq fois de suite, jusqu'a 28 cm de derive sur une phase.
+        # Florian : « comprends l'anti-glissement du depart sprint, pourquoi il
+        # ne bloque pas bien les pieds sur squat en XZ ».
+        #
+        # L'AUTRE PIED est la bonne reference. En locomotion les pieds
+        # alternent : le pied qui oscille avance franchement par rapport a
+        # celui qui est pose, et le glissement global, commun aux deux,
+        # s'annule par difference. En squat les deux pieds sont plantes, leur
+        # ecart ne bouge pas, et le critere se tait — ce qu'on veut. Il reste
+        # donc actif la ou il sert (marche, course, sprint) sans mutiler les
+        # gestes en place, et la marche qui SUIT les squats est preservee.
+        _autre = next((o for o in centro if o != side), None)
+        if walk_axis is not None and _autre is not None:
+            rel = (centro[side] - centro[_autre]) @ walk_axis
             fwd = np.zeros(T)
             fwd[1:] = np.diff(rel) * fps
             c &= fwd <= (recede_tol_ms * _unit)
@@ -2377,6 +2472,23 @@ def anti_foot_skate_markers(
         foot_xz[side] = np.nanmean(sub[:, :, [0, 2]], axis=1)
         foot_y[side] = foot[:, 1]
         contact[side] = keep
+        # DUREE de la phase d'appui en cours, image par image. Elle sert de
+        # discriminant physique pour le plafond de correction (plus bas) : une
+        # foulee de course dure 0,1 a 0,25 s, un pied de squat ou de lever de
+        # chaise reste pose plusieurs secondes. Le premier merite la prudence,
+        # le second EST la reference.
+        _d = np.zeros(T)
+        _i = 0
+        while _i < T:
+            if keep[_i]:
+                _j = _i
+                while _j < T and keep[_j]:
+                    _j += 1
+                _d[_i:_j] = (_j - _i) / max(fps, 1e-6)
+                _i = _j
+            else:
+                _i += 1
+        planted[side] = _d >= planted_min_s
 
     if not contact:
         return result, np.zeros((T, 2))
@@ -2404,14 +2516,21 @@ def anti_foot_skate_markers(
     # donc à retirer la gigue.
     max_step = max_contact_speed_ms * _unit / max(fps, 1e-6)
     anchors: dict[str, np.ndarray | None] = {s: None for s in contact}
+    # Nombre d'images consecutives hors contact, par pied : l'ancre ne meurt
+    # qu'apres `anchor_hold_s` (0 en locomotion, ou tout vol est reel).
+    off: dict[str, int] = {s: 0 for s in contact}
+    hold = int(round(anchor_hold_s * fps))
 
     for t in range(T):
         needed = []
         for side in contact:
             xz = foot_xz[side][t]
             if not (contact[side][t] and np.all(np.isfinite(xz))):
-                anchors[side] = None      # pied en vol → l'ancre expire
+                off[side] += 1
+                if off[side] > hold:
+                    anchors[side] = None  # pied en vol → l'ancre expire
                 continue
+            off[side] = 0
             if anchors[side] is None:     # pose : ancre = position corrigée
                 anchors[side] = xz + shifts[t - 1] if t > 0 else xz.copy()
             needed.append(anchors[side] - xz)
@@ -2427,21 +2546,61 @@ def anti_foot_skate_markers(
         # Un pied en appui ne glisse pas vite : au-delà, c'est de la gigue
         # d'inférence, et la compenser d'un coup projetterait le corps de côté.
         n = float(np.linalg.norm(step))
-        if n > max_step:
-            step *= max_step / n
+        # PLAFOND SELON LA DUREE DE L'APPUI, pas selon la vitesse du bassin.
+        #
+        # Le plafond de 0,30 m/s protege d'une correction ample qui
+        # reconstruirait la trajectoire depuis les pieds et entrerait en
+        # conflit avec `cam_t`. Mais sur un geste en place il EMPECHE de
+        # planter le pied : mesure sur `outputs/SQUAT_VY` (2026-09-09), le
+        # corps entier derive a 0,58 m/s pendant l'appui — dont 0,16 seulement
+        # relatif au bassin, donc les trois quarts sont un mouvement commun,
+        # precisement ce qu'un decalage global sait retirer — et la correction,
+        # bridee a 0,30, ne rattrape jamais : 30, 47 puis 64 cm de derive nette
+        # par phase d'appui. Florian : « faut bloquer des qu'y'a le contact au
+        # sol, eviter que ca glisse ».
+        #
+        # Le discriminant n'est pas la vitesse du bassin — elle est contaminee
+        # par le glissement lui-meme, le raisonnement tournerait en rond — mais
+        # la DUREE de l'appui : une foulee de course dure 0,1 a 0,25 s, un pied
+        # de squat, de lever de chaise ou de station debout reste pose des
+        # secondes. Au-dela de `planted_min_s` le pied EST la reference et la
+        # correction peut converger ; en deca, prudence historique. Course et
+        # depart de sprint, dont les appuis sont brefs, ne changent pas d'un
+        # millimetre.
+        _plante = any(planted[side][t] and contact[side][t] for side in contact)
+        _cap = planted_speed_ms * _unit / max(fps, 1e-6) if _plante else max_step
+        if n > _cap:
+            step *= _cap / n
         shifts[t] = (shifts[t - 1] if t > 0 else 0.0) + step
 
     # Lissage zéro-phase de la correction cumulée : les transitions d'appui
     # laissent des angles vifs dans la trajectoire du bassin. 2 Hz laisse passer
     # la cadence de marche (~1 Hz) tout en supprimant les ruptures.
-    if T > 18 and fps > 6:
+    #
+    # ⚠️ 2 Hz EST TROP BAS POUR UN GESTE EN PLACE, et c'etait la vraie cause du
+    # glissement residuel du squat. Mesure sur `outputs/SQUAT_XZ` (2026-09-09) :
+    # a t=1,6 s tout le corps se translate de 18 cm et revient en 0,24 s, soit
+    # environ 4 Hz — la correlation entre la vitesse du pied et celle du bassin
+    # vaut 0,97, et 0,95 avec C7, donc c'est bien un saut de la SCENE entiere,
+    # exactement ce que le decalage global doit annuler. La consigne le
+    # demandait correctement (12,5 cm) ; le filtre n'en laissait passer que 2,9.
+    # En place il n'y a aucune cadence de marche a preserver : on monte a 8 Hz,
+    # ce qui suit ces sauts tout en retirant le bruit image a image. La
+    # locomotion garde 2 Hz, ou les transitions d'appui sont reelles.
+    if T > 18 and fps > 6 and shift_lowpass_hz > 0:
         try:
             from scipy.signal import butter, sosfiltfilt
-            wn = min(2.0 / (fps / 2.0), 0.99)
+            wn = min(shift_lowpass_hz / (fps / 2.0), 0.99)
             shifts = sosfiltfilt(butter(2, wn, btype="low", output="sos"),
                                  shifts, axis=0)
         except Exception:
             pass  # scipy absent ou signal trop court : on garde le brut
+
+    if max_shift_m > 0:
+        _n = np.linalg.norm(shifts, axis=1)
+        _tf = np.where(_n > max_shift_m * _unit,
+                       (max_shift_m * _unit) / np.maximum(_n, 1e-9), 1.0)
+        shifts = shifts * _tf[:, None]
 
     result[:, :, 0] += shifts[:, 0][:, None]
     result[:, :, 2] += shifts[:, 1][:, None]
@@ -2580,6 +2739,12 @@ def lateral_root_shift(
     if win > 1:
         for j in range(2):
             shifts[:, j] = uniform_filter1d(shifts[:, j], size=win, mode="nearest")
+
+    if max_shift_m > 0:
+        _n = np.linalg.norm(shifts, axis=1)
+        _tf = np.where(_n > max_shift_m * _unit,
+                       (max_shift_m * _unit) / np.maximum(_n, 1e-9), 1.0)
+        shifts = shifts * _tf[:, None]
 
     result[:, :, 0] += shifts[:, 0][:, None]
     result[:, :, 2] += shifts[:, 1][:, None]

@@ -350,6 +350,54 @@ def _robust_line(t: np.ndarray, y: np.ndarray, n_iter: int = 2):
     return a, b, keep
 
 
+def _plantar_speed(plantar: np.ndarray, fps: float, lowpass_hz: float = 6.0) -> np.ndarray:
+    """Vitesse 3D (m/s) de chaque point plantaire, sur trajectoire lissee.
+
+    Image a image un point pose gigote de ~1 cm, soit 0,3 m/s a 30 im/s : sans
+    lissage prealable la porte de vitesse ne tient rien. Les trous sont
+    interpoles avant filtrage et rendus NaN apres.
+    """
+    T, P = plantar.shape[0], plantar.shape[1]
+    out = np.full((T, P), np.nan)
+    if T < 3:
+        return out
+    idx = np.arange(T, dtype=np.float64)
+    for k in range(P):
+        pos = plantar[:, k, :].astype(np.float64)
+        ok = np.all(np.isfinite(pos), axis=1)
+        if ok.sum() < 3:
+            continue
+        filled = np.column_stack([np.interp(idx, idx[ok], pos[ok, j]) for j in range(3)])
+        if lowpass_hz > 0 and T > 20 and lowpass_hz < 0.5 * fps:
+            try:
+                from scipy.signal import butter, sosfiltfilt
+                sos = butter(2, lowpass_hz / (0.5 * fps), btype="low", output="sos")
+                filled = sosfiltfilt(sos, filled, axis=0)
+            except ImportError:                            # pragma: no cover
+                pass
+        v = np.linalg.norm(np.gradient(filled, axis=0), axis=1) * fps
+        v[~ok] = np.nan
+        out[:, k] = v
+    return out
+
+
+def _mask_to_runs(on: np.ndarray, min_run: int) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    T = len(on)
+    i = 0
+    while i < T:
+        if on[i]:
+            j = i
+            while j < T and on[j]:
+                j += 1
+            if j - i >= min_run:
+                runs.append((i, j))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
 def _stance_gated_shift(
     plantar: np.ndarray,
     split: int,
@@ -358,6 +406,9 @@ def _stance_gated_shift(
     thresh_m: float = 0.020,
     min_run_s: float = 0.06,
     lowpass_hz: float = 4.0,
+    vel_ms: float = 0.30,
+    vel_band_m: float = 0.30,
+    vel_min_run_s: float = 0.12,
 ):
     """Correction verticale CONDITIONNEE A L'APPUI, interpolee pendant le vol.
 
@@ -379,32 +430,61 @@ def _stance_gated_shift(
       * le resultat est lisse a ``lowpass_hz`` avant d'etre soustrait, pour ne pas
         transferer le bruit image a image de la detection dans le squelette.
 
+    DEUX CRITERES DE CONTACT, en OU :
+      * par la HAUTEUR (``thresh_m``) : le point est a moins de 2 cm de son propre
+        plancher. C'est la regle de Mesh2Sim ;
+      * par l'IMMOBILITE (``vel_ms``, ``vel_band_m``) : le point est quasi
+        immobile (vitesse 3D lissee < 0,30 m/s, le seuil de l'anti-glissement)
+        ET a moins de 30 cm de son plancher. Sans ce second critere la regle est
+        CIRCULAIRE : il faut deja etre au sol pour etre vu au sol. Mesure sur
+        `outputs/SQUAT_SOL` (2026-09-09) : le sujet remonte de 4 a 6 cm chaque
+        fois qu'il se releve, la regle par hauteur ne retenait que les fonds de
+        squat (appui 37 %) et INTERPOLAIT les phases debout — qui restaient
+        donc a +5 cm. Un pied immobile est un pied pose ; le vol, lui, bouge.
+        La bande est LARGE (30 cm) a dessein : mesure sur `outputs/SQUAT_VIT`
+        (translation complete, camera piquee de 12°), l'erreur de profondeur de
+        l'estimateur fuit dans la verticale et souleve le corps de 20 cm au fond
+        du squat — pieds immobiles, mais hors d'une bande de 8 cm, donc « en
+        vol », interpoles, et la profondeur du squat etait mangee (bassin 79 cm
+        au lieu de 59). Un pied tenu en l'air (hop unipodal) ne fait pas de
+        degat : c'est le point LE PLUS BAS en contact qui fixe le niveau, et le
+        pied d'appui gagne toujours ce minimum. La duree minimale de 0,12 s
+        exclut le passage par vitesse nulle a l'apex d'un saut (a 0,30 m/s de
+        seuil, la vitesse verticale reste sous le seuil 0,06 s autour de l'apex).
+
     Ce que ce mode NE FAIT PAS : aplatir l'oscillation verticale du centre de
     masse. Pendant l'appui c'est le PIED qui est tenu au sol ; le bassin reste
     libre de monter et descendre au-dessus. Pendant le vol rien n'est tenu.
 
     Returns:
-        (shift (T,), couverture d'appui) ou (None, couverture) si aucun appui.
+        (shift (T,), couverture d'appui, masque (T,) des images en contact)
+        ou (None, couverture, masque) si aucun appui.
     """
     T, P = plantar.shape[0], plantar.shape[1]
     groups = [(0, split), (split, P)] if 0 < split < P else [(0, P)]
     level = np.full(T, np.nan)
     covered = np.zeros(T, dtype=bool)
+    speed = _plantar_speed(plantar, fps) if vel_ms > 0 else None
     for a, b in groups:
         for k in range(a, b):
             y = plantar[:, k, 1]
             if not np.isfinite(y).any():
                 continue
             fl = float(np.nanpercentile(y, 1.0))
-            for r0, r1 in detect_contact_by_height(
-                    y, fl, thresh_m=thresh_m, min_run_s=min_run_s, fps=fps):
+            runs = detect_contact_by_height(
+                y, fl, thresh_m=thresh_m, min_run_s=min_run_s, fps=fps)
+            if speed is not None:
+                still = (np.isfinite(y) & (y - fl <= vel_band_m)
+                         & np.isfinite(speed[:, k]) & (speed[:, k] <= vel_ms))
+                runs += _mask_to_runs(still, max(2, int(round(vel_min_run_s * fps))))
+            for r0, r1 in runs:
                 seg = y[r0:r1]
                 cur = level[r0:r1]
                 level[r0:r1] = np.where(np.isnan(cur), seg, np.minimum(cur, seg))
                 covered[r0:r1] = True
     cov = float(covered.mean())
     if not covered.any():
-        return None, cov
+        return None, cov, covered
     idx = np.arange(T, dtype=np.float64)
     good = np.isfinite(level)
     shift = np.interp(idx, idx[good], level[good])
@@ -415,7 +495,7 @@ def _stance_gated_shift(
             shift = sosfiltfilt(sos, shift)
         except ImportError:                                # pragma: no cover
             pass
-    return np.asarray(shift, dtype=np.float64), cov
+    return np.asarray(shift, dtype=np.float64), cov, covered
 
 
 def stable_floor_transform(
@@ -432,7 +512,9 @@ def stable_floor_transform(
     stance_thresh_m: float = 0.020,
     stance_min_run_s: float = 0.06,
     stance_lowpass_hz: float = 4.0,
-    stance_passes: int = 3,
+    stance_vel_ms: float = 0.30,
+    stance_vel_band_m: float = 0.30,
+    stance_passes: int = 12,
     stance_max_shift_m: float = 0.30,
     stance_min_gain: float = 0.25,
     stance_min_coverage: float = 0.10,
@@ -552,24 +634,56 @@ def stable_floor_transform(
         # couverture d'appui passe de 8 % a la premiere passe a ~25 % a la
         # troisieme, et l'etendue du sol de 7,3 a 4,4 cm. La suite converge : les
         # passes suivantes ne bougent plus la correction de plus de 1 mm.
+        # Le nombre de passes n'est pas un reglage de precision, c'est une
+        # CONVERGENCE : chaque passe ne ramene que les images a moins de 2 cm de
+        # la precedente. Mesure sur `outputs/SQUAT_SOL` (2026-09-09) : 70 %, 91 %,
+        # 100 % d'appui en trois passes hors ligne — mais le pipeline, parti de
+        # plus haut, s'etait arrete a 37 % apres SES trois passes, et les phases
+        # debout restaient a +5 cm. On itere donc jusqu'a ce que la correction
+        # ne bouge plus (< 1 mm), avec un plafond de securite.
         total = np.zeros(T, dtype=np.float64)
+        _cov_trace: list[float] = []
+        _cov_union = np.zeros(T, dtype=bool)
         probe = work.copy()
         _f0 = [np.nanmin(work[:, :split, 1], axis=1)]
         if split < work.shape[1]:
             _f0.append(np.nanmin(work[:, split:, 1], axis=1))
         _t0v, y0 = _pose_floor_levels(_f0, fps)
         for _ in range(max(1, stance_passes)):
-            shift, cov = _stance_gated_shift(
+            shift, cov, _covm = _stance_gated_shift(
                 probe, split, fps, thresh_m=stance_thresh_m,
-                min_run_s=stance_min_run_s, lowpass_hz=stance_lowpass_hz)
+                min_run_s=stance_min_run_s, lowpass_hz=stance_lowpass_hz,
+                vel_ms=stance_vel_ms, vel_band_m=stance_vel_band_m)
             sf.stance_coverage = cov
+            _cov_trace.append(cov)
             if shift is None:
                 break
             total += shift
+            _cov_union |= _covm
             probe = probe.copy()
             probe[:, :, 1] -= shift[:, None]
             if float(np.max(np.abs(shift))) < 0.001:
                 break
+        # UNE SEULE INTERPOLATION DU VOL. Les passes ne servent qu'a faire
+        # croitre le masque de contact ; chacune interpole SA correction sur les
+        # images de vol, et ces interpolations s'empilent. Mesure sur
+        # `outputs/REG_jump` (2026-09-09) : passe 1 saine (6,4 -> 3,5 cm a
+        # travers le vol), cumul a +10 cm en plein vol, hauteur de saut passee
+        # de 50,9 a 41,7 cm. On garde donc la correction convergee AUX IMAGES DE
+        # CONTACT, et on ne l'interpole qu'une fois entre elles.
+        if _cov_union.any() and not _cov_union.all():
+            idx = np.arange(T, dtype=np.float64)
+            total = np.interp(idx, idx[_cov_union], total[_cov_union])
+            if stance_lowpass_hz > 0 and T > 20 and stance_lowpass_hz < 0.5 * fps:
+                try:
+                    from scipy.signal import butter, sosfiltfilt
+                    sos = butter(2, stance_lowpass_hz / (0.5 * fps), btype="low",
+                                 output="sos")
+                    total = sosfiltfilt(sos, total)
+                except ImportError:                        # pragma: no cover
+                    pass
+            probe = work.copy()
+            probe[:, :, 1] -= total[:, None]
         # GARDE-FOUS. Le mode "stance" postule que la semelle touche VRAIMENT le
         # sol. Sur un geste ou c'est faux il produit une correction absurde et
         # DEGRADE tout : mesure sur `outputs/SMOKE_birddog` (quadrupedie, pieds
@@ -592,6 +706,34 @@ def stable_floor_transform(
         std1 = float(np.std(y2)) if len(y2) > 1 else float("nan")
         gain = (1.0 - std1 / std0) if (std0 and np.isfinite(std0)
                                        and np.isfinite(std1)) else float("nan")
+        _critere = "poses"
+        if not np.isfinite(gain):
+            # MOINS DE DEUX POSES : un saut vertical n'en a que deux (flexion,
+            # reception) et il en reste parfois une seule apres correction — le
+            # critere de Mesh2Sim ne peut pas s'evaluer. Mesure sur
+            # `outputs/REG_jump` (2026-09-09) : « dispersion des poses 0,23 ->
+            # nan, gain 0 % », mode refuse, et la flexion restait a +8,5 cm du
+            # sol. On juge alors sur la dispersion de la hauteur de semelle
+            # PENDANT LES CONTACTS detectes : c'est exactement ce que la
+            # correction pretend stabiliser.
+            _covm = np.zeros(T, dtype=bool)
+            _P = work.shape[1]
+            for a, b in ([(0, split), (split, _P)] if 0 < split < _P else [(0, _P)]):
+                for k in range(a, b):
+                    yk = work[:, k, 1]
+                    if not np.isfinite(yk).any():
+                        continue
+                    flk = float(np.nanpercentile(yk, 1.0))
+                    for r0, r1 in detect_contact_by_height(
+                            yk, flk, thresh_m=stance_vel_band_m,
+                            min_run_s=stance_min_run_s, fps=fps):
+                        _covm[r0:r1] = True
+            if _covm.sum() > 3:
+                _h0 = np.nanmin(work[_covm][:, :, 1], axis=1)
+                _h1 = np.nanmin(probe[_covm][:, :, 1], axis=1)
+                std0 = float(np.nanstd(_h0)); std1 = float(np.nanstd(_h1))
+                gain = (1.0 - std1 / std0) if std0 > 0 else float("nan")
+                _critere = "hauteur en contact"
         if not np.any(total):
             sf.notes += "mode stance : aucun appui detecte, non applique ; "
         elif amp > stance_max_shift_m:
@@ -603,13 +745,17 @@ def stable_floor_transform(
                          f"{sf.stance_coverage*100:.0f} % des images ; ")
         elif not (np.isfinite(gain) and gain >= stance_min_gain):
             sf.notes += (f"mode stance REFUSE : ne stabilise pas le sol "
-                         f"(dispersion des poses {std0*100:.2f} -> {std1*100:.2f} cm, "
+                         f"(dispersion des {_critere} {std0*100:.2f} -> {std1*100:.2f} cm, "
                          f"gain {0.0 if not np.isfinite(gain) else gain*100:.0f} % < "
                          f"{stance_min_gain*100:.0f} %) ; ")
         else:
             sf.stance_shift_m = total
             sf.drift_applied = True
             work = probe
+            sf.notes += ("mode stance : appui par passe "
+                         + " > ".join(f"{c*100:.0f}%" for c in _cov_trace)
+                         + f", correction max {amp*100:.1f} cm, critere {_critere} "
+                         f"{std0*100:.2f} -> {std1*100:.2f} cm ; ")
 
     # --- 3. offset constant (l'offset provisoire du mode appui y est reintegre)
     y = work[:, :, 1].reshape(-1)

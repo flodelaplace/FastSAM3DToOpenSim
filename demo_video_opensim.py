@@ -541,6 +541,12 @@ def main(args, estimator=None, visualizer=None):
         os.environ["MOGE_WORLD_FRAME"] = "0"
     else:
         os.environ["MOGE_WORLD_FRAME"] = "1"
+    # Camera qui suit le sujet : la verticale n'est pas la meme d'un bout a
+    # l'autre de l'essai, on l'interpole entre images-cles (opt-in ailleurs,
+    # tant qu'elle n'est pas eprouvee sur verite terrain). `MOGE_WF_MOBILE=0`
+    # explicite dans l'environnement garde la main.
+    if getattr(args, "handheld", False):
+        os.environ.setdefault("MOGE_WF_MOBILE", "1")
 
     # Les normales du sol par image sont accumulees dans un attribut DE CLASSE.
     # Le worker persistant enchaine les videos dans le meme process : sans cette
@@ -643,9 +649,30 @@ def main(args, estimator=None, visualizer=None):
     # sous le sol, et tout ce qui en derive suivait — dont les fleches GRF,
     # ancrees sur les pieds du TRC. Invisible sur AWS, ou le lambda ajoute
     # --floor_moge explicitement.
+    #
+    # ⚠️ DECOUPLE DE --floor ET --floor_seated le 2026-09-09. Ces deux drapeaux
+    # choisissent une mise au sol PAR IMAGE ; ils n'ont rien a dire sur la
+    # VERTICALE DU MONDE, qui est une propriete de la scene filmee. Or ils
+    # eteignaient tout le bloc MoGe, donc aussi GeoCalib et le repere monde —
+    # en silence. Florian, 2026-09-09 : « on est d'accord que MoGe+GeoCalib est
+    # par defaut peu importe le module, n'importe quel essai ». C'est le cas
+    # desormais : seul `--no_floor_moge` (ou `--no_world_frame` pour la seule
+    # rotation) l'eteint, et le journal le dit a chaque passage.
     _floor_moge_on = (getattr(args, "floor_moge", False)
-                      or (not args.floor and not args.floor_seated
-                          and not getattr(args, "no_floor_moge", False)))
+                      or not getattr(args, "no_floor_moge", False))
+    if _floor_moge_on and args.no_lean_fix:
+        print("  [verticale monde] DESACTIVEE par --no_lean_fix : ni MoGe ni "
+              "GeoCalib ne seront consultes, la scene ne sera pas redressee.")
+    elif not _floor_moge_on:
+        print("  [verticale monde] DESACTIVEE par --no_floor_moge.")
+    elif getattr(args, "no_world_frame", False):
+        print("  [verticale monde] estimation MoGe+GeoCalib ACTIVE, mais la "
+              "rotation globale est coupee par --no_world_frame (repli sur la "
+              "mediane des angles).")
+    else:
+        print("  [verticale monde] MoGe + GeoCalib ACTIFS PAR DEFAUT "
+              f"(module {args.module or 'aucun'}, independant du module). "
+              "--no_world_frame coupe la rotation, --no_floor_moge coupe tout.")
     if _floor_moge_on and not args.no_lean_fix:
         fov_est = getattr(estimator, "fov_estimator", None)
         if fov_est is not None:
@@ -1517,8 +1544,27 @@ def main(args, estimator=None, visualizer=None):
     #   • clamp Y≥0 (défaut floor_moge) → empêche traversée sol.
     _auto_feet_anchor = args.module in ("d3.squat", "d3.sit_to_stand",
                                           "d3.jump")
-    _auto_stationary = args.module in ("d3.squat", "d3.sit_to_stand",
-                                          "d3.jump", "d3.cycling")
+    # ⚠️ Le SQUAT sort du mode stationnaire (Florian, 2026-09-09). Ce mode
+    # recentre le bassin a chaque image et supprime PAR CONSTRUCTION toute
+    # avancee horizontale : un sujet qui fait ses squats puis s'eloigne a pied
+    # restait cloue sur place (deplacement net 0,063 m une fois les pieds au
+    # sol). Le geste est tenu par l'ANTI-GLISSEMENT, qui ancre par appui et
+    # laisse avancer -- a la condition, desormais remplie, que les pieds soient
+    # reellement au sol pour que la detection de contact par hauteur fonctionne
+    # (mode appui du sol stable accepte : pied median +0,4 cm).
+    _auto_stationary = args.module in ("d3.sit_to_stand", "d3.jump", "d3.cycling")
+    # CAMERA QUI SUIT LE SUJET (--handheld, jeton `handheld`) : la translation
+    # de camera estimee melange le deplacement du sujet et celui de l'operateur,
+    # elle ne vaut rien en XZ. On traite alors comme un tapis : bassin centre
+    # en XZ, seule la verticale vit (injection cam_t.Y). Decision Florian
+    # 2026-09-09 sur `REG_run` (course in situ, operateur qui court a cote) :
+    # traite en camera fixe, le pied flottait de 6 cm et les poses de sol
+    # etaient dispersees de 6 cm. Le sprint, lui, est in situ MAIS camera
+    # fixe : il garde le traitement complet, et c'est ce qui le rend bon.
+    if getattr(args, "handheld", False) and not _auto_stationary:
+        _auto_stationary = True
+        print("  [camera portee] --handheld → bassin centre en XZ (comme sur tapis), "
+              "verticale libre ; anti-glissement et recalage lateral coupes plus bas.")
     # MODE TAPIS AUTO : dès qu'une vitesse tapis est fournie (token tm<kmh>) sur
     # course/marche, le sujet est EN PLACE → --stationary récupère l'oscillation
     # verticale (rebond) via l'injection cam_t.Y, sinon le bassin reste plat et
@@ -1545,6 +1591,13 @@ def main(args, estimator=None, visualizer=None):
     # explicitement que l'excursion verticale n'est pas un bon discriminant).
     _auto_lock_vertical = (args.module == "d3.cycling"
                            and not getattr(args, "danseuse", False))
+    # ⚠️ NE PAS VERROUILLER SOUS --handheld. Essai le 2026-09-09 : le verrou
+    # ramenait l'etendue verticale du bassin a 1,6 cm sur une COURSE
+    # (`outputs/RUN_PORTEE2`) — un coureur qui ne rebondit plus. Florian :
+    # « je veux qu'il y ait du deplacement en vertical, c'est comme sur tapis
+    # en gros ». Le mode tapis garde justement l'injection de cam_t.Y : XZ fige,
+    # verticale libre. La derive lente de l'operateur se retire en aval, par le
+    # mode appui du sol stable, pas en supprimant le signal.
     # Tests RTS unipodaux : single_leg_squat (statique pied au sol) et
     # single_leg_hop (sauts avec vol). L'ancrage conscient du contact gère les
     # deux — bassin qui descend en SLS, vol préservé en hop — sans le pré-réglage
@@ -1623,20 +1676,24 @@ def main(args, estimator=None, visualizer=None):
     # chaise), les garde-fous internes du sol stable refusent d'eux-memes faute
     # de poses distinctes a mesurer : l'activer par defaut est sans effet plutot
     # que risque.
+    # CAMERA PORTEE : le sol stable N'EST PLUS coupe (2026-09-09). Sous
+    # --handheld le bassin est centre en XZ et la verticale monde est
+    # interpolee par image-cle ; ce qui reste au sol stable, c'est la mise au
+    # sol verticale par appui — precisement ce qu'il faut a un coureur filme en
+    # le suivant. Sa rotation ne trouvera pas d'axe de progression (bassin
+    # centre) et se refusera d'elle-meme : pas d'empilement avec la verticale
+    # monde, qui est mesuree sur `REG_run` en camera fixe (8,07° monde puis
+    # 6,77° de sol stable par-dessus).
     _sf_exclu = ("cycling", "birddog")
     _sf_auto = (args.module is not None
                 and not any(x in args.module for x in _sf_exclu)
-                and not args.handheld and not args.no_stable_floor)
+                and not args.no_stable_floor)
     if _sf_auto and not args.stable_floor:
-        print(f"  [stable floor] ACTIF PAR DEFAUT ({args.module}, camera fixe). "
-              "--handheld si la camera bouge, --no_stable_floor pour couper. "
-              "Ses propres garde-fous refusent la correction quand l'essai ne "
-              "permet pas de l'observer.")
+        print(f"  [stable floor] ACTIF PAR DEFAUT ({args.module}"
+              f"{', camera portee' if args.handheld else ', camera fixe'}). "
+              "--no_stable_floor pour couper. Ses propres garde-fous refusent la "
+              "correction quand l'essai ne permet pas de l'observer.")
     _stable_floor = (args.stable_floor or _sf_auto) and not args.no_stable_floor
-    if args.handheld and args.stable_floor:
-        print("  [stable floor] demande explicitement malgre --handheld : "
-              "le sol ne sera pas constant, resultat a interpreter avec reserve.")
-        _stable_floor = True
 
     if _stable_floor and _plantar_idx is None:
         print("  [stable floor] AVERTISSEMENT : aucun marqueur SOLE_* trouve, "
@@ -1797,11 +1854,22 @@ def main(args, estimator=None, visualizer=None):
             if _anti_skate_on:
                 print(f"  [anti-glissement] DESACTIVE : {_motif}")
             _anti_skate_on = False
+    # GESTE EN PLACE : jeu de seuils distinct (demande de Florian, 2026-09-09,
+    # « fais un anti-glissement avec des seuils differents de celui qui sert
+    # pour la locomotion »). Les pieds y restent poses des secondes : l'ancre ne
+    # doit pas expirer sur un rate de detection, et la correction doit pouvoir
+    # suivre les sauts rapides de la scene entiere (elle n'a aucune cadence de
+    # marche a preserver). Mesure sur `outputs/SQUAT_XZ` : excursion des pieds
+    # 21,9/19,6 cm en mode locomotion, 3,7/4,3 en mode en place.
+    _en_place = args.module in ("d3.squat", "d3.sit_to_stand",
+                                "d3.single_leg_squat", "d3.jump")
     if _anti_skate_on and marker_names is not None:
         from sam_3d_body.export.coordinate_transform import anti_foot_skate_markers
         markers_array, _antiskate_shifts = anti_foot_skate_markers(
-            markers_array, marker_names, fps=out_fps)
-        print("  [anti-glissement] decalage global XZ applique au TRC final")
+            markers_array, marker_names, fps=out_fps, en_place=_en_place)
+        print("  [anti-glissement] decalage global XZ applique au TRC final"
+              + (" (seuils GESTE EN PLACE : ancre tenue 0,60 s, correction "
+                 "suivie jusqu'a 8 Hz)" if _en_place else " (seuils locomotion)"))
 
     # ── --feet_anchor : shift global per-frame pour que le midpoint des
     # pieds reste à sa position médiane sur toute la vidéo. Translate tout
@@ -2861,13 +2929,14 @@ def build_parser():
                              "(course/saut). Unifie et remplace --floor/défaut. Recommandé pour "
                              "avatars + mouvements libres. (Opt-in en cours de validation.)")
     parser.add_argument("--handheld", action="store_true",
-                        help="La CAMERA bouge (portee a la main, embarquee). Distinct "
-                             "de --stationary, qui dit que le SUJET est en place : un "
-                             "tapis de course est stationnaire ET camera fixe. Ce "
-                             "drapeau desactive le sol stable par defaut, parce que "
-                             "celui-ci suppose un sol constant sur l'essai — mesure sur "
-                             "une course filmee a la main : la hauteur du pied a la pose "
-                             "derive de 20 cm sur 6 s, contre 4,4 cm camera fixe.")
+                        help="La CAMERA SUIT le sujet (portee a la main, embarquee). "
+                             "Distinct de --stationary, qui dit que le SUJET est en "
+                             "place : un tapis de course est stationnaire ET camera "
+                             "fixe ; un depart de sprint est in situ ET camera fixe. "
+                             "Traite comme un tapis : bassin centre en XZ, verticale "
+                             "libre, verticale monde interpolee par image-cle, "
+                             "anti-glissement et recalage lateral coupes, sol stable "
+                             "garde pour la mise au sol par appui.")
     parser.add_argument("--lateral_anchor", action="store_true",
                         help="Recale LATERALEMENT le corps entier APRES l'IK, pour "
                              "supprimer le glissement de cote du pied en appui. "

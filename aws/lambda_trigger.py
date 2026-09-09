@@ -462,7 +462,12 @@ def parse_filename(basename):
 
     # Toujours activer --floor_moge (fix Y-DOWN 2026-07 : marche pour tous les
     # cas standard, auto-skip si MoGe échoue).
-    if "--floor_moge" not in extra and not floor:
+    # TOUJOURS, y compris avec le jeton `floor`. La mise au sol par image et la
+    # verticale du monde sont deux choses distinctes : `floor` choisit la
+    # premiere, il n'a jamais eu vocation a eteindre la seconde. Il le faisait
+    # pourtant, en silence (`_floor_moge_on` excluait `--floor`), privant ces
+    # essais de MoGe ET de GeoCalib. Decouple le 2026-09-09.
+    if "--floor_moge" not in extra:
         extra.append("--floor_moge")
 
     return {
