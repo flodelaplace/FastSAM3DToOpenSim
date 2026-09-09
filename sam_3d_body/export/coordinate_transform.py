@@ -2740,12 +2740,6 @@ def lateral_root_shift(
         for j in range(2):
             shifts[:, j] = uniform_filter1d(shifts[:, j], size=win, mode="nearest")
 
-    if max_shift_m > 0:
-        _n = np.linalg.norm(shifts, axis=1)
-        _tf = np.where(_n > max_shift_m * _unit,
-                       (max_shift_m * _unit) / np.maximum(_n, 1e-9), 1.0)
-        shifts = shifts * _tf[:, None]
-
     result[:, :, 0] += shifts[:, 0][:, None]
     result[:, :, 2] += shifts[:, 1][:, None]
     return result, shifts / unit
