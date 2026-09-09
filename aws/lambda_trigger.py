@@ -116,7 +116,7 @@ START_RE = re.compile(r"^s(\d+)$")
 END_RE = re.compile(r"^e(\d+)$")
 TREADMILL_RE = re.compile(r"^tm(\d+)$")  # vitesse tapis en km/h (tm12 = 12 km/h)
 FLAG_TOKENS = {"st", "insitu", "com", "floor", "lv", "ll", "bikefit", "ca",
-               "seated", "handheld", "nosf", "nolat"}
+               "seated", "handheld", "nosf", "nolat", "danseuse"}
 LEVEL_TOKENS = {"tr": "trained", "re": "recreational",
                 "cl": "clinical", "el": "elite"}
 # Module token → --module value (d3 par défaut pour SAM3D 3D pipeline)
@@ -182,6 +182,7 @@ def parse_filename(basename):
     handheld = False
     no_stable_floor = False
     no_lateral_anchor = False
+    danseuse = False
     compute_com = False
     floor = False
     lock_vertical = False
@@ -260,6 +261,12 @@ def parse_filename(basename):
         if t == "nosf":
             # Coupe le sol stable sans declarer la camera mobile.
             no_stable_floor = True
+            continue
+        if t == "danseuse":
+            # Cyclisme hors de la selle : coupe le verrouillage vertical du
+            # bassin. Assis il ne monte pas ; en danseuse ce mouvement EST le
+            # geste, et l'effacer le supprimerait.
+            danseuse = True
             continue
         if t == "nolat":
             # Coupe le recalage lateral, actif par defaut sur marche, course et
@@ -381,6 +388,8 @@ def parse_filename(basename):
         extra.append("--no_stable_floor")
     if no_lateral_anchor:
         extra.append("--no_lateral_anchor")
+    if danseuse:
+        extra.append("--danseuse")
     if stationary:
         extra.append("--stationary")
     if compute_com:

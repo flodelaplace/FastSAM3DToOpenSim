@@ -1511,7 +1511,20 @@ def main(args, estimator=None, visualizer=None):
         _auto_stationary = True
         print(f"  [mode tapis] vitesse {args.treadmill_speed} m/s → --stationary "
               f"auto (rebond vertical) + anti-skate OFF (pied glisse avec la bande)")
-    _auto_lock_vertical = args.module == "d3.cycling"
+    # Verrouillage vertical du bassin : ACTIF par defaut en cyclisme, parce
+    # qu'un cycliste ASSIS sur une selle ne monte pas. Sans lui, l'injection de
+    # cam_t.Y recopie le mouvement de la camera sur le bassin -- mesure du
+    # 2026-09-09 sur un home-trainer filme a la main : 18,1 cm d'oscillation,
+    # ramenes a 2,6 cm une fois verrouille.
+    #
+    # ⚠️ EN DANSEUSE, NE PAS VERROUILLER. Le bassin y monte et descend pour de
+    # vrai, et l'effacer supprimerait le geste qu'on vient mesurer. `--danseuse`
+    # coupe le verrouillage. La detection automatique du mode, elle, n'est pas
+    # affectee : elle se fonde sur le rocking LATERAL, pas sur le vertical
+    # (voir `_detect_position_mode` dans synkro-analytics, qui documente
+    # explicitement que l'excursion verticale n'est pas un bon discriminant).
+    _auto_lock_vertical = (args.module == "d3.cycling"
+                           and not getattr(args, "danseuse", False))
     # Tests RTS unipodaux : single_leg_squat (statique pied au sol) et
     # single_leg_hop (sauts avec vol). L'ancrage conscient du contact gère les
     # deux — bassin qui descend en SLS, vol préservé en hop — sans le pré-réglage
@@ -1524,8 +1537,17 @@ def main(args, estimator=None, visualizer=None):
     # de course resterait active pour les suivantes (squat, CMJ, STS, cycling)
     # dans un process qui en traite plusieurs → marqueurs pieds décalés de
     # plusieurs cm, TRC et IK faux, sans le moindre message d'erreur.
+    # ⚠️ Le CYCLISME rejoint la liste le 2026-09-09. Les pieds sont sur des
+    # PEDALES : il n'y a aucun sol sous eux, et rien ne doit les y ramener.
+    # Constate par Florian sur un home-trainer filme a la main : la camera
+    # bouge legerement, le plan du sol derive, les pieds finissent par passer
+    # dessous, et le clamp remonte alors TOUT LE CORPS a chaque coup de
+    # pedale. Le sujet monte et descend au rythme du pedalage.
+    # Qu'un cycliste passe sous le plan du sol est sans consequence : ce plan
+    # n'a pas de sens physique ici. Le clamp, lui, en a une.
     os.environ["NO_FLOOR_CLAMP"] = (
-        "1" if args.module in ("d3.running", "d3.gait", "d3.sprint_start") else "0"
+        "1" if args.module in ("d3.running", "d3.gait", "d3.sprint_start",
+                               "d3.cycling") else "0"
     )
 
     # Indices des points PLANTAIRES dans le tableau jcoords_processed. Les
@@ -1611,7 +1633,13 @@ def main(args, estimator=None, visualizer=None):
         correct_floor_lean=_correct_lean,
         floor_angle=moge_floor_angle,
         apply_body_vertical=_apply_body_vertical,
-        lock_vertical=args.lock_vertical,
+        # `_auto_lock_vertical` etait calcule (l.1514) et JAMAIS transmis :
+        # le verrouillage vertical du cyclisme n'a jamais ete actif. Son voisin
+        # `lock_lateral` est bien passe en `args... or _auto...`, celui-ci non.
+        # Consequence mesuree le 2026-09-09 sur un home-trainer : le bassin
+        # oscillait de 18 cm alors qu'un cycliste assis sur une selle ne monte
+        # pas. L'injection de cam_t.Y remontait le tremblement du camera-man.
+        lock_vertical=args.lock_vertical or _auto_lock_vertical,
         lock_lateral=args.lock_lateral or _auto_lock_lateral,
         contact_anchor=args.contact_anchor or _auto_contact_anchor,
         stable_floor=_stable_floor,
@@ -1930,7 +1958,7 @@ def main(args, estimator=None, visualizer=None):
                 correct_floor_lean=not args.no_lean_fix,
                 floor_angle=moge_floor_angle,
                 apply_body_vertical=not args.floor_seated,
-                lock_vertical=args.lock_vertical,
+                lock_vertical=args.lock_vertical or _auto_lock_vertical,
                 lock_lateral=args.lock_lateral or _auto_lock_lateral,
                 contact_anchor=args.contact_anchor or _auto_contact_anchor,
                 fps=out_fps,
@@ -2611,8 +2639,7 @@ OpenSim workflow:
                    "--mot", ik_mot_path,
                    "--trc", os.path.join(args.output_dir, f"{prefix}_post_ik.trc"),
                    "--subject", subj_json,
-                   "--out", out_dir,
-                   "--export-pdf"]
+                   "--out", out_dir]
         if args.treadmill_speed is not None:
             cli_cmd += ["--treadmill-speed", str(args.treadmill_speed)]
         if getattr(args, "hop_type", None):
@@ -2944,6 +2971,12 @@ def build_parser():
     parser.add_argument("--treadmill_speed", type=float, default=None,
                         help="Vitesse tapis (m/s) — pour --module d3.running/gait sur tapis. "
                              "Laisser vide pour overground.")
+    parser.add_argument("--danseuse", action="store_true",
+                        help="Cyclisme EN DANSEUSE (hors de la selle). Coupe le "
+                             "verrouillage vertical du bassin, actif par defaut "
+                             "en cyclisme : assis le bassin ne monte pas, mais en "
+                             "danseuse ce mouvement est le geste lui-meme et il ne "
+                             "faut pas l'effacer.")
     parser.add_argument("--cycling_position", default="road",
                         choices=["road", "tt", "comfort"],
                         help="Position cycliste (module d3.cycling) — bascule le jeu de "
