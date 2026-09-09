@@ -99,6 +99,7 @@ class CoordinateTransformer:
         stable_floor: bool = False,
         plantar_indices: Optional[np.ndarray] = None,
         stable_floor_drift: str = "linear+stance",
+        ground_margin_m: float = 0.01,
         fps: float = 30.0,
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
@@ -578,16 +579,46 @@ class CoordinateTransformer:
                 if plantar_indices is not None and jc is not None and len(plantar_indices):
                     return jc[i, np.asarray(plantar_indices, dtype=int)]
                 return kpts[i, _FOOT_INDICES]
-            n_calib = min(20, kpts.shape[0])
-            calib_min_y = []
-            for i in range(n_calib):
+            # ⚠️ CALIBRE SUR TOUT L'ESSAI, PAS SUR LES 20 PREMIERES IMAGES.
+            # L'ancienne fenetre supposait que le point le plus bas du geste
+            # arrive au debut. C'est faux des qu'il y a un CYCLE : en pedalage,
+            # le point mort bas revient toutes les 0,7 s et rien ne dit qu'il
+            # tombe dans les 20 premieres images. Mesure sur
+            # `output_20260909_200817_bikefit_demo` (2026-09-09) : 16 images sur
+            # 241 descendaient a -3,5 cm, le pied passant sous le sol dans le
+            # visionneur. Florian : « parfois leurs pieds vont en dessous du
+            # sol ; trouve le min sur tout l'essai et remonte d'un offset fixe
+            # avec un peu de marge ».
+            #
+            # L'offset reste CONSTANT sur l'essai — c'est ce qui garantit qu'il
+            # ne deforme rien : une translation verticale uniforme ne change
+            # aucun angle articulaire ni aucune amplitude. Et il est rejoue tel
+            # quel sur le mesh (`_last_constant_offset_m`), donc peau, squelette
+            # et TRC restent alignes au millimetre.
+            #
+            # Cette branche n'est atteinte que quand le SOL STABLE est inactif,
+            # c'est-a-dire en pratique le cyclisme et la quadrupedie : les
+            # gestes ou les pieds ne touchent aucun sol et ou personne d'autre
+            # ne garantit qu'ils restent au-dessus.
+            _mins = []
+            for i in range(kpts.shape[0]):
                 foot = _pieds(i)
                 if not np.any(np.isnan(foot)):
-                    calib_min_y.append(np.min(foot[:, 1]))
+                    _mins.append(float(np.min(foot[:, 1])))
+            calib_min_y = _mins
             if calib_min_y:
-                constant_offset = float(np.min(calib_min_y))
-                print(f"  [floor lean] constant ground shift Y -= {constant_offset:.3f} m "
-                      f"(calib over {len(calib_min_y)} frames)")
+                _plus_bas = float(np.min(calib_min_y))
+                _debut = float(np.min(calib_min_y[:min(20, len(calib_min_y))]))
+                # Marge : le point le plus bas se retrouve a `ground_margin_m`
+                # au-dessus du sol plutot qu'exactement dessus. Sans elle, la
+                # moindre interpolation d'affichage repasse sous zero.
+                constant_offset = _plus_bas - ground_margin_m
+                print(f"  [floor lean] constant ground shift Y -= "
+                      f"{constant_offset:.3f} m (point le plus bas de l'essai "
+                      f"{_plus_bas*100:+.1f} cm sur {len(calib_min_y)} images, "
+                      f"marge {ground_margin_m*100:.0f} cm ; les 20 premieres "
+                      f"images seules auraient donne {_debut*100:+.1f} cm, soit "
+                      f"{(_debut-_plus_bas)*100:+.1f} cm d'ecart)")
                 kpts[:, :, 1] -= constant_offset
                 if jc is not None:
                     jc[:, :, 1] -= constant_offset
