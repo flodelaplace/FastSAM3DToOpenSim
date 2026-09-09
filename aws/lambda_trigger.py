@@ -45,7 +45,9 @@ Flags avancés (auto-dispatch par --module rend ces flags souvent redondants) :
     com                  --compute_com
     floor                --floor        (mode aggressive : per-frame ground align)
     lv                   --lock-vertical
-    bikefit              MACRO = st + lv + no_lean_fix (home-trainer)
+    bikefit              home-trainer CAMERA FIXE (= st + lv + --bikefit).
+                         SANS ce jeton, `cycling` suppose de l'in situ, donc une
+                         camera embarquee, et interpole la verticale du monde.
     camR | camL          --camera_side (module cycling) : côté près caméra en
                          vue 3/4 (neutralise le membre occulté). Vide = auto.
     tt|road|comfort      --cycling_position (module cycling) : bascule les normes
@@ -360,6 +362,7 @@ def parse_filename(basename):
     if bikefit:
         stationary = True
         lock_vertical = True
+
         if module is None:
             module = "d3.cycling"
         if cycling_position is None:
@@ -373,6 +376,12 @@ def parse_filename(basename):
             )
 
     extra = []
+    if bikefit:
+        # HOME-TRAINER, CAMERA FIXE. Depuis le 2026-09-09 le module cyclisme
+        # suppose de l'IN SITU — donc une camera embarquee — et interpole la
+        # verticale du monde entre images-cles. Le home-trainer est l'exception
+        # et doit se declarer : ce jeton est ce qui le declare.
+        extra.append("--bikefit")
     if len(heights) == 1:
         extra += ["--person_height", f"{heights[0]:.2f}"]
     else:

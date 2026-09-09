@@ -545,6 +545,26 @@ def main(args, estimator=None, visualizer=None):
     # l'autre de l'essai, on l'interpole entre images-cles (opt-in ailleurs,
     # tant qu'elle n'est pas eprouvee sur verite terrain). `MOGE_WF_MOBILE=0`
     # explicite dans l'environnement garde la main.
+    # CYCLISME IN SITU : CAMERA EMBARQUEE PAR DEFAUT. Decision de Florian,
+    # 2026-09-09 : « jamais on aura une camera fixe qui filme un cycliste passer
+    # devant toi, ca va trop vite ». Un cycliste en exterieur est suivi — moto,
+    # voiture, velo ouvreur — donc la verticale n'est pas la meme d'un bout a
+    # l'autre de l'essai et doit etre interpolee entre images-cles.
+    #
+    # ⚠️ LE HOME-TRAINER EST L'EXCEPTION, ET IL DOIT SE DECLARER (`--bikefit`,
+    # jeton AWS `bikefit`). On ne peut pas s'en remettre a la dispersion des
+    # verticales pour distinguer les deux : mesure sur `outputs/REG_cycling`
+    # (home-trainer, camera fixe, essai valide par Florian) la dispersion vaut
+    # 6,16 deg, DEVANT le seuil mobile de 2,5 — plus haut meme que les 3,34 de
+    # Titia filmee en roulant. Elle mesure le desaccord des estimateurs sur la
+    # scene, pas le mouvement de la camera. Sans declaration explicite, ce
+    # passage valide basculerait en rotation par image.
+    if (args.module == "d3.cycling" and not getattr(args, "bikefit", False)
+            and not getattr(args, "handheld", False)):
+        args.handheld = True
+        print("  [cyclisme in situ] camera embarquee par defaut : verticale "
+              "interpolee par image-cle. --bikefit si c'est un home-trainer "
+              "filme camera fixe.")
     if getattr(args, "handheld", False):
         os.environ.setdefault("MOGE_WF_MOBILE", "1")
 
@@ -2976,6 +2996,15 @@ def build_parser():
                              "soutenu (squat → bassin descend) mais préserve la phase de vol "
                              "(course/saut). Unifie et remplace --floor/défaut. Recommandé pour "
                              "avatars + mouvements libres. (Opt-in en cours de validation.)")
+    parser.add_argument("--bikefit", action="store_true",
+                        help="Cyclisme sur HOME-TRAINER filme camera FIXE. Sans "
+                             "lui, le module cyclisme suppose de l'in situ, donc "
+                             "une camera embarquee : la verticale du monde est "
+                             "interpolee entre images-cles. La dispersion des "
+                             "verticales ne permet PAS de deviner lequel des deux "
+                             "on filme (6,16 deg mesures sur un home-trainer "
+                             "immobile contre 3,34 sur une cycliste suivie en "
+                             "roulant), d'ou ce drapeau explicite.")
     parser.add_argument("--anti_skate_variance", action="store_true",
                         help="Anti-glissement par VARIANCE d'appui au lieu d'une "
                              "ancre (formulation Mesh2Sim/OpenCap-Monocular). "
