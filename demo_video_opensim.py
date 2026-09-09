@@ -1793,6 +1793,28 @@ def main(args, estimator=None, visualizer=None):
     # le corps (mesh + kpts + jcoords + markers) du même delta XZ par frame.
     # Effet : pieds collés au sol, le reste du corps articule autour.
     feet_anchor_shifts_xz = None  # (N, 2) array, [dx, dz] per frame, or None
+    # ⚠️ L'ancrage AUTOMATIQUE des pieds est ABANDONNE au profit de
+    # l'anti-glissement, sur proposition de Florian le 2026-09-09.
+    #
+    # Les deux corrigent le meme defaut, mais pas de la meme facon :
+    #   - `feet_anchor` colle le milieu des talons a sa position MEDIANE sur
+    #     tout le clip. Il bloque donc le deplacement PAR CONSTRUCTION.
+    #   - l'anti-glissement pose une ancre PAR APPUI, qui expire quand le pied
+    #     decolle : le pied ne derape pas et la marche avance quand meme.
+    #     C'est ce qui tourne deja sur le sprint et la course.
+    #
+    # Les deux etaient actifs sur squat, lever de chaise et saut : le second
+    # faisait le travail, le premier epinglait tout par-dessus. Constate sur un
+    # squat suivi de quelques pas — « il est bloque, il ne peut pas avancer » —
+    # ou l'ancrage corrigeait 22 cm pendant que le bassin n'avancait que de 11.
+    #
+    # `--feet_anchor` explicite reste respecte : c'est l'automatisme qu'on
+    # retire. Et si l'anti-glissement est coupe, on garde l'ancrage : mieux vaut
+    # un pied epingle qu'un pied qui derape.
+    if _auto_feet_anchor and not args.feet_anchor and _anti_skate_on:
+        print("  [feet_anchor] AUTO DESACTIVE : l'anti-glissement fait le meme "
+              "travail par appui, sans bloquer le deplacement")
+        _auto_feet_anchor = False
     if args.feet_anchor or _auto_feet_anchor:
         # Référence : midpoint LCAL/RCAL (talons) si dispo, sinon LAJC/RAJC
         name_to_idx = {n: i for i, n in enumerate(marker_names)}

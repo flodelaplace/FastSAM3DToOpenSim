@@ -247,9 +247,34 @@ class CoordinateTransformer:
             # On garde donc leur agregation telle quelle, et l on retombe sur la
             # mediane des que le consensus est trop maigre pour etre credible.
             import os as _os_wf
+            # Remise a zero : ces etats sont rejoues sur le MESH plus tard. Sans
+            # cela, une video sans repere monde rejouerait la rotation de la
+            # precedente sur ses sommets — meme famille de fuite que
+            # `_ups_cam_m2s` dans un worker persistant.
+            self._last_world_frame_R = None
+            self._last_world_frame_series = None
+            self._last_world_frame_dy_m = 0.0
             _deja_redresse = False
+            # ⚠️ REMIS EN OPT-IN le 2026-09-09 au soir. Mesure sur `Squat.MP4`,
+            # tronc en phase debout, 0 degre = vertical :
+            #     repere monde COUPE      10,60 deg
+            #     repere monde a 11,94    19,01 deg
+            # La rotation ne CORRIGE pas l'inclinaison, elle s'y AJOUTE
+            # (10,60 + 11,94 = 22,5, mesure 19,0). Le sujet ressort plus penche
+            # qu'avant, ce que Florian a vu a l'oeil avant que je le mesure.
+            #
+            # Piste, non verifiee : le vecteur estime vaut [-0,031, +0,978,
+            # +0,205]. Si le vrai up avait un Z NEGATIF, notre rotation
+            # doublerait l'erreur au lieu de l'annuler — famille de piege que
+            # Mesh2Sim documente sur les conventions d'axes. A instruire sur une
+            # scene dont on connait l'inclinaison, pas au jugé.
+            #
+            # Tout ce qui a ete mesure ce soir sur le consensus reste vrai et
+            # utile : MoGe a pleine resolution s'accorde avec GeoCalib a 0,2 deg
+            # sur un squat et 2,9 sur un sprint. C'est l'APPLICATION de cette
+            # verticale qui est fausse, pas son estimation.
             _world_frame = (_src == "MoGe"
-                            and bool(int(_os_wf.environ.get("MOGE_WORLD_FRAME", "1"))))
+                            and bool(int(_os_wf.environ.get("MOGE_WORLD_FRAME", "0"))))
             if _world_frame:
                 # Les angles recus sont deja multiplies par LEAN_SCALE ; ce mode
                 # veut l angle MESURE, donc on defait ce facteur. Si le clamp a
@@ -276,6 +301,19 @@ class CoordinateTransformer:
                 # des estimateurs, pas l'interpolation.
                 _cles = self.verticales_par_image_cle()
                 _nf = int(getattr(CoordinateTransformer, "_n_frames_video", 0)) or len(kpts)
+                # ⚠️ OPT-IN, pas defaut. Ecrite le 2026-09-09, validee sur
+                # verite terrain SYNTHETIQUE (0,24 deg d'erreur sur 8 images-cles
+                # pour un mouvement de 27 deg a deux axes) mais PAS sur une vraie
+                # video. Le seul essai qui l'exerce — `titia_cycling_insitu`,
+                # camera a la main — donne un tronc a 43,11 deg contre 35 sans
+                # elle, soit 8 deg de sur-correction : la cycliste ressort plus
+                # droite qu'elle ne l'est, ce que Florian a vu a l'oeil.
+                # Piste a instruire : en exterieur, MoGe mesure la NORMALE DE LA
+                # ROUTE et GeoCalib mesure la GRAVITE. Sur une pente les deux
+                # divergent legitimement, et leur moyenne n'est ni l'une ni
+                # l'autre. Il faudra peut-etre preferer GeoCalib seul dehors.
+                # `MOGE_WF_MOBILE=1` la reactive pour la mettre au point.
+                _mobile_on = bool(int(_os_wf.environ.get("MOGE_WF_MOBILE", "0")))
                 _seuil_mob = float(_os_wf.environ.get("MOGE_WF_SEUIL_MOBILE_DEG", "2.5"))
                 _disp = 0.0
                 if len(_cles) >= 3:
@@ -286,7 +324,7 @@ class CoordinateTransformer:
                 print(f"  [world frame] images-cles retenues par le consensus : "
                       f"{len(_cles)} | dispersion {_disp:.2f}° | seuil mobile "
                       f"{_seuil_mob:.1f}°")
-                if len(_cles) >= 3 and _disp > _seuil_mob:
+                if _mobile_on and len(_cles) >= 3 and _disp > _seuil_mob:
                     _serie = self.interpoler_verticales(_cles, len(kpts))
                     if _serie is not None:
                         _y0 = float(np.nanmin(kpts[..., 1])) if kpts.size else 0.0
@@ -302,6 +340,10 @@ class CoordinateTransformer:
                                 kpts[..., 1] += _dy
                                 if jc is not None:
                                     jc[..., 1] += _dy
+                        self._last_world_frame_series = [
+                            self.rotation_align(_serie[_i2], _cible)
+                            for _i2 in range(len(kpts))]
+                        self._last_world_frame_dy_m = float(_dy) if np.isfinite(_dy) else 0.0
                         _incl = float(np.degrees(np.arccos(np.clip(
                             np.abs(_serie[:, 1]), -1.0, 1.0))).mean())
                         print(f"  [world frame] CAMERA MOBILE : dispersion "
@@ -392,8 +434,14 @@ class CoordinateTransformer:
                                 print(f"  [world frame] scene reposee : {_dy*100:+.1f} cm "
                                       f"en Y (la rotation globale l avait soulevee)")
                         self._last_world_frame_R = _R
+                        self._last_world_frame_dy_m = float(_dy) if np.isfinite(_dy) else 0.0
                         self._last_world_frame_tilt_deg = _incl
-                        self._last_floor_angle_deg = _incl
+                        # ⚠️ NE PAS remplir `_last_floor_angle_deg` ici : il est
+                        # rejoue sur le mesh comme une rotation autour du
+                        # BASSIN, alors qu'on vient d'appliquer une rotation
+                        # GLOBALE aux kpts. C'est ce qui decouplait le mesh de
+                        # l'anatomical (constate sur Titia le 2026-09-09).
+                        self._last_floor_angle_deg = None
                 else:
                     # REPLI : aucune normale collectee (angles fournis a la main,
                     # ou estimation mono-image). On reconstitue depuis les angles
@@ -632,6 +680,29 @@ class CoordinateTransformer:
                 if (self._last_stationary_cam_t_y_m is not None
                         and i < len(self._last_stationary_cam_t_y_m)):
                     w[:, 1] += self._last_stationary_cam_t_y_m[i]
+            # ── REPERE MONDE : rejouer la MEME transformation que les kpts ──
+            # ⚠️ Defaut trouve le 2026-09-09, signale par Florian sur Titia :
+            # « le mesh et l'anatomical sont decouples ». En mode repere monde,
+            # les points articulaires subissent une rotation GLOBALE autour de
+            # l'origine camera, tandis que ce bloc rejouait la chaine
+            # historique — une rotation autour du BASSIN, d'angle
+            # `_last_floor_angle_deg`. Deux transformations differentes sur les
+            # memes donnees : le mesh et le squelette divergeaient
+            # necessairement, et d'autant plus que l'inclinaison etait grande.
+            # `_last_world_frame_R` etait d'ailleurs stocke depuis le portage et
+            # JAMAIS relu.
+            _Rw = getattr(self, "_last_world_frame_R", None)
+            _serie_w = getattr(self, "_last_world_frame_series", None)
+            if _serie_w is not None and i < len(_serie_w):
+                w = w @ _serie_w[i].T
+                w[:, 1] += getattr(self, "_last_world_frame_dy_m", 0.0)
+                pre_ground.append(w)
+                continue
+            if _Rw is not None:
+                w = w @ _Rw.T
+                w[:, 1] += getattr(self, "_last_world_frame_dy_m", 0.0)
+                pre_ground.append(w)
+                continue
             # Pitch correction (axe Z lateral)
             if (self._last_floor_angle_deg is not None
                     and abs(self._last_floor_angle_deg) > 0.5
@@ -1445,6 +1516,8 @@ class CoordinateTransformer:
             # deja reduits, dont on ne peut reconstituer ni l orientation
             # geometrique ni le rejet d image.
             import os as _os_wf2
+            # La COLLECTE reste active meme quand l'application est coupee :
+            # elle ne coute rien et alimente le diagnostic du consensus.
             if bool(int(_os_wf2.environ.get("MOGE_WORLD_FRAME", "1"))):
                 try:
                     _u = CoordinateTransformer.floor_up_from_points_m2s(
