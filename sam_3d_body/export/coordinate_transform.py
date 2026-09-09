@@ -399,6 +399,9 @@ class CoordinateTransformer:
                         _up_w = _mg
                         print("  [world frame] GeoCalib indisponible → MoGe seul")
 
+                    # Le consensus est exprime dans le monde de Mesh2Sim ; nos
+                    # points sont dans le notre. UNE conversion, ici.
+                    _up_w = self.up_m2s_vers_opensim(_up_w)
                     _R = self.rotation_align(_up_w, np.array([0.0, 1.0, 0.0]))
                     _incl = float(np.degrees(np.arccos(np.clip(_up_w[1], -1.0, 1.0))))
                     if _world_frame:
@@ -544,10 +547,20 @@ class CoordinateTransformer:
             # Sans ça l'anatomical apparaît sous le sol (kpts.Y = cam_t_y brut).
             # Le shift est appliqué à TOUTES les frames de manière constante,
             # ce qui préserve la motion Y naturelle (squat, sauts, etc).
+            # ⚠️ Points de SEMELLE quand ils existent, articulations sinon.
+            # `_FOOT_INDICES` designe les CENTRES ARTICULAIRES talon et gros
+            # orteil, qui flottent quelques centimetres au-dessus de la semelle :
+            # se caler dessus met le sujet en l'air d'autant. Le sol stable
+            # utilise deja les points plantaires ; cette branche et le clamp
+            # ci-dessous ne le faisaient pas (constat du 2026-09-09).
+            def _pieds(i):
+                if plantar_indices is not None and jc is not None and len(plantar_indices):
+                    return jc[i, np.asarray(plantar_indices, dtype=int)]
+                return kpts[i, _FOOT_INDICES]
             n_calib = min(20, kpts.shape[0])
             calib_min_y = []
             for i in range(n_calib):
-                foot = kpts[i, _FOOT_INDICES]
+                foot = _pieds(i)
                 if not np.any(np.isnan(foot)):
                     calib_min_y.append(np.min(foot[:, 1]))
             if calib_min_y:
@@ -573,7 +586,7 @@ class CoordinateTransformer:
                 n_clamped = 0
                 all_min_y = []
                 for i in range(kpts.shape[0]):
-                    foot = kpts[i, _FOOT_INDICES]
+                    foot = _pieds(i)
                     if np.any(np.isnan(foot)):
                         continue
                     min_y = float(np.min(foot[:, 1]))
@@ -1670,7 +1683,9 @@ class CoordinateTransformer:
                 v = a if a is not None else b     # une seule source disponible
             n = float(np.linalg.norm(v))
             if n > 1e-9:
-                out.append((int(i), v / n))
+                # Meme passerelle que le chemin global : les cles sont
+                # rendues dans NOTRE repere, pretes a etre appliquees.
+                out.append((int(i), CoordinateTransformer.up_m2s_vers_opensim(v / n)))
         if _diag:
             print("  [world frame] desaccord GeoCalib/MoGe par image-cle : "
                   + " ".join(f"{i}:{a:.1f}°" for i, a in _diag))
@@ -1913,6 +1928,32 @@ class CoordinateTransformer:
         return u / (np.linalg.norm(u) or 1.0)
 
     @staticmethod
+    def up_m2s_vers_opensim(m: np.ndarray) -> np.ndarray:
+        """Repere monde de Mesh2Sim -> NOTRE repere OpenSim.
+
+        ⚠️ LA CAUSE du repere monde qui penchait le sujet au lieu de le
+        redresser (2026-09-09). Mesh2Sim exprime sa verticale dans un monde
+        (x droite, y haut, z arriere), obtenu depuis la camera OpenCV par
+        (x, -y, -z). Notre CAMERA_TO_OPENSIM est une PERMUTATION differente :
+        X_os = Z_cam, Y_os = -Y_cam, Z_os = X_cam — le monde OpenSim standard
+        (x avant, y haut, z droite). J'avais porte leur conversion a la lettre,
+        et elle est juste... dans LEUR monde. Nos points, eux, sont dans le
+        notre. Consequence mesuree en synthetique : pour un tangage de 12 deg,
+        16,91 deg d'ecart entre les deux vecteurs — le tangage etait applique
+        comme un ROULIS. Sur Squat.MP4, tronc debout 10,6 deg sans correction,
+        19,0 deg avec.
+
+        La passerelle se DERIVE de CAMERA_TO_OPENSIM plutot que d'etre ecrite
+        en dur : ours = C @ M @ m, avec M = diag(1,-1,-1) qui est son propre
+        inverse. Verifie a 0,000 deg en synthetique.
+        """
+        m = np.asarray(m, dtype=np.float64)
+        o = CoordinateTransformer.CAMERA_TO_OPENSIM @ (m * np.array([1.0, -1.0, -1.0]))
+        if o[1] < 0:
+            o = -o
+        return o / (np.linalg.norm(o) or 1.0)
+
+    @staticmethod
     def rotation_align(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         """Rotation minimale amenant le vecteur a sur le vecteur b (Rodrigues)."""
         a = np.asarray(a, dtype=np.float64); a /= (np.linalg.norm(a) or 1.0)
@@ -1936,7 +1977,7 @@ class CoordinateTransformer:
         ce qui preserve la geometrie relative de tout l essai et permet ensuite
         de definir un sol constant.
         """
-        up = self.world_up_from_moge_angles(pitch_deg, roll_deg)
+        up = self.up_m2s_vers_opensim(self.world_up_from_moge_angles(pitch_deg, roll_deg))
         R = self.rotation_align(up, np.array([0.0, 1.0, 0.0]))
         incl = float(np.degrees(np.arccos(np.clip(up[1], -1.0, 1.0))))
         print(f"  [world frame] up monde = [{up[0]:+.3f},{up[1]:+.3f},{up[2]:+.3f}] "

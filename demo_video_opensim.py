@@ -522,10 +522,25 @@ def main(args, estimator=None, visualizer=None):
     # Le repere monde se lit par variable d environnement (il est consomme au
     # fond de la chaine de transformation, la ou `args` n arrive pas). Le drapeau
     # CLI la pose ici, pour que le reglage reste exprime en une seule place.
+    # ⚠️ Le repere monde est OPT-IN depuis le 2026-09-09 au soir : son
+    # estimation est bonne (MoGe et GeoCalib s'accordent a 0,2 deg) mais son
+    # APPLICATION ajoute la rotation au lieu de la retrancher — tronc en phase
+    # debout 10,60 deg sans, 19,01 avec, sur Squat.MP4.
+    # `--world_frame` pour l'activer et le mettre au point ; `--no_world_frame`
+    # reste accepte et sans effet supplementaire.
+    #
+    # ⚠️ C'est ICI que se decide le defaut, pas dans coordinate_transform :
+    # cette ligne ecrasait la valeur par defaut de la bibliotheque, et ma
+    # premiere tentative de bascule n'a donc rien change. La variable
+    # d'environnement doit etre posee a UN seul endroit.
+    # PAR DEFAUT depuis le 2026-09-09 au soir, une fois la passerelle de repere
+    # posee (`up_m2s_vers_opensim`). Mesure sur Squat.MP4, tronc en phase
+    # debout : 10,68 deg sans, 19,01 avec l'ancien portage, 5,39 avec le pont.
+    # Pied au sol : p5 a +0,2 cm. `--no_world_frame` revient a la mediane.
     if getattr(args, "no_world_frame", False):
         os.environ["MOGE_WORLD_FRAME"] = "0"
     else:
-        os.environ.setdefault("MOGE_WORLD_FRAME", "1")
+        os.environ["MOGE_WORLD_FRAME"] = "1"
 
     # Les normales du sol par image sont accumulees dans un attribut DE CLASSE.
     # Le worker persistant enchaine les videos dans le meme process : sans cette
@@ -1811,7 +1826,13 @@ def main(args, estimator=None, visualizer=None):
     # `--feet_anchor` explicite reste respecte : c'est l'automatisme qu'on
     # retire. Et si l'anti-glissement est coupe, on garde l'ancrage : mieux vaut
     # un pied epingle qu'un pied qui derape.
-    if _auto_feet_anchor and not args.feet_anchor and _anti_skate_on:
+    # Exception : le SAUT. Le sujet ne se deplace pas en XZ, il ne fait que
+    # monter ; on BLOQUE donc le plan horizontal et on ne laisse libre que la
+    # verticale (consigne de Florian, 2026-09-09). L'ancrage des pieds fait
+    # exactement cela — il ne touche pas a Y — et l'anti-glissement reste
+    # actif par-dessus pour les phases d'appui.
+    if _auto_feet_anchor and not args.feet_anchor and _anti_skate_on \
+            and args.module != "d3.jump":
         print("  [feet_anchor] AUTO DESACTIVE : l'anti-glissement fait le meme "
               "travail par appui, sans bloquer le deplacement")
         _auto_feet_anchor = False
@@ -2442,6 +2463,42 @@ def main(args, estimator=None, visualizer=None):
             output_units="m",
             ground_offset_mode=_glb_ground_mode,
             override_constant_offset_m=_shared_offset_m)
+        # ── AUTO-CONTROLE : le rejeu DOIT reproduire transform() ──────────
+        # `kpts_world` est le rejeu des keypoints bruts par le chemin du mesh ;
+        # `kpts_opensim` est ce que le squelette a recu. Par construction ils
+        # doivent coincider. S'ils divergent, une transformation s'applique a
+        # l'un et pas a l'autre — c'est ainsi que le mesh s'est retrouve 75 cm
+        # au-dessus du squelette sur un squat (2026-09-09). Ce controle tourne
+        # a chaque passage et nomme l'ecart plutot que de le laisser au GLB.
+        try:
+            _ko = np.asarray(kpts_opensim, dtype=np.float64)
+            _sc = 1000.0 if np.nanmedian(np.abs(_ko)) > 50.0 else 1.0
+            _dif = [np.asarray(_w, dtype=np.float64) - _ko[_i] / _sc
+                    for _i, _w in enumerate(kpts_world)
+                    if _w is not None and _i < len(_ko)]
+            if _dif:
+                _med = np.nanmedian(np.abs(np.concatenate(_dif, axis=0)), axis=0) * 100.0
+                _etat = {k: getattr(transformer, k, None) is not None for k in (
+                    "_last_xz_deltas_m", "_last_pelvis_shifts_m", "_last_stationary_cam_t_y_m",
+                    "_last_stable_floor", "_last_constant_offset_m", "_last_ground_offsets_m",
+                    "_last_penetration_clamp_m", "_last_world_frame_R", "_last_world_frame_series")}
+                print(f"  [auto-controle rejeu] |kpts_world - kpts_opensim| mediane : "
+                      f"X {_med[0]:.1f}  Y {_med[1]:.1f}  Z {_med[2]:.1f} cm"
+                      + ("" if float(_med.max()) < 1.0
+                         else "   ⚠️ LE REJEU NE REPRODUIT PAS transform()"))
+                print("  [auto-controle rejeu] etat transformateur : "
+                      + ", ".join(f"{k[6:]}={'oui' if v else 'non'}" for k, v in _etat.items()))
+                # Le mesh, les keypoints et les articulations doivent partager
+                # le meme sol : leurs points les plus bas ne peuvent differer
+                # que de l'epaisseur de la peau sous les articulations.
+                def _bas(L):
+                    v = [float(np.nanmin(np.asarray(w)[:, 1])) for w in L if w is not None and len(w)]
+                    return np.nanmedian(v) * 100.0 if v else float("nan")
+                print(f"  [auto-controle rejeu] point le plus bas (mediane sur les images) : "
+                      f"mesh {_bas(verts_world):+.1f} cm | keypoints {_bas(kpts_world):+.1f} cm | "
+                      f"articulations {_bas(jc_world):+.1f} cm")
+        except Exception as _e_ac:
+            print(f"  [auto-controle rejeu] impossible ({_e_ac})")
         # --feet_anchor : applique le même shift global XZ (en mètres) que
         # celui appliqué aux kpts/markers/jcoords pour que le mesh GLB et
         # l'anatomical/IK restent alignés au sol.
@@ -2825,6 +2882,14 @@ def build_parser():
                              "(5,52 cm avant IK -> 9,71 cm apres). Ne s'active que sur "
                              "les gestes avec avancee franche (> 0,5 m) et sur des "
                              "appuis de moins d'une seconde. (Opt-in.)")
+    parser.add_argument("--world_frame", action="store_true",
+                        help="Active le redressement par REPERE MONDE "
+                             "(consensus GeoCalib+MoGe, rotation globale). "
+                             "OPT-IN : son estimation est bonne mais son "
+                             "application ajoute la rotation au lieu de la "
+                             "retrancher (tronc debout 10,6 deg sans, 19,0 avec, "
+                             "sur Squat.MP4). A mettre au point avant de le "
+                             "remettre par defaut.")
     parser.add_argument("--no_world_frame", action="store_true",
                         help="Revient a l ancienne chaine de redressement du sol. "
                              "Par defaut on utilise le REPERE MONDE (recette "
