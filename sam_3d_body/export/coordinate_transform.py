@@ -56,8 +56,10 @@ class CoordinateTransformer:
     # CLASSE parce que l estimation multi-images est statique : elle tourne
     # avant toute instanciation du transformateur, et c est le seul endroit ou
     # la grille de points MoGe existe encore.
-    _ups_cam_m2s: list = []
-    _gc_up_world_m2s = None
+    _ups_cam_m2s: list = []          # [(idx_image, up_camera)]
+    _gc_up_world_m2s = None          # up monde agrege (retro-compat)
+    _gc_ups_world_m2s: list = []     # [(idx_image, up_monde)] par image-cle
+    _n_frames_video: int = 0
 
     CAMERA_TO_OPENSIM = np.array(
         [
@@ -245,6 +247,7 @@ class CoordinateTransformer:
             # On garde donc leur agregation telle quelle, et l on retombe sur la
             # mediane des que le consensus est trop maigre pour etre credible.
             import os as _os_wf
+            _deja_redresse = False
             _world_frame = (_src == "MoGe"
                             and bool(int(_os_wf.environ.get("MOGE_WORLD_FRAME", "1"))))
             if _world_frame:
@@ -252,8 +255,78 @@ class CoordinateTransformer:
                 # veut l angle MESURE, donc on defait ce facteur. Si le clamp a
                 # 60 deg a mordu, la reconstruction serait fausse — on ne peut
                 # pas le savoir ici, mais un pitch a la borne est deja anormal.
-                _ups = list(getattr(CoordinateTransformer, "_ups_cam_m2s", []))
-                if _ups:
+                # ── CAMERA MOBILE : verticale interpolee entre images-cles ──
+                # Une rotation GLOBALE suppose une camera fixe. Des qu'elle
+                # bouge, la verticale n'est pas la meme au debut et a la fin, et
+                # le mode global ne peut que moyenner (faux) ou refuser (rien
+                # redresse). On bascule donc sur une verticale PAR IMAGE,
+                # interpolee entre les images-cles.
+                #
+                # Le critere de bascule est la DISPERSION elle-meme : sur une
+                # camera fixe elle vaut 0,4 a 0,7 deg (sprint, squat), sur un
+                # essai in-situ filme a la main 6,9 deg (Titia, 2026-09-09).
+                # Faible dispersion, on garde le mode global, eprouve ; forte
+                # dispersion, ce n'est pas du bruit mais le mouvement reel de la
+                # camera, et l'interpoler le suit au lieu de l'ecraser.
+                #
+                # Mesure du 2026-09-09 sur mouvement synthetique a deux axes et
+                # vitesse variable (27 deg d'amplitude) : 8 images-cles donnent
+                # 0,24 deg d'erreur max, 16 en donnent 0,06. Inutile d'en
+                # echantillonner davantage — le facteur limitant est le bruit
+                # des estimateurs, pas l'interpolation.
+                _cles = self.verticales_par_image_cle()
+                _nf = int(getattr(CoordinateTransformer, "_n_frames_video", 0)) or len(kpts)
+                _seuil_mob = float(_os_wf.environ.get("MOGE_WF_SEUIL_MOBILE_DEG", "2.5"))
+                _disp = 0.0
+                if len(_cles) >= 3:
+                    _V = np.array([c[1] for c in _cles])
+                    _m = _V.mean(axis=0); _m /= (np.linalg.norm(_m) or 1.0)
+                    _disp = float(np.degrees(np.arccos(
+                        np.clip(_V @ _m, -1.0, 1.0))).max())
+                print(f"  [world frame] images-cles retenues par le consensus : "
+                      f"{len(_cles)} | dispersion {_disp:.2f}° | seuil mobile "
+                      f"{_seuil_mob:.1f}°")
+                if len(_cles) >= 3 and _disp > _seuil_mob:
+                    _serie = self.interpoler_verticales(_cles, len(kpts))
+                    if _serie is not None:
+                        _y0 = float(np.nanmin(kpts[..., 1])) if kpts.size else 0.0
+                        _cible = np.array([0.0, 1.0, 0.0])
+                        for _i in range(len(kpts)):
+                            _Ri = self.rotation_align(_serie[_i], _cible)
+                            kpts[_i] = kpts[_i] @ _Ri.T
+                            if jc is not None and _i < len(jc) and jc[_i] is not None:
+                                jc[_i] = jc[_i] @ _Ri.T
+                        if kpts.size:
+                            _dy = _y0 - float(np.nanmin(kpts[..., 1]))
+                            if np.isfinite(_dy) and abs(_dy) > 1e-6:
+                                kpts[..., 1] += _dy
+                                if jc is not None:
+                                    jc[..., 1] += _dy
+                        _incl = float(np.degrees(np.arccos(np.clip(
+                            np.abs(_serie[:, 1]), -1.0, 1.0))).mean())
+                        print(f"  [world frame] CAMERA MOBILE : dispersion "
+                              f"{_disp:.2f}° > {_seuil_mob:.1f}° → verticale "
+                              f"interpolee sur {len(_cles)} images-cles, "
+                              f"inclinaison moyenne {_incl:.2f}°, rotation PAR IMAGE")
+                        self._last_floor_angle_deg = _incl
+                        # ⚠️ Drapeau DEDIE, pas `_world_frame = False` : ce
+                        # dernier fait retomber sur la chaine historique, qui
+                        # appliquerait sa propre rotation PAR-DESSUS celle-ci.
+                        _deja_redresse = True
+                    else:
+                        _ups = list(getattr(CoordinateTransformer, "_ups_cam_m2s", []))
+                        _ups = [u for _, u in _ups]
+                else:
+                    _ups = [u for _, u in
+                            (getattr(CoordinateTransformer, "_ups_cam_m2s", []) or [])]
+                if _deja_redresse:
+                    # Deja redresse image par image : ne rien appliquer de plus.
+                    # Sans ce test, le bloc global ci-dessous ajoutait SA
+                    # rotation par-dessus la mienne — double redressement,
+                    # visible au journal du 2026-09-09 : « rotation PAR IMAGE »
+                    # suivi de « rotation GLOBALE » sur le meme passage.
+                    pass
+                elif _ups:
                     # CHEMIN FIDELE : vraies normales par image, agregation
                     # robuste avec rejet a 8 deg, conversion de repere, rotation
                     # globale unique. C est la recette Mesh2Sim complete.
@@ -334,7 +407,7 @@ class CoordinateTransformer:
             # Chaine historique : le defaut quand le repere monde est coupe, ET
             # le repli quand il vient de se refuser lui-meme faute de consensus.
             # Sans ce second cas, un refus laisserait la scene NON redressee.
-            if not _world_frame:
+            if not _world_frame and not _deja_redresse:
                 if _src is not None and abs(_pitch) > 0.5:
                     print(f"  [floor lean] {_src} pitch {_pitch:+.2f}° → correcting")
                     kpts, jc = self._rotate_around_pelvis_z(kpts, jc, _pitch)
@@ -1314,6 +1387,7 @@ class CoordinateTransformer:
         # Sample n_samples frames uniformly, skipping first/last 5% (motion
         # blur + freeze frames)
         margin = max(1, int(total * 0.05))
+        CoordinateTransformer._n_frames_video = int(total)
         sample_idx = np.linspace(margin, total - margin - 1, n_samples).astype(int)
         sample_idx = np.unique(sample_idx)
 
@@ -1376,7 +1450,7 @@ class CoordinateTransformer:
                     _u = CoordinateTransformer.floor_up_from_points_m2s(
                         pts, mask, person_bbox=person_bbox, orig_hw=orig_hw)
                     if _u is not None:
-                        CoordinateTransformer._ups_cam_m2s.append(_u)
+                        CoordinateTransformer._ups_cam_m2s.append((int(idx), _u))
                 except Exception:
                     pass
 
@@ -1487,6 +1561,91 @@ class CoordinateTransformer:
         return n_w / (np.linalg.norm(n_w) or 1.0)
 
     @staticmethod
+    def verticales_par_image_cle(max_desaccord_deg: float = 8.0):
+        """Consensus GeoCalib ⊕ MoGe image-clé PAR image-clé.
+
+        La version globale agrège d'abord et confronte ensuite : une seule
+        verticale pour tout l'essai. C'est juste quand la caméra ne bouge pas,
+        et faux dès qu'elle bouge — la verticale n'est alors pas la même à
+        l'image 10 et à l'image 150, et refuser la correction (ce que fait le
+        mode global) revient à ne rien redresser du tout.
+
+        Ici on applique LEUR règle des 8 degrés à chaque image-clé, et une
+        image-clé où les deux divergent est simplement ÉCARTÉE : on interpole
+        par-dessus au lieu de faire tomber tout l'essai.
+
+        Returns:
+            [(idx_image, up_monde)] trié par indice, ou [] si rien d'exploitable.
+        """
+        gc = dict(getattr(CoordinateTransformer, "_gc_ups_world_m2s", []) or [])
+        mg_cam = dict(getattr(CoordinateTransformer, "_ups_cam_m2s", []) or [])
+        if not gc and not mg_cam:
+            return []
+        mg = {i: CoordinateTransformer.cam_up_to_world_m2s(u)
+              for i, u in mg_cam.items()}
+        out = []
+        _diag = []
+        for i in sorted(set(gc) | set(mg)):
+            a, b = gc.get(i), mg.get(i)
+            if a is not None and b is not None:
+                ang = float(np.degrees(np.arccos(np.clip(float(a @ b), -1.0, 1.0))))
+                _diag.append((i, ang))
+                if ang > max_desaccord_deg:
+                    continue                      # image-clé écartée
+                v = a + b
+            else:
+                v = a if a is not None else b     # une seule source disponible
+            n = float(np.linalg.norm(v))
+            if n > 1e-9:
+                out.append((int(i), v / n))
+        if _diag:
+            print("  [world frame] desaccord GeoCalib/MoGe par image-cle : "
+                  + " ".join(f"{i}:{a:.1f}°" for i, a in _diag))
+        return out
+
+    @staticmethod
+    def interpoler_verticales(cles, n_images: int):
+        """Verticale par image, interpolée entre les images-clés (slerp).
+
+        ⚠️ On interpole des ORIENTATIONS, pas des angles. Une moyenne linéaire
+        de pitch et de roll dérape dès que les deux varient ensemble ; le slerp
+        parcourt le grand cercle entre deux directions unitaires, ce qui est la
+        trajectoire naturelle d'une caméra qui pivote.
+
+        Hors de l'intervalle des images-clés, on prolonge par la valeur du bord
+        plutôt que d'extrapoler : une caméra fait n'importe quoi avant et après
+        la séquence utile, et extrapoler y inventerait un mouvement.
+        """
+        if not cles or n_images <= 0:
+            return None
+        idx = np.array([c[0] for c in cles], dtype=float)
+        V = np.array([c[1] for c in cles], dtype=np.float64)
+        if len(cles) == 1:
+            return np.repeat(V[0][None, :], n_images, axis=0)
+        t = np.arange(n_images, dtype=float)
+        sortie = np.empty((n_images, 3), dtype=np.float64)
+        pos = np.searchsorted(idx, t, side="right") - 1
+        pos = np.clip(pos, 0, len(idx) - 2)
+        for k in range(n_images):
+            j = int(pos[k])
+            a, b = V[j], V[j + 1]
+            if t[k] <= idx[0]:
+                sortie[k] = V[0]; continue
+            if t[k] >= idx[-1]:
+                sortie[k] = V[-1]; continue
+            u = (t[k] - idx[j]) / max(idx[j + 1] - idx[j], 1e-9)
+            cos = float(np.clip(a @ b, -1.0, 1.0))
+            om = float(np.arccos(cos))
+            if om < 1e-6:
+                v = (1.0 - u) * a + u * b
+            else:
+                so = np.sin(om)
+                v = (np.sin((1.0 - u) * om) / so) * a + (np.sin(u * om) / so) * b
+            n = float(np.linalg.norm(v))
+            sortie[k] = v / n if n > 1e-9 else a
+        return sortie
+
+    @staticmethod
     def geocalib_up_world_m2s(video_path: str, frames, camera_model: str = "pinhole"):
         """Verticale de la scene par GeoCalib — portage de leur etage mono.
 
@@ -1515,7 +1674,7 @@ class CoordinateTransformer:
         _t.set_grad_enabled(False)
         dev = "cuda" if _t.cuda.is_available() else "cpu"
         model = _GC().to(dev)
-        ups = []
+        ups, vus = [], []
         for f in frames:
             cap = _cv.VideoCapture(video_path)
             cap.set(_cv.CAP_PROP_POS_FRAMES, int(f))
@@ -1534,9 +1693,15 @@ class CoordinateTransformer:
             u = -r["gravity"].vec3d[0].cpu().numpy()
             n = float(np.linalg.norm(u))
             if n > 1e-9:
-                ups.append(u / n)
+                ups.append(u / n); vus.append(f)
         if not ups:
             return None
+        # Memorise le vecteur de CHAQUE image-cle, en repere monde : c'est ce
+        # qui permet de suivre une camera qui bouge au lieu de tout moyenner.
+        CoordinateTransformer._gc_ups_world_m2s = [
+            (int(f), (u * np.array([-1.0, 1.0, 1.0]))
+                     / (np.linalg.norm(u * np.array([-1.0, 1.0, 1.0])) or 1.0))
+            for f, u in zip(vus, ups)]
         V = np.array(ups)
         V[V @ V[0] < 0] *= -1
         mean = V.mean(axis=0)

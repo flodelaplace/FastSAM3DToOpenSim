@@ -663,7 +663,12 @@ def main(args, estimator=None, visualizer=None):
                 try:
                     pitch, roll, quality = CoordinateTransformer.robust_floor_angle_multi_frame(
                         args.video_path,
-                        depth_estimator_fn=fov_est.get_depth_points,
+                        # Chemin HAUTE FIDELITE : le sol ne tourne que sur 8
+                        # images et ne doit pas heriter des reglages de vitesse
+                        # du FOV. Voir `get_depth_points_sol`.
+                        depth_estimator_fn=getattr(
+                            fov_est, "get_depth_points_sol",
+                            fov_est.get_depth_points),
                         person_bbox_fn=_bbox_fn,
                         n_samples=n_samples,
                     )

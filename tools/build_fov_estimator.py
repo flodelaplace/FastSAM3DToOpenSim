@@ -124,6 +124,50 @@ class FOVEstimator:
                                         fixed_size=self.fixed_size,
                                         resolution_level=self.resolution_level, **kwargs)
 
+    def get_depth_points_sol(self, img):
+        """Nuage de points HAUTE FIDELITE, reserve a l'estimation du SOL.
+
+        POURQUOI UN SECOND CHEMIN. Le FOV et le sol ont des besoins opposes :
+        le FOV tourne a CHAQUE image et doit etre rapide ; le sol ne tourne que
+        sur 8 images de tout l'essai et doit etre juste. Les deux passaient par
+        le meme reglage — TensorRT, entree forcee a 512 px, resolution_level 0 —
+        et le sol en heritait alors qu'il n'a aucun besoin de vitesse.
+
+        CE QUE CA COUTAIT, mesure le 2026-09-09 sur `titia_cycling_insitu` :
+            niveau 0, 512 px : roulis MoGe de -0,2 a -20,7 deg selon l'image,
+                               desaccord avec GeoCalib jusqu'a 18,1 deg,
+                               2 images-cles sur 8 survivant au consensus.
+            pleine resolution : roulis de -1,3 a +1,0 deg, ecart-type du pitch
+                               0,47 deg, desaccord ramene sous 8 deg,
+                               6 images-cles sur 8 retenues.
+        Ajuster un plan de sol sur une carte de profondeur de niveau 0 ne
+        marche pas. C'est la cause des refus du repere monde depuis le 2026-09-08.
+
+        CE QUE CA COUTE. 0,6 s de plus pour les 8 images (4,42 -> 5,01 s).
+        Couper TensorRT PARTOUT aurait en revanche fait tomber l'inference de
+        7,63 a 5,50 images/s, soit une minute sur une video de mille images :
+        d'ou ce second chemin plutot qu'un reglage global.
+
+        Le modele haute fidelite est charge PARESSEUSEMENT, a la premiere
+        demande : une video qui n'estime pas de sol ne le paie pas.
+        """
+        est = getattr(self, "_estimateur_sol", None)
+        if est is None:
+            print("  [FOV sol] chargement du modele pleine resolution "
+                  "(TensorRT desactive, resolution_level 9)")
+            est = load_moge(self.device,
+                            path=MOGE_MODELS.get(self.model_size, MOGE_MODELS["l"]),
+                            use_trt=False)
+            est.eval()
+            self._estimateur_sol = est
+        _, points, mask = self.fov_estimator_func(
+            est, img, self.device,
+            fixed_size=0,            # pas de redimensionnement
+            resolution_level=9,      # le reglage de Mesh2Sim
+            return_points=True,
+        )
+        return points, mask
+
     def get_depth_points(self, img):
         """
         Run MoGe on img and return the 3D point cloud in camera space.
