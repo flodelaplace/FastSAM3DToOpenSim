@@ -528,7 +528,25 @@ def stable_floor_transform(
         work[:, :, 1] -= (sf.drift_m_per_s / fps * (tt - sf.t0_frame))[:, None]
 
     # 2b. correction conditionnee a l'appui, sur le resultat de 2a
+    #
+    # ⚠️ ORDRE CORRIGE le 2026-09-09. Le mode appui ramene chaque appui a
+    # y = 0 ABSOLU. Calcule sur des donnees brutes -- pieds a -0,9 m sur un
+    # squat -- sa correction contenait TOUT l'offset global : 96 cm, soit 89,5
+    # d'offset + 7 de flottement, et le garde-fou de 30 cm le refusait a tort.
+    # Meme cause sur le sprint (30,9 cm) et une course in situ (82,5 cm) : le
+    # mode appui etait refuse sur TOUS les modules, et le corps flottait de
+    # quelques centimetres partout ou les pieds bougent au long de l'essai.
+    # On retranche donc d'abord un offset provisoire (meme centile que l'offset
+    # final), l'amplitude ne reflete plus que le flottement reel, et l'offset
+    # provisoire est reintegre a l'etape 3. Tout reste lineaire, donc le rejeu
+    # sur le mesh est inchange.
+    _off0 = 0.0
     if correct_drift and "stance" in drift_model:
+        _y_all = work[:, :, 1].reshape(-1)
+        _y_all = _y_all[np.isfinite(_y_all)]
+        _off0 = float(np.percentile(_y_all, floor_percentile)) if _y_all.size else 0.0
+        work = work.copy()
+        work[:, :, 1] -= _off0
         # Plusieurs passes : la detection de contact et la correction du sol se
         # conditionnent l'une l'autre. Mesure sur `outputs/SMOKE_FINAL`, la
         # couverture d'appui passe de 8 % a la premiere passe a ~25 % a la
@@ -593,10 +611,10 @@ def stable_floor_transform(
             sf.drift_applied = True
             work = probe
 
-    # --- 3. offset constant
+    # --- 3. offset constant (l'offset provisoire du mode appui y est reintegre)
     y = work[:, :, 1].reshape(-1)
     y = y[np.isfinite(y)]
-    sf.offset_m = float(np.percentile(y, floor_percentile)) if y.size else 0.0
+    sf.offset_m = _off0 + (float(np.percentile(y, floor_percentile)) if y.size else 0.0)
     return sf
 
 
