@@ -2212,6 +2212,13 @@ def anti_foot_skate_markers(
     anchor_hold_s: float = 0.0,
     shift_lowpass_hz: float = 2.0,
     max_shift_m: float = 0.0,
+    continuous_contact: bool = False,
+    contact_loss: str = "anchor",
+    var_smooth: float = 3.0,
+    var_prior: float = 0.02,
+    settle_s: float = 0.12,
+    max_settle_m: float = 0.12,
+    ramp_s: float = 0.04,
     planted_speed_ms: float = 5.0,
     walk_min_travel_m: float = 0.40,
     stance_band_fraction: float = 0.35,
@@ -2507,6 +2514,187 @@ def anti_foot_skate_markers(
     # (`foot + shift` à l'instant de la pose) : sans cela, chaque nouveau pas
     # exigerait d'annuler tout le décalage accumulé et rappellerait le corps en
     # arrière. Le pied qui décolle libère son ancre, donc la marche progresse.
+    # ── COUVERTURE CONTINUE (MARCHE UNIQUEMENT) ──────────────────────────
+    # Portage de `M2S:contact_optim.py:ensure_continuous_coverage`. En marche il
+    # y a TOUJOURS un pied au sol — simple appui alternant avec double appui —
+    # donc une image sans contact detecte est un RATE DE DETECTION, pas un vol.
+    # Leur mesure sur P06 cam00 : couverture de 80 % seulement, et dans chaque
+    # trou un pied etait demontrablement au sol et glissait de 57 a 386 mm,
+    # faute d'ancre. La notre sur `outputs/GAIT_COULOIR` : 90 % de couverture,
+    # cinq trous dont un de 0,40 s, et le pied droit glissait de 26 a 74 cm.
+    #
+    # ⚠️ MARCHE SEULEMENT. En course, au sprint, au saut et au hop unipodal le
+    # vol est REEL : forcer la couverture y transformerait chaque envol en
+    # appui. C'est aussi pourquoi Mesh2Sim ne l'active que sur les points
+    # PLANTAIRES (`fill_contact_gaps or use_sole`) : avec des marqueurs cutanes,
+    # 4 cm au-dessus de la semelle, elle degrade (2,16 -> 2,44 cMAE chez eux).
+    # Nous avons les points SOLE, la condition est remplie.
+    if continuous_contact and len(contact) > 1:
+        _cov = np.zeros(T, dtype=bool)
+        for _c in contact.values():
+            _cov |= _c
+        if not _cov.all():
+            _bas = {sd: np.nanmin(result[:, side_markers[sd], 1], axis=1)
+                    for sd in contact}
+            _min_gap = 3
+            _i = 0
+            while _i < T:
+                if _cov[_i]:
+                    _i += 1
+                    continue
+                _j = _i
+                while _j < T and not _cov[_j]:
+                    _j += 1
+                if _j - _i >= _min_gap:
+                    # Un seul proprietaire pour tout le trou — le pied le plus
+                    # bas en moyenne, celui qui porte la charge. Choisir image
+                    # par image ferait battre l'ancre d'un pied a l'autre.
+                    _own = min(contact, key=lambda sd: float(
+                        np.nanmean(_bas[sd][_i:_j])))
+                    contact[_own][_i:_j] = True
+                _i = _j
+
+    # ── ANCRE A L'ATTERRISSAGE, PUIS POSE PROGRESSIVE ────────────────────
+    # Portage de `M2S:contact_optim.py:refine_contacts`, deux idees distinctes.
+    #
+    # 1. L'ancre est la ou le pied ATTERRIT : la mediane des premieres images de
+    #    l'appui, pas la position instantanee de la premiere image. Celle-ci
+    #    porte tout le bruit de l'impact, et l'ancre en herite pour toute la
+    #    phase.
+    # 2. L'ANCRE N'EST PAS CONSTANTE : UN PIED QUI SE POSE N'EST PAS UN PIED
+    #    ARRETE. Mesure de Mesh2Sim sur le gold BioCV P03, appuis definis par
+    #    les PLATEFORMES donc sans seuil : apres le contact le talon avance
+    #    ENCORE de 4,4 cm et l'orteil de 8,6 a 9,1 cm, progressivement sur 100 a
+    #    150 ms, puis s'arrete. Une ancre figee des la premiere image ecrase ce
+    #    deplacement reel et produit la pose saccadee. La cible glisse donc de
+    #    la position d'entree vers la position stabilisee suivant un quart de
+    #    sinusoide sur `settle_s` — forme verifiee chez eux : sin(pi/2 u) predit
+    #    0,32/0,61/0,83/0,97 a 25/50/75/100 ms contre 0,23/0,61/0,80/0,91
+    #    observes — puis tient. Le verrouillage de mi-appui, le vrai
+    #    anti-patinage, est INCHANGE.
+    #
+    # La pose est FORCEMENT VERS L'AVANT et bornee a `max_settle_m` : sur des
+    # donnees monoculaires bruitees le deplacement des 120 ms suivant le contact
+    # peut sortir negatif, ce qui ferait RECULER un pied pose — physiquement
+    # impossible, et pire que de le figer. Le lateral et le vertical sont
+    # ecartes : Mesh2Sim a mesure deux fois que suivre le lateral degrade
+    # l'adduction de hanche (r 0,93 -> 0,70 sur P06), la hanche etant le seul
+    # degre de liberte capable d'absorber une contrainte laterale au pied.
+    _phases: dict[str, list[tuple[int, int]]] = {}
+    _anc_raw: dict[str, np.ndarray] = {}
+    _poids: dict[str, np.ndarray] = {}
+    _ns = max(1, int(round(settle_s * fps)))
+    _nr = max(1, int(round(ramp_s * fps)))
+    _rampe = 0.5 * (1.0 - np.cos(np.linspace(0.0, np.pi, _nr + 2)[1:-1]))
+    for side in contact:
+        _ph, _k0 = [], 0
+        while _k0 < T:
+            if contact[side][_k0]:
+                _k1 = _k0
+                while _k1 < T and contact[side][_k1]:
+                    _k1 += 1
+                _ph.append((_k0, _k1)); _k0 = _k1
+            else:
+                _k0 += 1
+        _phases[side] = _ph
+        _a = np.zeros((T, 2), dtype=np.float64)
+        _w = np.zeros(T, dtype=np.float64)
+        xz_s = foot_xz[side]
+        for (a_, b_) in _ph:
+            _kk = int(np.clip(int(0.15 * (b_ - a_)), 3, 10))
+            _entree = np.nanmedian(xz_s[a_:min(b_, a_ + _kk)], axis=0)
+            _a[a_:b_] = _entree
+            if walk_axis is not None and not en_place and b_ - a_ > _ns + 2:
+                _s1 = min(T, a_ + _ns + _kk)
+                _pose = np.nanmedian(xz_s[max(a_ + _ns, _s1 - _kk):_s1], axis=0)
+                _av = float(np.dot(_pose - _entree, walk_axis))
+                _av = float(np.clip(_av, 0.0, max_settle_m * _unit))
+                _u = np.clip((np.arange(a_, b_) - a_) / float(_ns), 0.0, 1.0)
+                _a[a_:b_] = (_entree[None, :]
+                             + np.sin(_u * (np.pi / 2))[:, None]
+                             * (_av * walk_axis)[None, :])
+            # Rampe en cosinus sureleve aux deux bouts : sans elle le serrage
+            # s'etablit d'un coup et laisse un « tac » dans la trajectoire.
+            _w[a_:b_] = 1.0
+            _n = min(_nr, (b_ - a_) // 2)
+            if _n > 0:
+                _w[a_:a_ + _n] = _rampe[:_n]
+                _w[b_ - _n:b_] = _rampe[:_n][::-1]
+        _anc_raw[side] = _a
+        _poids[side] = _w
+
+    # ── VARIANCE D'APPUI, SANS ANCRE ─────────────────────────────────────
+    # Formulation que Mesh2Sim teste actuellement (`contact_loss="variance"`,
+    # venue d'OpenCap-Monocular), et dont leur note dit l'essentiel : « l'ancre
+    # dit au pied OU se poser : elle est derivee de la pose d'entree, donc elle
+    # porte deja notre erreur et tire le pied vers elle. La variance ne demande
+    # que l'IMMOBILITE pendant l'appui — ce que le monoculaire observe bien — et
+    # laisse le solveur choisir la position. »
+    #
+    # C'etait exactement notre defaut : mesure sur `outputs/GAIT_COULOIR`, la
+    # derive de mi-appui du pied droit passait de 10,1 a 16,5 cm APRES
+    # correction, l'ancre issue d'un atterrissage bruite tirant le pied vers un
+    # mauvais endroit.
+    #
+    # Chez eux la variance est un terme de perte dans une optimisation
+    # differentiable de la pose et de la racine. Chez nous la correction est un
+    # DECALAGE GLOBAL RIGIDE s(t), donc le meme critere se resout en FORME
+    # CLOSE, sans solveur ni gradient. On minimise
+    #
+    #     Somme_appuis (1/W) Somme_t w_t || x_t + s_t - moyenne_appui ||^2
+    #   + lambda Somme_t || s_t - 2 s_{t-1} + s_{t-2} ||^2
+    #   + mu     Somme_t || s_t ||^2
+    #
+    # Le premier terme est la variance ponderee de la position du pied pendant
+    # chaque appui, normalisee par appui pour qu'un appui long ne pese pas plus
+    # qu'un appui court — leur choix, repris tel quel. Le deuxieme est le terme
+    # de continuite temporelle qu'ils decrivent comme « celui qui manquait » :
+    # sans lui une pose sautillante passe telle quelle. Le troisieme retient la
+    # correction pres de zero, pour ne pas reconstruire la trajectoire depuis
+    # les pieds — ce que fait Mesh2Sim mais qui entrerait ici en conflit avec
+    # `cam_t`.
+    #
+    # La moyenne d'appui s'elimine analytiquement, le probleme devient
+    # quadratique en s et separable par axe :
+    #     (A + lambda L^T L + mu I) s = -A x
+    # avec A = Somme_appuis (1/W)(diag(w) - w w^T / W), semi-definie positive.
+    if contact_loss == "variance":
+        def _resoudre(axe: int) -> np.ndarray:
+            A = np.zeros((T, T), dtype=np.float64)
+            b = np.zeros(T, dtype=np.float64)
+            for side in contact:
+                x = foot_xz[side][:, axe]
+                for (a_, b_) in _phases[side]:
+                    w = _poids[side][a_:b_].copy()
+                    ok = np.isfinite(x[a_:b_])
+                    w[~ok] = 0.0
+                    W = float(w.sum())
+                    if W < 2.0:
+                        continue
+                    idx = np.arange(a_, b_)
+                    A[np.ix_(idx, idx)] += (np.diag(w) - np.outer(w, w) / W) / W
+                    xv = np.nan_to_num(x[a_:b_])
+                    b[idx] += ((np.diag(w) - np.outer(w, w) / W) / W) @ xv
+            if not np.any(A):
+                return np.zeros(T)
+            # Second difference (acceleration de la correction).
+            L = (np.eye(T, k=0) - 2 * np.eye(T, k=1) + np.eye(T, k=2))[:max(T - 2, 0)]
+            M = A + var_smooth * (L.T @ L) + var_prior * np.eye(T)
+            try:
+                return np.linalg.solve(M, -b)
+            except np.linalg.LinAlgError:      # pragma: no cover
+                return np.zeros(T)
+
+        shifts = np.column_stack([_resoudre(0), _resoudre(1)])
+        if max_shift_m > 0:
+            _n = np.linalg.norm(shifts, axis=1)
+            _tf = np.where(_n > max_shift_m * _unit,
+                           (max_shift_m * _unit) / np.maximum(_n, 1e-9), 1.0)
+            shifts = shifts * _tf[:, None]
+        result[:, :, 0] += shifts[:, 0][:, None]
+        result[:, :, 2] += shifts[:, 1][:, None]
+        return result, shifts / _unit
+
     shifts = np.zeros((T, 2), dtype=np.float64)
     # Plafond exprimé en VITESSE (donc indépendant du fps). Volontairement
     # serré : notre déplacement global vient de `cam_t`, et une correction
@@ -2521,27 +2709,44 @@ def anti_foot_skate_markers(
     off: dict[str, int] = {s: 0 for s in contact}
     hold = int(round(anchor_hold_s * fps))
 
+    # Decalage fige a l'entree de chaque phase : l'ancre pre-calculee est en
+    # coordonnees BRUTES, on lui ajoute le decalage courant au moment de la pose
+    # pour que chaque nouveau pas reparte du corps deja corrige.
+    _off_phase: dict[str, np.ndarray] = {s: np.zeros(2) for s in contact}
+    _phase_en_cours: dict[str, int] = {s: -1 for s in contact}
     for t in range(T):
-        needed = []
+        needed, poids = [], []
         for side in contact:
             xz = foot_xz[side][t]
             if not (contact[side][t] and np.all(np.isfinite(xz))):
                 off[side] += 1
                 if off[side] > hold:
                     anchors[side] = None  # pied en vol → l'ancre expire
+                    _phase_en_cours[side] = -1
                 continue
             off[side] = 0
-            if anchors[side] is None:     # pose : ancre = position corrigée
-                anchors[side] = xz + shifts[t - 1] if t > 0 else xz.copy()
+            _pid = next((k for k, (a_, b_) in enumerate(_phases[side])
+                         if a_ <= t < b_), -1)
+            if _pid != _phase_en_cours[side]:
+                _phase_en_cours[side] = _pid
+                _off_phase[side] = (shifts[t - 1].copy() if t > 0
+                                    else np.zeros(2))
+            anchors[side] = _anc_raw[side][t] + _off_phase[side]
+            _w = float(_poids[side][t])
+            if _w <= 0.0:
+                continue
             needed.append(anchors[side] - xz)
+            poids.append(_w)
 
         if not needed:
             shifts[t] = shifts[t - 1] if t > 0 else 0.0
             continue
 
-        # Double appui : moyenne des deux consignes. Suivre un seul pied ferait
-        # basculer le corps à chaque transition d'appui.
-        target = np.mean(np.stack(needed), axis=0)
+        # Double appui : moyenne PONDEREE par la rampe. Suivre un seul pied
+        # ferait basculer le corps à chaque transition d'appui ; la rampe fait
+        # passer le relais progressivement de l'un à l'autre.
+        _pw = np.asarray(poids, dtype=np.float64)
+        target = (np.stack(needed) * _pw[:, None]).sum(axis=0) / _pw.sum()
         step = target - (shifts[t - 1] if t > 0 else 0.0)
         # Un pied en appui ne glisse pas vite : au-delà, c'est de la gigue
         # d'inférence, et la compenser d'un coup projetterait le corps de côté.
@@ -2607,6 +2812,94 @@ def anti_foot_skate_markers(
     # shifts retournés en MÈTRES (pour appliquer le même décalage au mesh GLB,
     # qui est en mètres), quelle que soit l'unité de markers_array.
     return result, shifts / _unit
+
+def lisser_trajectoire_rigide(
+    markers_array: np.ndarray,
+    marker_names: list,
+    fps: float = 30.0,
+    cutoff_hz: float = 2.5,
+    max_shift_m: float = 0.60,
+):
+    """Retire les SAUTS de la trajectoire globale, par translation rigide.
+
+    Constat qui a motive cet etage, mesure sur `outputs/GAIT_COULOIR` (marche en
+    couloir, camera fixe, 2026-09-09) :
+
+      * le bassin saute de **19 cm en une image** a t = 1,03 s, soit 11,2 m/s,
+        et 41 images sur 344 depassent 4 m/s alors que la marche se fait a
+        1,2 m/s ;
+      * **aucun pied ne reste immobile plus de 0,28 s**, quand un appui de
+        marche en dure 0,6 a 0,7.
+
+    Autrement dit il n'y a, sur cette video, aucun appui identifiable a
+    verrouiller : l'anti-glissement n'a rien de solide sur quoi s'appuyer, et
+    aucun reglage de seuil ne le lui donnera. Le goulot est la trajectoire
+    globale issue de `cam_t`, pas l'etage de contact.
+
+    D'ou cet etage volontairement simple, et deliberement en amont : on lisse la
+    trajectoire du bassin a ``cutoff_hz`` sans phase, et on applique l'ecart
+    comme une TRANSLATION RIGIDE de tout le corps. Deux proprietes en decoulent,
+    qui sont la raison de ce choix :
+
+      * **aucun angle articulaire ne peut changer** — une translation rigide ne
+        modifie aucune distance ni aucun angle interne. Le risque de degrader
+        la biomecanique est nul par construction, ce qui n'est pas le cas d'un
+        verrouillage de pied ;
+      * la vitesse moyenne de progression est conservee (un filtre passe-bas
+        garde la composante continue), donc la longueur de foulee et la vitesse
+        restent celles qui sont mesurees.
+
+    2,5 Hz laisse passer la cadence de pas (environ 2 Hz) et l'oscillation
+    avant-arriere du bassin, tout en coupant les sauts. Mesure :
+
+        essai            vitesse max du bassin      derive de mi-appui G / D
+        GAIT_COULOIR     11,17 -> 6,92 m/s          11,1 -> 8,6  /  10,1 -> 10,0 cm
+        REG_run          14,25 -> 8,38 m/s           9,4 -> 9,7  /  40,2 -> 21,6 cm
+        SPRINT (valide)   6,67 -> 5,88 m/s           6,0 -> 5,0  /   1,7 ->  2,0 cm
+        REG_hop           5,39 -> 3,66 m/s          14,5 -> 12,5 /  79,8 -> 74,7 cm
+
+    Le deplacement net est conserve au centimetre sur les quatre.
+
+    Returns:
+        (markers_corriges, shifts) — shifts en METRES, (T, 2) en XZ, a rejouer
+        tel quel sur le mesh comme les decalages de l'anti-glissement.
+    """
+    if markers_array is None or markers_array.ndim != 3 or markers_array.shape[0] < 20:
+        return markers_array, None
+    T = markers_array.shape[0]
+    _unit = 1000.0 if np.nanmax(np.abs(markers_array)) > 50.0 else 1.0
+    name_to_idx = {n: i for i, n in enumerate(marker_names)}
+    pel = [name_to_idx[m] for m in ("RASI", "LASI", "RPSI", "LPSI")
+           if m in name_to_idx]
+    if not pel:
+        return markers_array, None
+    p = np.nanmean(markers_array[:, pel, :][:, :, [0, 2]], axis=1)  # (T, 2)
+    ok = np.all(np.isfinite(p), axis=1)
+    if ok.sum() < 10:
+        return markers_array, None
+    idx = np.arange(T, dtype=np.float64)
+    p = np.column_stack([np.interp(idx, idx[ok], p[ok, j]) for j in range(2)])
+    if not (0 < cutoff_hz < 0.5 * fps):
+        return markers_array, None
+    try:
+        from scipy.signal import butter, sosfiltfilt
+        sos = butter(2, cutoff_hz / (0.5 * fps), btype="low", output="sos")
+        q = sosfiltfilt(sos, p, axis=0)
+    except ImportError:                                    # pragma: no cover
+        return markers_array, None
+    shifts = q - p
+    # Garde-fou : au-dela, ce n'est plus un saut a lisser mais un changement de
+    # sujet ou une perte de suivi, et translater le corps d'autant serait pire
+    # que de ne rien faire.
+    n = np.linalg.norm(shifts, axis=1)
+    lim = max_shift_m * _unit
+    if np.any(n > lim):
+        shifts = shifts * np.where(n > lim, lim / np.maximum(n, 1e-9), 1.0)[:, None]
+    out = markers_array.copy()
+    out[:, :, 0] += shifts[:, 0][:, None]
+    out[:, :, 2] += shifts[:, 1][:, None]
+    return out, shifts / _unit
+
 
 def lateral_root_shift(
     markers_array: np.ndarray,

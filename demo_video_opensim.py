@@ -1811,6 +1811,7 @@ def main(args, estimator=None, visualizer=None):
     # il ne doit pas déraper. Désactivable via --no_anti_foot_skate.
     _antiskate_shifts = None
     _lateral_shifts = None
+    _traj_shifts = None
     # Articulations de main : SAM3D les fournit nommees (4 par doigt), la ou le
     # markerset ne portait que des points de PEAU — et, pour le majeur et
     # l'annulaire, des positions INTERPOLEES (23,5 mm d'ecart mesure). On les
@@ -1863,13 +1864,55 @@ def main(args, estimator=None, visualizer=None):
     # 21,9/19,6 cm en mode locomotion, 3,7/4,3 en mode en place.
     _en_place = args.module in ("d3.squat", "d3.sit_to_stand",
                                 "d3.single_leg_squat", "d3.jump")
+    # LISSAGE RIGIDE DE LA TRAJECTOIRE, en amont de l'anti-glissement.
+    # Sur `outputs/GAIT_COULOIR` le bassin saute de 19 cm en une image et aucun
+    # pied ne reste immobile plus de 0,28 s : il n'y a pas d'appui a verrouiller,
+    # le goulot est la trajectoire globale. Cet etage la lisse a 2,5 Hz par
+    # TRANSLATION RIGIDE — donc sans pouvoir modifier le moindre angle — et
+    # laisse ensuite l'anti-glissement travailler sur une trajectoire propre.
+    # Reserve aux gestes ou le corps PROGRESSE : sur un geste en place il n'y a
+    # pas de trajectoire a lisser et il se battrait avec le mode en place.
+    _traj_lisse = args.module in ("d3.gait", "d3.running", "d3.sprint_start",
+                                  "d3.single_leg_hop")
+    if _traj_lisse and marker_names is not None and not args.no_traj_smooth:
+        from sam_3d_body.export.coordinate_transform import lisser_trajectoire_rigide
+        markers_array, _traj_shifts = lisser_trajectoire_rigide(
+            markers_array, marker_names, fps=out_fps)
+        if _traj_shifts is not None:
+            import numpy as _np_ts
+            print("  [trajectoire] lissage rigide 2,5 Hz : correction max "
+                  f"{float(_np_ts.max(_np_ts.linalg.norm(_traj_shifts, axis=1)))*100:.1f} cm "
+                  "(translation, aucun angle modifie). --no_traj_smooth pour couper.")
     if _anti_skate_on and marker_names is not None:
         from sam_3d_body.export.coordinate_transform import anti_foot_skate_markers
+        # MARCHE : formulation VARIANCE, sans ancre (Mesh2Sim, en test chez eux,
+        # venue d'OpenCap-Monocular). Leur raison, verifiee chez nous : l'ancre
+        # dit au pied OU se poser, elle est derivee de la pose d'entree, donc
+        # elle porte deja notre erreur et tire le pied vers elle. La variance ne
+        # demande que l'IMMOBILITE pendant l'appui et laisse le solveur choisir
+        # la position. Avec la couverture continue, qui pose qu'en marche il y a
+        # toujours un pied au sol — vrai en marche seulement, le vol est reel en
+        # course, au sprint et au hop.
+        # ⚠️ PAS PAR DEFAUT — essaye et mesure le 2026-09-09 sur
+        # `outputs/GAIT_VAR` : la variance GONFLE le deplacement de 6,99 a
+        # 8,79 m, soit 26 %. Sans ancre, plus rien ne retient la correction pres
+        # de zero et elle reconstruit la trajectoire depuis les pieds — ce que
+        # Mesh2Sim fait, mais qui entre ici en conflit direct avec `cam_t` et
+        # fausserait vitesse et longueur de foulee. Le terme de rappel
+        # (`var_prior`) le borne, mais le regler assez fort pour proteger le
+        # deplacement lui retire l'essentiel de son avantage. A reprendre si
+        # l'on decide un jour de deriver la progression des pieds plutot que de
+        # la camera. `--anti_skate_variance` pour l'essayer.
+        _variance = bool(getattr(args, "anti_skate_variance", False))
         markers_array, _antiskate_shifts = anti_foot_skate_markers(
-            markers_array, marker_names, fps=out_fps, en_place=_en_place)
+            markers_array, marker_names, fps=out_fps, en_place=_en_place,
+            contact_loss="variance" if _variance else "anchor",
+            continuous_contact=_variance)
         print("  [anti-glissement] decalage global XZ applique au TRC final"
-              + (" (seuils GESTE EN PLACE : ancre tenue 0,60 s, correction "
-                 "suivie jusqu'a 8 Hz)" if _en_place else " (seuils locomotion)"))
+              + (" (VARIANCE d'appui, sans ancre, + couverture continue)"
+                 if _variance else
+                 (" (seuils GESTE EN PLACE : ancre tenue 0,60 s, correction "
+                  "suivie jusqu'a 8 Hz)" if _en_place else " (seuils locomotion)")))
 
     # ── --feet_anchor : shift global per-frame pour que le midpoint des
     # pieds reste à sa position médiane sur toute la vidéo. Translate tout
@@ -2606,11 +2649,16 @@ def main(args, estimator=None, visualizer=None):
         # Anti-skate : applique le MÊME shift XZ (en mètres) au mesh GLB pour
         # qu'il suive le TRC anti-slidé (sinon le mesh dérape alors que le
         # squelette est ancré).
-        if _antiskate_shifts is not None:
+        # Le lissage de trajectoire est, comme l'anti-glissement, une
+        # translation rigide par image : le mesh doit recevoir exactement la
+        # meme, sinon il derape alors que le squelette est propre.
+        for _sh_xz in (_traj_shifts, _antiskate_shifts):
+            if _sh_xz is None:
+                continue
             for i in range(len(verts_world)):
-                if i >= len(_antiskate_shifts):
+                if i >= len(_sh_xz):
                     break
-                sx, sz = float(_antiskate_shifts[i][0]), float(_antiskate_shifts[i][1])
+                sx, sz = float(_sh_xz[i][0]), float(_sh_xz[i][1])
                 if verts_world[i] is not None:
                     verts_world[i][:, 0] += sx
                     verts_world[i][:, 2] += sz
@@ -2928,6 +2976,20 @@ def build_parser():
                              "soutenu (squat → bassin descend) mais préserve la phase de vol "
                              "(course/saut). Unifie et remplace --floor/défaut. Recommandé pour "
                              "avatars + mouvements libres. (Opt-in en cours de validation.)")
+    parser.add_argument("--anti_skate_variance", action="store_true",
+                        help="Anti-glissement par VARIANCE d'appui au lieu d'une "
+                             "ancre (formulation Mesh2Sim/OpenCap-Monocular). "
+                             "Experimental : ne demande que l'immobilite du pied "
+                             "pendant l'appui, mais gonfle le deplacement net "
+                             "quand le rappel est faible (mesure : +26 % sur une "
+                             "marche en couloir).")
+    parser.add_argument("--no_traj_smooth", action="store_true",
+                        help="Coupe le lissage rigide de la trajectoire globale "
+                             "(actif par defaut sur marche, course, depart de "
+                             "sprint et hop). Cet etage retire les sauts de "
+                             "cam_t par TRANSLATION rigide : il ne peut modifier "
+                             "aucun angle articulaire, et conserve le deplacement "
+                             "net et la vitesse moyenne.")
     parser.add_argument("--handheld", action="store_true",
                         help="La CAMERA SUIT le sujet (portee a la main, embarquee). "
                              "Distinct de --stationary, qui dit que le SUJET est en "
