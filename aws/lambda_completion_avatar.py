@@ -1,6 +1,6 @@
 """
 Lambda triggered by EventBridge on AWS Batch job state changes (SUCCEEDED/FAILED)
-for the synkro-fastsam3d-avatar-job (queue: synkro-fastsam3d-queue, filtered by
+for the synkro-shared-video-avatar-job (queue: synkro-shared-video-sam3d-bulk-queue, filtered by
 job name prefix 'avatar-').
 
 Publishes a SNS notification with:
@@ -17,7 +17,7 @@ import os
 import boto3
 
 SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
-S3_OUTPUT_BUCKET = os.environ.get("S3_OUTPUT_BUCKET", "data-synchro-video")
+S3_OUTPUT_BUCKET = os.environ.get("S3_OUTPUT_BUCKET", "synkro-shared-video")
 S3_OUTPUT_PREFIX = os.environ.get("S3_OUTPUT_PREFIX", "02-output-avatar")
 
 # g4dn.xlarge Spot eu-west-3 — approximate.

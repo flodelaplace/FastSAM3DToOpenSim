@@ -121,9 +121,9 @@ conda activate fast_sam_3d_body
 #
 # ⚠️ If you rebuild the Docker image with a different TensorRT version, purge
 # the cached engines on S3 first:
-#   aws s3 rm s3://data-synchro-video/checkpoints/yolo/yolo11m-pose.engine
-#   aws s3 rm s3://data-synchro-video/checkpoints/moge_trt/ --recursive --exclude "*" --include "*.engine"
-#   aws s3 rm s3://data-synchro-video/checkpoints/sam-3d-body-dinov3/backbone_trt/ --recursive
+#   aws s3 rm s3://synkro-shared-video/checkpoints/yolo/yolo11m-pose.engine
+#   aws s3 rm s3://synkro-shared-video/checkpoints/moge_trt/ --recursive --exclude "*" --include "*.engine"
+#   aws s3 rm s3://synkro-shared-video/checkpoints/sam-3d-body-dinov3/backbone_trt/ --recursive
 cd /app
 if [ ! -f "checkpoints/yolo/yolo11m-pose.engine" ]; then
     echo ">>> Building YOLO TRT engine..."

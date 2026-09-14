@@ -140,7 +140,7 @@ def _prevenir(job, dossier_sortie, duree, faits=0, erreur=None):
     if erreur:
         l += ["", f"Erreur        : {erreur}", "",
               "Le message reste en file : SQS le représentera. Après trois",
-              "tentatives il partira en file d'échec (synkro-fastsam3d-dlq)."]
+              "tentatives il partira en file d'échec (synkro-shared-video-sam3d-dlq)."]
     else:
         l += ["", "─── Temps ───",
               f"Traitement    : {_duree(duree)}",

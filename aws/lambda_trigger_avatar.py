@@ -1,7 +1,7 @@
 """
 Lambda function that triggers an AWS Batch AVATAR job when a video lands in S3.
 
-Triggered by S3 event on s3://data-synchro-video/01-input-avatar/<user>/<exercise>__<meta>.<ext>.
+Triggered by S3 event on s3://synkro-shared-video/01-input-avatar/<user>/<exercise>__<meta>.<ext>.
 
 S3 key convention (strict):
     01-input-avatar/<user_id>/<exercise_id>__<meta_tokens>.<ext>
@@ -50,10 +50,10 @@ try:
 except ImportError:
     boto3 = None  # local unit tests
 
-JOB_QUEUE = os.environ.get("JOB_QUEUE", "synkro-fastsam3d-queue")
-JOB_DEFINITION = os.environ.get("JOB_DEFINITION", "synkro-fastsam3d-avatar-job")
+JOB_QUEUE = os.environ.get("JOB_QUEUE", "synkro-shared-video-sam3d-bulk-queue")
+JOB_DEFINITION = os.environ.get("JOB_DEFINITION", "synkro-shared-video-avatar-job")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
-S3_OUTPUT_BUCKET = os.environ.get("S3_OUTPUT_BUCKET", "data-synchro-video")
+S3_OUTPUT_BUCKET = os.environ.get("S3_OUTPUT_BUCKET", "synkro-shared-video")
 # Le segment `private/` est structurant, pas decoratif : tout ce que le pipeline
 # genere appartient au compte du kine et n'est visible que de lui. La banque
 # communautaire vit sous `02-output-avatar/public/`, ou l'on ne PROMEUT que par

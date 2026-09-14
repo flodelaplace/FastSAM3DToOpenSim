@@ -1,7 +1,7 @@
 """
 Lambda function that triggers an AWS Batch job when a video lands in S3.
 
-Triggered by S3 event on s3://data-synchro-video/01-input-SAM3D/*.
+Triggered by S3 event on s3://synkro-shared-video/01-input-SAM3D/*.
 
 Filename convention (strict — files not matching are rejected):
 
@@ -75,14 +75,14 @@ try:
 except ImportError:
     boto3 = None  # Allow local unit tests without boto3
 
-JOB_QUEUE = os.environ.get("JOB_QUEUE", "synkro-fastsam3d-queue")
-JOB_DEFINITION = os.environ.get("JOB_DEFINITION", "synkro-fastsam3d-job")
+JOB_QUEUE = os.environ.get("JOB_QUEUE", "synkro-shared-video-sam3d-queue")
+JOB_DEFINITION = os.environ.get("JOB_DEFINITION", "synkro-shared-video-sam3d-job")
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 
 # --- Aiguillage interactif / bulk -------------------------------------------
 # Le GPU principal est reserve aux analyses a l'unite (un kine qui attend son
 # resultat). Les gros lots partent sur un second GPU pour ne pas le monopoliser.
-BULK_JOB_QUEUE = os.environ.get("BULK_JOB_QUEUE", "synkro-fastsam3d-bulk-queue")
+BULK_JOB_QUEUE = os.environ.get("BULK_JOB_QUEUE", "synkro-shared-video-sam3d-bulk-queue")
 # Un segment de cle S3 egal a ce mot suffit a router : 01-input-SAM3D/bulk/x.mp4
 BULK_PREFIX_MARKER = os.environ.get("BULK_PREFIX_MARKER", "bulk")
 # Filet de securite : au-dela de ce nombre de jobs deja en attente sur la voie
@@ -95,13 +95,13 @@ BULK_DEPTH_THRESHOLD = int(os.environ.get("BULK_DEPTH_THRESHOLD", "5"))
 USE_WORKER = os.environ.get("USE_WORKER", "0") == "1"
 WORK_QUEUE_URL = os.environ.get("WORK_QUEUE_URL", "")
 WORKER_JOB_DEFINITION = os.environ.get("WORKER_JOB_DEFINITION",
-                                       "synkro-fastsam3d-worker-job")
+                                       "synkro-shared-video-sam3d-worker-job")
 WORKER_NAME_PREFIX = "fastsam-worker"
 # run_job.sh construit lui-meme <S3_OUTPUT_URI>/output_<TS>_<nom>/. Avec le
 # worker il n'y a plus de run_job.sh, donc le Lambda calcule le meme chemin —
 # meme convention, pour que rien ne bouge cote app.
 S3_OUTPUT_URI = os.environ.get("S3_OUTPUT_URI",
-                               "s3://data-synchro-video/02-output-SAM3D/")
+                               "s3://synkro-shared-video/02-output-SAM3D/")
 
 
 def chemin_sortie(raw_name):

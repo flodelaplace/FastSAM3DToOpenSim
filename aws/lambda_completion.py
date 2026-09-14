@@ -1,6 +1,6 @@
 """
 Lambda triggered by EventBridge on AWS Batch job state changes (SUCCEEDED/FAILED)
-for the synkro-fastsam3d-queue.
+for the synkro-shared-video-sam3d-queue.
 
 Publishes a detailed notification via SNS including:
   - timing breakdown (cold start vs container time)
@@ -18,7 +18,7 @@ import boto3
 
 SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 S3_OUTPUT_URI = os.environ.get(
-    "S3_OUTPUT_URI", "s3://data-synchro-video/02-output-SAM3D/"
+    "S3_OUTPUT_URI", "s3://synkro-shared-video/02-output-SAM3D/"
 )
 
 # g4dn.xlarge Spot eu-west-3 — approximate (price varies ±10%).
@@ -57,7 +57,7 @@ def _prevenir_worker_eteint(job_id, job_name, created_at, started_at,
         l.append(f"Cout session  : ~{cout:.4f} $  (g4dn.xlarge Spot eu-west-3)")
     if log_stream:
         l += ["", "─── Logs ───",
-              f"aws logs tail /aws/batch/synkro-fastsam3d "
+              f"aws logs tail /aws/batch/synkro-shared-video-sam3d "
               f"--log-stream-names {log_stream} --region eu-west-3"]
     boto3.client("sns").publish(
         TopicArn=SNS_TOPIC_ARN,
@@ -94,10 +94,10 @@ def _prevenir_worker_en_echec(detail, job_id, job_name, status, status_reason,
     lignes += ["",
                "Les videos non traitees restent dans la file SQS et seront reprises",
                "par le prochain worker. Apres trois tentatives elles partent dans",
-               "synkro-fastsam3d-dlq.", ""]
+               "synkro-shared-video-sam3d-dlq.", ""]
     if log_stream:
         lignes += ["─── Logs ───",
-                   f"aws logs tail /aws/batch/synkro-fastsam3d "
+                   f"aws logs tail /aws/batch/synkro-shared-video-sam3d "
                    f"--log-stream-names {log_stream} --region eu-west-3"]
     boto3.client("sns").publish(
         TopicArn=SNS_TOPIC_ARN,
@@ -369,11 +369,11 @@ def lambda_handler(event, context):
 
     if log_stream:
         lines.append("─── Logs CloudWatch ───")
-        lines.append(f"Group  : /aws/batch/synkro-fastsam3d")
+        lines.append(f"Group  : /aws/batch/synkro-shared-video-sam3d")
         lines.append(f"Stream : {log_stream}")
         lines.append("")
         lines.append(
-            "Voir :  aws logs tail /aws/batch/synkro-fastsam3d "
+            "Voir :  aws logs tail /aws/batch/synkro-shared-video-sam3d "
             f"--log-stream-names {log_stream} --region eu-west-3"
         )
 
