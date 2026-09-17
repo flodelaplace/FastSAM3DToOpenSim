@@ -871,6 +871,70 @@ def export_post_ik_trc(
     return True
 
 
+def _modele_depart_ik(model_path: str, trc_path: str, dest_dir: str) -> str:
+    """Copie du modele dont le bassin PART de la pose de la premiere image.
+
+    L'outil IK d'OpenSim resout la premiere image depuis les valeurs par defaut
+    du modele — bassin face a +X — puis chaque image depuis la precedente. Quand
+    le sujet est vu de dos ou de trois-quarts, la premiere image tombe dans un
+    minimum RETOURNE et l'erreur se propage a tout l'essai.
+    Mesure du 2026-09-17 sur la course de Ced filmee en camera embarquee (sujet
+    a -162 deg a la premiere image) : epaules collees en butee (arm_add = +90),
+    coude a 150, bassin incline de -17 a +36 deg, RMS IK 64,4 mm. Memes TRC et
+    modele, bassin initialise sur la premiere image : RMS 23,3 mm, epaules
+    -24/-14 deg. Les marqueurs d'entree etaient rigides et identiques ; seule la
+    graine de l'optimisation changeait. Les sorties restent dans le meme repere :
+    seules les VALEURS PAR DEFAUT changent, pas la scene.
+
+    Renvoie le modele d'origine si le bassin n'est pas lisible (autre markerset,
+    TRC vide) : on ne perd rien par rapport a avant.
+    """
+    import math
+    import re
+    try:
+        lignes = Path(trc_path).read_text(errors="replace").splitlines()
+        unites = lignes[2].split("\t")[4].strip().lower() if len(lignes) > 2 else "mm"
+        echelle = 0.001 if unites == "mm" else 1.0
+        noms = [c.strip() for c in lignes[3].split("\t")[2:] if c.strip()]
+        idx = {n: i for i, n in enumerate(noms)}
+        cles = ("RASI", "LASI", "RPSI", "LPSI")
+        if not all(k in idx for k in cles):
+            return model_path
+        pose = None
+        for l in lignes[5:]:
+            parts = l.split("\t")
+            if len(parts) < 2 + 3 * len(noms):
+                continue
+            try:
+                pts = {k: np.array([float(parts[2 + 3 * idx[k] + j]) for j in range(3)])
+                       for k in cles}
+            except ValueError:
+                continue
+            if all(np.all(np.isfinite(v)) for v in pts.values()):
+                pose = {k: v * echelle for k, v in pts.items()}
+                break
+        if pose is None:
+            return model_path
+        avant = 0.5 * (pose["RASI"] + pose["LASI"]) - 0.5 * (pose["RPSI"] + pose["LPSI"])
+        cap = math.atan2(-avant[2], avant[0])     # rotation autour de Y, 0 = face a +X
+        centre = 0.25 * sum(pose.values())
+        src = Path(model_path).read_text()
+        for coord, val in (("pelvis_rotation", cap), ("pelvis_tx", centre[0]),
+                           ("pelvis_ty", centre[1]), ("pelvis_tz", centre[2])):
+            src, n = re.subn(
+                r'(<Coordinate name="%s">.*?<default_value>)[^<]*(</default_value>)' % coord,
+                lambda m: m.group(1) + "%.6f" % val + m.group(2), src, count=1, flags=re.S)
+            if n != 1:
+                return model_path
+        dest = os.path.join(dest_dir, "modele_depart_ik.osim")
+        Path(dest).write_text(src)
+        print(f"  [IK] depart du bassin sur la 1re image : cap {math.degrees(cap):+.0f} deg")
+        return dest
+    except Exception as e:                                  # pragma: no cover
+        print(f"  [IK] initialisation du bassin impossible ({e}) : modele d'origine")
+        return model_path
+
+
 def run_ik(
     model_path: str,
     trc_path: str,
@@ -897,6 +961,7 @@ def run_ik(
     output_dir = str(Path(mot_path).parent.resolve())
 
     with tempfile.TemporaryDirectory() as tmp:
+        model_path = _modele_depart_ik(model_path, trc_path, tmp)
         # Write setup XML to the OUTPUT dir so that OpenSim writes the marker
         # errors file alongside it (OpenSim uses setup XML dir, not CWD).
         xml_path    = os.path.join(output_dir, "_ik_setup.xml")
