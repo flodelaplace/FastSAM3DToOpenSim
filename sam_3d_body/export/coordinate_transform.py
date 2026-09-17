@@ -407,11 +407,21 @@ class CoordinateTransformer:
                         _ang = float(np.degrees(np.arccos(
                             np.clip(float(_mg @ _gc), -1.0, 1.0))))
                         if _ang > 8.0:
+                            # DESACCORD : GeoCalib SEUL, pas MoGe. Le repli
+                            # coupait le repere monde puis la chaine historique
+                            # appliquait la pente de MoGe — la source qu'on vient
+                            # de declarer non fiable. MoGe ajuste un plan de sol :
+                            # sur un tapis il voit la bande et le plateau, pas le
+                            # sol. GeoCalib lit la gravite sur les lignes de la
+                            # piece, sans passer par le sol.
+                            # Mesure du 2026-09-17 sur Gait_sagittale (tapis, vue
+                            # de profil, desaccord 9,8 deg) : tronc incline de
+                            # -5,4 deg sur le cote avec MoGe, -0,9 avec GeoCalib
+                            # seul ; autocontrole mesh/squelette inchange (0,3 cm).
                             print(f"  [world frame] GeoCalib⊕MoGe EN DESACCORD "
-                                  f"({_ang:.1f}° > 8) → verticale non fiable, "
-                                  f"repli sur la mediane des angles.")
-                            _world_frame = False
-                            _up_w = _mg
+                                  f"({_ang:.1f}° > 8) → MoGe ecarte, "
+                                  f"verticale GeoCalib seule.")
+                            _up_w = _gc
                         else:
                             _up_w = _gc + _mg
                             _up_w = _up_w / (np.linalg.norm(_up_w) or 1.0)
