@@ -503,6 +503,7 @@ def stable_floor_transform(
     fps: float,
     *,
     per_foot_split: int | None = None,
+    autoriser_rotation: bool = True,
     floor_percentile: float = 0.5,
     min_poses_for_drift: int = 4,
     min_drift_cm_per_s: float = 0.3,
@@ -568,7 +569,17 @@ def stable_floor_transform(
     fit = fit_floor_plane(plantar, per_foot_split=per_foot_split, **fit_kwargs)
     sf.fit = fit
     work = plantar
-    if fit.ok and fit.tilt_deg > 0.1:
+    if fit.ok and fit.tilt_deg > 0.1 and not autoriser_rotation:
+        # DEJA REDRESSE PAR LE REPERE MONDE : deux rotations s'ajouteraient.
+        # Mesure du 2026-09-20 sur le geste libre de basket : le repere monde
+        # applique 13,57 deg (GeoCalib seul), puis cet etage mesurait 13,28 deg —
+        # la MEME inclinaison, vue une seconde fois — et le tronc passait de 11,0
+        # a 17,2 deg par rapport a la verticale. On garde ici la derive et
+        # l'offset, qui sont autre chose.
+        sf.notes = ((sf.notes + " ; ") if sf.notes else "") + (
+            f"rotation refusee ({fit.tilt_deg:.2f}deg) : le repere monde a deja "
+            "redresse la scene")
+    elif fit.ok and fit.tilt_deg > 0.1:
         sf.R = rotation_align_a_to_b(fit.normal, np.array([0.0, 1.0, 0.0]))
         sf.pivot = fit.pivot
         sf.rotation_applied = True

@@ -563,7 +563,15 @@ class CoordinateTransformer:
                 plantar = kpts[:, _FOOT_INDICES, :]
                 split = 2
                 src = "4 keypoints cutanes (pas de points plantaires fournis)"
+            # La scene a-t-elle DEJA ete redressee juste avant ? Si oui, cet
+            # etage ne doit pas rotationner a son tour : il mesurerait la meme
+            # inclinaison une seconde fois et la scene serait redressee deux
+            # fois (mesure du 2026-09-20 : tronc 11,0 -> 17,2 deg sur le geste
+            # libre de basket). Sa derive et son offset restent utiles.
+            _deja_redresse_monde = (getattr(self, "_last_world_frame_R", None) is not None
+                                    or getattr(self, "_last_world_frame_series", None) is not None)
             sf = stable_floor_transform(plantar, float(fps), per_foot_split=split,
+                                        autoriser_rotation=not _deja_redresse_monde,
                                         drift_model=stable_floor_drift,
                                         min_span_travel_m=2.0)
             print(f"  [stable floor] source : {src} | rotation "
