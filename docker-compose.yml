@@ -36,7 +36,12 @@ services:
       - HOME=/tmp
       - HF_HOME=/tmp/hf
       - HUGGINGFACE_HUB_CACHE=/tmp/hf
-      - TORCH_HOME=/tmp/torch
+      # PAS /tmp/torch : les poids GeoCalib sont deja CUITS dans l'image sous
+      # /opt/torch_home (Dockerfile, ENV TORCH_HOME). Rediriger vers /tmp, qui
+      # est un cache monte depuis l'hote et vide a chaque redemarrage de WSL,
+      # les faisait retelecharger (111 Mo, ~20 min derriere le proxy du CHU) et,
+      # sans reseau, GeoCalib passait « indisponible » en silence.
+      - TORCH_HOME=/opt/torch_home
       - XDG_CACHE_HOME=/tmp/xdg-cache
       - TRANSFORMERS_CACHE=/tmp/hf/transformers
       # PYTHONPATH pour que l'env opensim voie synkro-analytics via volume mount
