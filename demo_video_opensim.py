@@ -1749,12 +1749,18 @@ def main(args, estimator=None, visualizer=None):
     # centre) et se refusera d'elle-meme : pas d'empilement avec la verticale
     # monde, qui est mesuree sur `REG_run` en camera fixe (8,07° monde puis
     # 6,77° de sol stable par-dessus).
+    # GESTE LIBRE (aucun --module) : MEME CHAINE que les autres gestes, demande
+    # de Florian le 2026-09-20. Le sol stable etait reserve aux modules, donc un
+    # geste libre n'avait que le decalage CONSTANT : seul l'instant le plus bas de
+    # l'essai touchait le sol et le corps flottait le reste du temps — 36 cm de
+    # mediane sous la semelle sur le geste libre de basket, alors que la mise au
+    # sol par appui pose le pied a CHAQUE appui. Ses garde-fous internes refusent
+    # d'eux-memes quand l'essai ne permet pas d'observer le sol.
     _sf_exclu = ("cycling", "birddog")
-    _sf_auto = (args.module is not None
-                and not any(x in args.module for x in _sf_exclu)
+    _sf_auto = (not any(x in (args.module or "") for x in _sf_exclu)
                 and not args.no_stable_floor)
     if _sf_auto and not args.stable_floor:
-        print(f"  [stable floor] ACTIF PAR DEFAUT ({args.module}"
+        print(f"  [stable floor] ACTIF PAR DEFAUT ({args.module or 'geste libre'}"
               f"{', camera portee' if args.handheld else ', camera fixe'}). "
               "--no_stable_floor pour couper. Ses propres garde-fous refusent la "
               "correction quand l'essai ne permet pas de l'observer.")
@@ -1937,8 +1943,12 @@ def main(args, estimator=None, visualizer=None):
     # laisse ensuite l'anti-glissement travailler sur une trajectoire propre.
     # Reserve aux gestes ou le corps PROGRESSE : sur un geste en place il n'y a
     # pas de trajectoire a lisser et il se battrait avec le mode en place.
-    _traj_lisse = args.module in ("d3.gait", "d3.running", "d3.sprint_start",
-                                  "d3.single_leg_hop")
+    # GESTE LIBRE inclus (2026-09-20) : c'est justement le cas ou la trajectoire
+    # saute le plus. Mesure sur le geste libre de basket : 108 images sur 300 ou
+    # le bassin bouge a plus de 3 m/s, dans un geste qui n'en fait pas 2. Le
+    # lissage est une TRANSLATION rigide, donc aucun angle ne peut changer.
+    _traj_lisse = args.module is None or args.module in (
+        "d3.gait", "d3.running", "d3.sprint_start", "d3.single_leg_hop")
     if _traj_lisse and marker_names is not None and not args.no_traj_smooth:
         from sam_3d_body.export.coordinate_transform import lisser_trajectoire_rigide
         markers_array, _traj_shifts = lisser_trajectoire_rigide(
