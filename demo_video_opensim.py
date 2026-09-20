@@ -934,6 +934,8 @@ def main(args, estimator=None, visualizer=None):
             tracker_cfg = f"{args.tracker}.yaml"
         estimator.detector.enable_tracking(tracker=tracker_cfg)
     black_frame_count = 0
+    # Boite de la personne ANALYSEE a l'image precedente (mode une personne).
+    _boite_principale = None
 
     while cap.isOpened():
         ret, frame_bgr = cap.read()
@@ -1027,6 +1029,35 @@ def main(args, estimator=None, visualizer=None):
                 boxes = boxes[order]
                 if frame_track_ids is not None:
                     frame_track_ids = np.asarray(frame_track_ids)[order]
+
+                # CONTINUITE DE LA PERSONNE PRINCIPALE. Trier par aire et garder
+                # `outputs[0]` change de sujet des qu'un autre passe plus pres de
+                # la camera : constate le 2026-09-20 sur un geste libre de basket
+                # ou plusieurs joueurs sont dans le cadre, l'analyse sautait d'une
+                # personne a l'autre en cours d'essai. Consequence en cascade : le
+                # point plantaire le plus bas servant a poser la scene pouvait
+                # venir d'un AUTRE participant, donc toute la hauteur etait fausse.
+                # On garde donc la boite la plus proche de celle analysee a
+                # l'image precedente (distance des centres, normalisee par la
+                # taille de la boite), et on ne retombe sur la plus grande que si
+                # plus rien ne correspond — sujet sorti du cadre, coupure.
+                if not getattr(args, "multi_person", False) and len(boxes) > 1:
+                    if _boite_principale is not None:
+                        _px0, _py0, _px1, _py1 = [float(v) for v in _boite_principale[:4]]
+                        _centre_prec = np.array([(_px0 + _px1) / 2.0, (_py0 + _py1) / 2.0])
+                        _taille = max(_px1 - _px0, _py1 - _py0, 1e-6)
+                        _centres = np.stack([(boxes[:, 0] + boxes[:, 2]) / 2.0,
+                                              (boxes[:, 1] + boxes[:, 3]) / 2.0], axis=1)
+                        _ecarts = np.linalg.norm(_centres - _centre_prec, axis=1) / _taille
+                        _k = int(np.argmin(_ecarts))
+                        if _ecarts[_k] < 1.0 and _k != 0:
+                            _rang = [_k] + [i for i in range(len(boxes)) if i != _k]
+                            boxes = boxes[_rang]
+                            if frame_track_ids is not None:
+                                frame_track_ids = frame_track_ids[_rang]
+                    _boite_principale = np.asarray(boxes[0], dtype=float).copy()
+                elif not getattr(args, "multi_person", False) and len(boxes) == 1:
+                    _boite_principale = np.asarray(boxes[0], dtype=float).copy()
 
                 max_p = getattr(args, 'max_persons', None)
                 if max_p is not None and max_p > 0:
@@ -1546,7 +1577,21 @@ def main(args, estimator=None, visualizer=None):
     # - Permet d'avoir le redressement caméra (pitch/roll/body-vertical) en
     #   mode défaut (--floor_moge sans --floor), sans forcer la mise au sol
     #   per_frame qui est l'objet propre de --floor.
-    _correct_lean = (moge_floor_angle is not None or _apply_floor) and not args.no_lean_fix
+    # ⚠️ PAS SEULEMENT QUAND MoGe A UN ANGLE. Cet etage fait DEUX choses : il
+    # redresse (pitch/roll) ET il pose la scene en hauteur (le point plantaire le
+    # plus bas de l'essai arrive au sol). La seconde ne depend d'aucun angle.
+    # Mesure du 2026-09-20 sur un geste libre de basket : les 8 images tirees
+    # pour estimer le sol ont toutes ete rejetees comme FLOUES
+    # (« insufficient_samples, 0/8 frames, blurry=8 » — geste rapide), donc
+    # `moge_floor_angle` valait None, donc RIEN ne posait la scene : semelles a
+    # -137 cm, tete a +20 cm, 1,23 m d'ecart signale par l'autocontrole du rejeu,
+    # le pied traversait le sol et l'anti-glissement ne reconnaissait plus aucun
+    # appui (il compare la hauteur de semelle au sol) — glissement de 89 a 231 cm.
+    # Avec `--floor_moge` demande, on garde donc l'etage meme sans angle : la
+    # rotation vaut alors 0 et seule la remise a hauteur s'applique.
+    _correct_lean = ((moge_floor_angle is not None or _apply_floor
+                      or getattr(args, "floor_moge", False))
+                     and not args.no_lean_fix)
     # Auto-détection selon --module :
     # - running/gait/sprint : subject avance en ligne droite → --lock_lateral
     # - squat/STS : feet stables → --feet_anchor + clamp (feet à Y≥0 auto)

@@ -295,7 +295,14 @@ class CoordinateTransformer:
             # utile : MoGe a pleine resolution s'accorde avec GeoCalib a 0,2 deg
             # sur un squat et 2,9 sur un sprint. C'est l'APPLICATION de cette
             # verticale qui est fausse, pas son estimation.
-            _world_frame = (_src == "MoGe"
+            # GeoCalib SEUL ouvre aussi cette porte. `_src` vaut None quand MoGe
+            # n'a rendu aucun angle (ses images rejetees comme floues sur un
+            # geste rapide) : tout le repere monde etait alors saute, et la
+            # verticale de GeoCalib — mesuree, 8/8 images, 13,6 deg sur le geste
+            # libre de basket du 2026-09-20 — partait a la poubelle. Mesh2Sim
+            # garde celui des deux estimateurs qui reste.
+            _gc_dispo = getattr(CoordinateTransformer, "_gc_up_world_m2s", None) is not None
+            _world_frame = ((_src == "MoGe" or (_src is None and _gc_dispo))
                             and bool(int(_os_wf.environ.get("MOGE_WORLD_FRAME", "0"))))
             if _world_frame:
                 # Les angles recus sont deja multiplies par LEAN_SCALE ; ce mode
@@ -390,20 +397,38 @@ class CoordinateTransformer:
                     # visible au journal du 2026-09-09 : « rotation PAR IMAGE »
                     # suivi de « rotation GLOBALE » sur le meme passage.
                     pass
-                elif _ups:
+                elif _ups or getattr(CoordinateTransformer, "_gc_up_world_m2s", None) is not None:
                     # CHEMIN FIDELE : vraies normales par image, agregation
                     # robuste avec rejet a 8 deg, conversion de repere, rotation
                     # globale unique. C est la recette Mesh2Sim complete.
-                    _u, _ng, _nt, _spread = self.aggregate_ups_m2s(_ups)
-                    _mg = self.cam_up_to_world_m2s(_u)
+                    #
+                    # GEOCALIB EST AUSSI UNE SOURCE DE SECOURS, PAS SEULEMENT UN
+                    # ARBITRE. Sans normale MoGe on tombait dans le repli d'en
+                    # dessous, qui reconstruit la rotation depuis les angles de
+                    # MoGe — nuls dans ce cas : la scene restait NON redressee et
+                    # GeoCalib, pourtant valide, etait ignore. Mesure du
+                    # 2026-09-20 sur un geste libre de basket : MoGe rejette ses
+                    # 8 images (floues, geste rapide) tandis que GeoCalib garde
+                    # 8/8 a 13,57 deg d'inclinaison. C'est la recette Mesh2Sim :
+                    # les deux estimateurs, et celui qui reste quand l'autre tombe.
                     _gc = getattr(CoordinateTransformer, "_gc_up_world_m2s", None)
+                    if _ups:
+                        _u, _ng, _nt, _spread = self.aggregate_ups_m2s(_ups)
+                        _mg = self.cam_up_to_world_m2s(_u)
+                    else:
+                        _mg, _ng, _nt, _spread = None, 0, 0, 0.0
+                        print("  [world frame] MoGe sans normale exploitable "
+                              "→ GeoCalib seul")
 
                     # CONSENSUS GeoCalib ⊕ MoGe — leur regle, mot pour mot :
                     # angle entre les deux, au-dela de 8 deg on ne fait pas
                     # confiance, sinon la verticale est la somme normalisee.
                     # Une seule source disponible : on la prend telle quelle
                     # (elle vaut 0,7-2,7 deg sur leur banc de 27 cameras).
-                    if _gc is not None:
+                    if _gc is not None and _mg is None:
+                        # MoGe absent : rien a arbitrer, GeoCalib fait foi.
+                        _up_w = _gc
+                    elif _gc is not None:
                         _ang = float(np.degrees(np.arccos(
                             np.clip(float(_mg @ _gc), -1.0, 1.0))))
                         if _ang > 8.0:
