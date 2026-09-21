@@ -1703,6 +1703,31 @@ def main(args, estimator=None, visualizer=None):
               [f"SOLE_s{i}_l" for i in range(1, 8)] if n in _mk]
         if _r and len(_r) == len(_l):
             _plantar_idx = np.asarray(_r + _l, dtype=int)
+    # CAP DU BASSIN (RASI, LASI, RPSI, LPSI) pour le verrouillage du cap en
+    # camera portee. Quand l'operateur tourne autour du sujet — velo qui double
+    # un coureur, personne qui bouge autour d'un home-trainer — le lacet de la
+    # camera est pris pour une rotation du sujet : mesure sur `ced_run_insitu`
+    # (2026-09-21, jeton handheld), cap du bassin de -72 a +71 deg en 8 s alors
+    # que Ced court droit. On ne l'active que sur les gestes qui ne tournent
+    # pas par nature (course, marche, depart sprint, cyclisme) : en camera
+    # portee la direction de deplacement n'est pas observable, un vrai virage
+    # serait efface aussi. `--no_heading_lock` pour couper.
+    _heading_idx = None
+    if markerset == "flodelaplace" and N_anat:
+        _mk = list(florian_converter.marker_names)
+        if all(n in _mk for n in ("RASI", "LASI", "RPSI", "LPSI")):
+            _heading_idx = np.asarray(
+                [jcoords_processed.shape[1] - N_anat + _mk.index(n)
+                 for n in ("RASI", "LASI", "RPSI", "LPSI")], dtype=int)
+    _lock_heading = (getattr(args, "handheld", False)
+                     and args.module in ("d3.running", "d3.gait",
+                                         "d3.sprint_start", "d3.cycling")
+                     and not getattr(args, "no_heading_lock", False)
+                     and _heading_idx is not None)
+    if _lock_heading:
+        print(f"  [cap verrouille] ACTIF ({args.module}, camera portee) : le lacet "
+              "lent de la camera n'est pas une rotation du sujet. "
+              "--no_heading_lock pour couper.")
     # SOL STABLE PAR DEFAUT sur la course et le depart sprint, camera fixe.
     #
     # Mesure du 2026-09-08 sur Sprint_start.mp4 (camera fixe, 200 images) : la
@@ -1790,6 +1815,9 @@ def main(args, estimator=None, visualizer=None):
                      no_floor_clamp=str(os.environ.get("NO_FLOOR_CLAMP", "0")))
         if _plantar_idx is not None:
             _dump["plantar_idx"] = _plantar_idx
+        _dump["lock_heading"] = bool(_lock_heading)
+        if _heading_idx is not None:
+            _dump["heading_idx"] = _heading_idx
         if moge_floor_angle is not None:
             _dump["moge_floor_angle"] = np.asarray(moge_floor_angle, dtype=float)
         _gcv = getattr(CoordinateTransformer, "_gc_up_world_m2s", None)
@@ -1830,6 +1858,8 @@ def main(args, estimator=None, visualizer=None):
         plantar_indices=_plantar_idx,
         stable_floor_drift=args.stable_floor_drift,
         fps=out_fps,
+        lock_heading=_lock_heading,
+        heading_indices=_heading_idx,
     )
 
     # 2b. Spine-based forward-lean correction (runs after floor-plane rotation above).
@@ -3184,6 +3214,10 @@ def build_parser():
                              "teleporte. Mesure sur depart sprint : 0,10 s -> 4,65 cm "
                              "a 48 m/s2 ; 0,30 s -> 5,86 cm au COUT NUL (32 m/s2, soit "
                              "la valeur sans correction). Defaut 0,30.")
+    parser.add_argument("--no_heading_lock", action="store_true",
+                        help="Camera portee : ne pas verrouiller le cap du bassin "
+                             "(par defaut le lacet lent de la camera est retire "
+                             "sur course, marche, depart sprint et cyclisme).")
     parser.add_argument("--no_stable_floor", action="store_true",
                         help="Desactive le sol stable meme la ou il est actif par "
                              "defaut (course et depart sprint, camera fixe).")

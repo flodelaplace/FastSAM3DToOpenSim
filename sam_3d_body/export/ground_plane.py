@@ -411,6 +411,7 @@ def _stance_gated_shift(
     vel_ms: float = 0.30,
     vel_band_m: float = 0.30,
     vel_min_run_s: float = 0.12,
+    floor_window_s: float = 0.0,
 ):
     """Correction verticale CONDITIONNEE A L'APPUI, interpolee pendant le vol.
 
@@ -454,6 +455,25 @@ def _stance_gated_shift(
         exclut le passage par vitesse nulle a l'apex d'un saut (a 0,30 m/s de
         seuil, la vitesse verticale reste sous le seuil 0,06 s autour de l'apex).
 
+    PLANCHER GLISSANT (``floor_window_s`` > 0) : le plancher d'un point n'est
+    plus son 1er centile sur TOUT l'essai mais son minimum LOCAL, sur une
+    fenetre de +/- ``floor_window_s``. C'est ce qu'exige la camera mobile :
+    la verticale y est interpolee par image-cle et ``cam_t.Y`` porte le
+    mouvement propre de l'operateur, si bien que le « sol » de la scene derive
+    de plusieurs dizaines de centimetres au fil de l'essai. Mesure sur
+    `outputs/CAP_run_hh` (course in situ, operateur a velo, 2026-09-21) : la
+    semelle la plus basse va de +43 a +9 puis +41 cm avant mise au sol. Avec
+    le plancher global, seuls les appuis les plus bas sont vus (appui 33 %
+    apres 12 passes, semelle a +8 cm de mediane, +27 cm au depart) ; avec le
+    plancher local a +/- 0,4 s, l'appui est vu a 76 % et la semelle tient a
+    +1 cm de mediane (dispersion des poses 15,4 -> 4,3 cm). L'immobilite ne
+    peut pas aider ici : le bassin est centre en XZ, le pied d'appui recule a
+    la vitesse de course. La fenetre est plus courte qu'une foulee de course
+    (0,7 s) mais plus longue qu'un vol (0,1 a 0,6 s) : au sommet d'un saut la
+    fenetre contient encore le decollage ou la reception, le minimum local
+    reste le sol et le vol n'est pas colle. A 0 (defaut, camera fixe) rien
+    ne change.
+
     Ce que ce mode NE FAIT PAS : aplatir l'oscillation verticale du centre de
     masse. Pendant l'appui c'est le PIED qui est tenu au sol ; le bassin reste
     libre de monter et descendre au-dessus. Pendant le vol rien n'est tenu.
@@ -467,14 +487,22 @@ def _stance_gated_shift(
     level = np.full(T, np.nan)
     covered = np.zeros(T, dtype=bool)
     speed = _plantar_speed(plantar, fps) if vel_ms > 0 else None
+    half = int(round(floor_window_s * fps)) if floor_window_s > 0 else 0
     for a, b in groups:
         for k in range(a, b):
             y = plantar[:, k, 1]
             if not np.isfinite(y).any():
                 continue
             fl = float(np.nanpercentile(y, 1.0))
-            runs = detect_contact_by_height(
-                y, fl, thresh_m=thresh_m, min_run_s=min_run_s, fps=fps)
+            if half > 0:
+                from scipy.ndimage import minimum_filter1d
+                loc = minimum_filter1d(np.where(np.isfinite(y), y, np.inf),
+                                       size=2 * half + 1, mode="nearest")
+                on_loc = np.isfinite(y) & (y - loc <= thresh_m)
+                runs = _mask_to_runs(on_loc, max(2, int(round(min_run_s * fps))))
+            else:
+                runs = detect_contact_by_height(
+                    y, fl, thresh_m=thresh_m, min_run_s=min_run_s, fps=fps)
             if speed is not None:
                 still = (np.isfinite(y) & (y - fl <= vel_band_m)
                          & np.isfinite(speed[:, k]) & (speed[:, k] <= vel_ms))
@@ -523,6 +551,7 @@ def stable_floor_transform(
     stance_max_shift_m: float = 0.30,
     stance_min_gain: float = 0.25,
     stance_min_coverage: float = 0.10,
+    stance_floor_window_s: float = 0.0,
     **fit_kwargs,
 ) -> StableFloor:
     """Calcule la transformation « sol stable » d'un essai.
@@ -736,7 +765,8 @@ def stable_floor_transform(
             shift, cov, _covm = _stance_gated_shift(
                 probe, split, fps, thresh_m=stance_thresh_m,
                 min_run_s=stance_min_run_s, lowpass_hz=stance_lowpass_hz,
-                vel_ms=stance_vel_ms, vel_band_m=stance_vel_band_m)
+                vel_ms=stance_vel_ms, vel_band_m=stance_vel_band_m,
+                floor_window_s=stance_floor_window_s)
             sf.stance_coverage = cov
             _cov_trace.append(cov)
             if shift is None:

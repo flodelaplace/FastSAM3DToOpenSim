@@ -101,6 +101,8 @@ class CoordinateTransformer:
         stable_floor_drift: str = "linear+stance",
         ground_margin_m: float = 0.01,
         fps: float = 30.0,
+        lock_heading: bool = False,
+        heading_indices: Optional[np.ndarray] = None,
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """
         Transform keypoints (and optionally jcoords) to OpenSim world space.
@@ -543,6 +545,8 @@ class CoordinateTransformer:
         self._last_ground_offsets_m = None
         self._last_constant_offset_m = None
         self._last_stable_floor = None
+        self._last_heading_R_series = None
+        self._last_heading_pivots_m = None
         # Offset de mise au sol partage entre les appels successifs a
         # apply_pipeline_to_verts (mesh / kpts / jcoords).
         self._replay_constant_offset_m = None
@@ -576,11 +580,21 @@ class CoordinateTransformer:
             _incl_monde = float(getattr(self, "_last_world_frame_tilt_deg", 0.0) or 0.0)
             if _deja_redresse_monde and not _incl_monde:
                 _incl_monde = float(self._last_floor_angle_deg or 0.0)
+            # CAMERA MOBILE (verticale interpolee par image-cle) : le sol de
+            # la scene derive avec l'operateur, de plusieurs dizaines de cm.
+            # Le mode appui cherche alors chaque appui pres de son minimum
+            # LOCAL (+/- 0,4 s) et a le droit de corriger jusqu'a 60 cm, la ou
+            # la camera fixe garde le plancher global et la borne de 30 cm.
+            # Mesure `outputs/CAP_run_hh` (2026-09-21) : semelle +8,4 -> +1,1 cm
+            # de mediane, appui 33 -> 76 %, correction max 47,9 cm.
+            _cam_mobile = getattr(self, "_last_world_frame_series", None) is not None
             sf = stable_floor_transform(plantar, float(fps), per_foot_split=split,
                                         autoriser_rotation=not _deja_redresse_monde,
                                         inclinaison_monde_deg=_incl_monde,
                                         drift_model=stable_floor_drift,
-                                        min_span_travel_m=2.0)
+                                        min_span_travel_m=2.0,
+                                        stance_floor_window_s=0.4 if _cam_mobile else 0.0,
+                                        stance_max_shift_m=0.60 if _cam_mobile else 0.30)
             print(f"  [stable floor] source : {src} | rotation "
                   f"{'OUI' if sf.rotation_applied else 'non'} "
                   f"(inclinaison {sf.fit.tilt_deg:.2f}deg, {sf.fit.reason or 'ok'}) | "
@@ -710,6 +724,60 @@ class CoordinateTransformer:
                     print(f"  [floor clamp] ground-penetration clamp APPLIED to "
                           f"{n_clamped}/{kpts.shape[0]} frames (max shift +{max_clamp*100:.1f} cm)")
                     self._last_penetration_clamp_m = clamp_shifts.copy()
+
+        # 4c. CAP VERROUILLE (camera portee, geste rectiligne ou sujet fixe).
+        # Quand l'operateur tourne autour du sujet (velo qui double un coureur,
+        # personne qui bouge autour d'un home-trainer), le lacet de la camera
+        # est pris pour une rotation du sujet : sur `ced_run_insitu` en
+        # handheld le cap du bassin va de -72 a +71 deg en 8 s alors que Ced
+        # court droit. Rien dans la chaine ne compense la rotation autour de
+        # la verticale (le bassin est centre en XZ, la verticale interpolee).
+        # On retire donc la composante LENTE du cap (< 0,5 Hz) par une rotation
+        # rigide par image autour de Y, pivot au centre du bassin : aucun
+        # angle articulaire ne change, la rotation du bassin intra-foulee
+        # (1,3-1,5 Hz) est conservee (residu haute frequence 2,90 -> 2,81 deg).
+        # La reference est la moyenne circulaire du cap lisse. Mesure du
+        # 2026-09-21 : etendue du cap 147,6 -> 12,3 deg, ecart-type 50,1 -> 2,9.
+        # L'appelant ne l'active que si le geste ne tourne pas par nature ;
+        # en camera portee la direction de deplacement n'est pas observable,
+        # aucun garde-fou interne ne peut distinguer un vrai virage.
+        if lock_heading and jc is not None and heading_indices is not None \
+                and len(heading_indices) == 4 and kpts.shape[0] >= 3:
+            from scipy.signal import butter, sosfiltfilt
+            _hi = np.asarray(heading_indices, dtype=int)
+            _asis = (jc[:, _hi[0], :] + jc[:, _hi[1], :]) / 2.0
+            _psis = (jc[:, _hi[2], :] + jc[:, _hi[3], :]) / 2.0
+            _fwd = _asis - _psis
+            _cap = np.arctan2(_fwd[:, 0], _fwd[:, 2])
+            _okc = np.isfinite(_cap)
+            if _okc.sum() >= 3:
+                _idx = np.arange(len(_cap), dtype=np.float64)
+                _cap = np.unwrap(np.interp(_idx, _idx[_okc], _cap[_okc]))
+                _fc = 0.5
+                if len(_cap) > 20 and _fc < 0.5 * float(fps):
+                    _lp = sosfiltfilt(butter(2, _fc / (0.5 * float(fps)), btype="low",
+                                             output="sos"), _cap)
+                else:
+                    _lp = np.full_like(_cap, np.median(_cap))
+                _ref = float(np.arctan2(np.mean(np.sin(_lp)), np.mean(np.cos(_lp))))
+                _dth = _ref - _lp
+                _piv = (_asis + _psis) / 2.0
+                _piv[:, 1] = 0.0
+                _piv = np.where(np.isfinite(_piv), _piv, 0.0)
+                _Rs = []
+                for _t in range(kpts.shape[0]):
+                    _c, _s = np.cos(_dth[_t]), np.sin(_dth[_t])
+                    _R = np.array([[_c, 0.0, _s], [0.0, 1.0, 0.0], [-_s, 0.0, _c]])
+                    kpts[_t] = (kpts[_t] - _piv[_t]) @ _R.T + _piv[_t]
+                    jc[_t] = (jc[_t] - _piv[_t]) @ _R.T + _piv[_t]
+                    _Rs.append(_R)
+                self._last_heading_R_series = _Rs
+                self._last_heading_pivots_m = _piv.copy()
+                print(f"  [cap verrouille] camera portee : lacet lent retire, "
+                      f"{np.degrees(np.ptp(_lp)):.1f} deg d'etendue sur l'essai "
+                      f"(rotation par image {np.degrees(_dth.min()):+.1f}.."
+                      f"{np.degrees(_dth.max()):+.1f} deg), cap de reference "
+                      f"{np.degrees(_ref):+.1f} deg")
 
         # 5. Unit conversion (m → mm if requested)
         kpts = kpts * self.scale_factor
@@ -928,6 +996,15 @@ class CoordinateTransformer:
         # ground_offset_mode == "none" : pas de shift Y
 
         # Étape 6 — Unit conversion + float32
+        # Cap verrouille : meme rotation rigide par image que les kpts (4c).
+        _Rh = getattr(self, "_last_heading_R_series", None)
+        _ph = getattr(self, "_last_heading_pivots_m", None)
+        if _Rh is not None and _ph is not None:
+            for i, w in enumerate(pre_ground):
+                if w is None or i >= len(_Rh):
+                    continue
+                pre_ground[i] = (w - _ph[i]) @ _Rh[i].T + _ph[i]
+
         out: list = []
         for w in pre_ground:
             if w is None:
