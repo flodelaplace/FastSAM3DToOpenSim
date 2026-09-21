@@ -290,6 +290,13 @@ def main():
                 log(f"  ÉCHEC — {texte}")
                 _prevenir(job, Path(tmp) / "out", time.time() - dernier,
                           faits=faits + 1, erreur=texte)
+        # L'inactivite se compte a partir de la FIN du traitement, pas de la
+        # reception. Vu le 2026-09-21 : une video de 659 s, puis « aucun
+        # message depuis 600 s — extinction » sans un seul receive_message,
+        # alors qu'un message deja depose attendait dans la file. Rien ne
+        # reveille un worker sur un message existant (la lambda ne reagit
+        # qu'aux depots) : la video restait bloquee jusqu'au depot suivant.
+        dernier = time.time()
 
 
 if __name__ == "__main__":
