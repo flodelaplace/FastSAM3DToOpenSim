@@ -1771,6 +1771,42 @@ def main(args, estimator=None, visualizer=None):
               "le sol sera pose sur les keypoints CUTANES (3 cm trop haut, "
               "reference qui bat au rythme du deroule du pied).")
 
+    # ETAT INTERMEDIAIRE POUR REJEU HORS LIGNE (SYNKRO_DUMP_ETAPES=1). Les
+    # etages de mise au sol sont du numpy pur : les rejouer depuis ce fichier
+    # prend quelques secondes, contre cinq minutes d'inference. C'est ce qui a
+    # permis de mesurer les variantes du sol stable sur le geste libre de
+    # basket (2026-09-21) sans relancer le GPU a chaque essai.
+    if os.environ.get("SYNKRO_DUMP_ETAPES", "0") == "1":
+        _dump = dict(kpts=kpts_processed, jcoords=jcoords_processed,
+                     cam_t=cam_t_processed, fps=float(out_fps),
+                     subject_height=float(subject_height),
+                     module=str(args.module), floor_moge=bool(_floor_moge_on),
+                     correct_lean=bool(_correct_lean), stable_floor=bool(_stable_floor),
+                     apply_floor=bool(_apply_floor), stationary=bool(_stationary_effective),
+                     lock_vertical=bool(args.lock_vertical or _auto_lock_vertical),
+                     lock_lateral=bool(args.lock_lateral or _auto_lock_lateral),
+                     contact_anchor=bool(args.contact_anchor or _auto_contact_anchor),
+                     stable_floor_drift=str(args.stable_floor_drift),
+                     no_floor_clamp=str(os.environ.get("NO_FLOOR_CLAMP", "0")))
+        if _plantar_idx is not None:
+            _dump["plantar_idx"] = _plantar_idx
+        if moge_floor_angle is not None:
+            _dump["moge_floor_angle"] = np.asarray(moge_floor_angle, dtype=float)
+        _gcv = getattr(CoordinateTransformer, "_gc_up_world_m2s", None)
+        if _gcv is not None:
+            _dump["gc_up_world_m2s"] = np.asarray(_gcv, dtype=float)
+        _upsv = getattr(CoordinateTransformer, "_ups_cam_m2s", None) or []
+        if _upsv:
+            _dump["ups_cam_idx"] = np.asarray([i for i, _ in _upsv], dtype=float)
+            _dump["ups_cam_m2s"] = np.asarray([u for _, u in _upsv], dtype=float)
+        _gcl = getattr(CoordinateTransformer, "_gc_ups_world_m2s", None) or []
+        if _gcl:
+            _dump["gc_ups_idx"] = np.asarray([i for i, _ in _gcl], dtype=float)
+            _dump["gc_ups_world_m2s"] = np.asarray([u for _, u in _gcl], dtype=float)
+        _dump["n_frames_video"] = int(getattr(CoordinateTransformer, "_n_frames_video", 0))
+        np.savez_compressed(os.path.join(args.output_dir, "_etapes_transform.npz"), **_dump)
+        print("  [dump] entrees de transform() ecrites dans _etapes_transform.npz")
+
     kpts_opensim, jcoords_opensim = transformer.transform(
         kpts_processed,
         jcoords_3d=jcoords_processed,
@@ -1890,6 +1926,11 @@ def main(args, estimator=None, visualizer=None):
     from sam_3d_body.export.hand_keypoints import append_hand_keypoints
     markers_array, marker_names = append_hand_keypoints(
         markers_array, marker_names, kpts_opensim)
+    if os.environ.get("SYNKRO_DUMP_ETAPES", "0") == "1":
+        np.savez_compressed(os.path.join(args.output_dir, "_etapes_marqueurs.npz"),
+                            markers=markers_array, names=np.asarray(marker_names),
+                            fps=float(out_fps))
+        print("  [dump] marqueurs AVANT lissage/anti-glissement ecrits dans _etapes_marqueurs.npz")
 
     # ANTI-GLISSEMENT : actif des que le pied se pose sur un sol FIXE, dans un
     # referentiel FIXE.
@@ -1935,6 +1976,19 @@ def main(args, estimator=None, visualizer=None):
     # 21,9/19,6 cm en mode locomotion, 3,7/4,3 en mode en place.
     _en_place = args.module in ("d3.squat", "d3.sit_to_stand",
                                 "d3.single_leg_squat", "d3.jump")
+    # GESTE LIBRE : la correction suit les sauts de la scene jusqu'a 8 Hz, comme
+    # en place, mais avec les ancres de la locomotion (un vol y est reel, et il
+    # n'y a pas de borne de 25 cm : sur le basket la trajectoire fausse
+    # demande 1,2 m de correction). Mesure du 2026-09-21 sur le geste libre de
+    # basket, une fois le sol remis a plat : les deux pieds a plat au sol
+    # bougent en bloc avec le bassin (correlation 0,98 en X — c'est la
+    # trajectoire qui saute, pas les pieds), et le filtre a 2 Hz laissait
+    # passer 8 a 25 cm de derive par demi-seconde ; a 8 Hz il en reste 1 a 5,
+    # et 4,4 cm de mediane par appui strict au pied gauche au lieu de 19,0.
+    # Sur le sprint et la course de reference, 2 et 8 Hz donnent la meme chose
+    # au millimetre pres (appuis de 0,2 s, la coupure ne les distingue pas) :
+    # le reglage ne sert que la ou la scene saute, et ne coute rien ailleurs.
+    _suivi_hz = 8.0 if args.module is None else 2.0
     # LISSAGE RIGIDE DE LA TRAJECTOIRE, en amont de l'anti-glissement.
     # Sur `outputs/GAIT_COULOIR` le bassin saute de 19 cm en une image et aucun
     # pied ne reste immobile plus de 0,28 s : il n'y a pas d'appui a verrouiller,
@@ -1981,13 +2035,18 @@ def main(args, estimator=None, visualizer=None):
         _variance = bool(getattr(args, "anti_skate_variance", False))
         markers_array, _antiskate_shifts = anti_foot_skate_markers(
             markers_array, marker_names, fps=out_fps, en_place=_en_place,
+            shift_lowpass_hz=_suivi_hz,
             contact_loss="variance" if _variance else "anchor",
             continuous_contact=_variance)
         print("  [anti-glissement] decalage global XZ applique au TRC final"
               + (" (VARIANCE d'appui, sans ancre, + couverture continue)"
                  if _variance else
                  (" (seuils GESTE EN PLACE : ancre tenue 0,60 s, correction "
-                  "suivie jusqu'a 8 Hz)" if _en_place else " (seuils locomotion)")))
+                  "suivie jusqu'a 8 Hz)" if _en_place else
+                  (" (seuils locomotion, correction suivie jusqu'a 8 Hz : geste libre)"
+                   if args.module is None else " (seuils locomotion)")))
+              + (f" | correction max {float(np.max(np.linalg.norm(_antiskate_shifts, axis=1)))*100:.1f} cm"
+                 if _antiskate_shifts is not None else ""))
 
     # ── --feet_anchor : shift global per-frame pour que le midpoint des
     # pieds reste à sa position médiane sur toute la vidéo. Translate tout

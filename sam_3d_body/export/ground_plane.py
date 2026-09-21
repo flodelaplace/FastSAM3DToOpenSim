@@ -297,6 +297,8 @@ class StableFloor:
     drift_model: str = "linear"
     stance_shift_m: np.ndarray | None = None   # (T,) mode "stance" uniquement
     stance_coverage: float = 0.0               # part des images en appui detecte
+    plane_shift_m: np.ndarray | None = None    # (T,) plan applique en TRANSLATION
+    plane_applied: bool = False
     notes: str = ""
 
 
@@ -504,6 +506,8 @@ def stable_floor_transform(
     *,
     per_foot_split: int | None = None,
     autoriser_rotation: bool = True,
+    inclinaison_monde_deg: float = 0.0,
+    plane_min_span_travel_m: float = 1.0,
     floor_percentile: float = 0.5,
     min_poses_for_drift: int = 4,
     min_drift_cm_per_s: float = 0.3,
@@ -569,16 +573,84 @@ def stable_floor_transform(
     fit = fit_floor_plane(plantar, per_foot_split=per_foot_split, **fit_kwargs)
     sf.fit = fit
     work = plantar
-    if fit.ok and fit.tilt_deg > 0.1 and not autoriser_rotation:
-        # DEJA REDRESSE PAR LE REPERE MONDE : deux rotations s'ajouteraient.
-        # Mesure du 2026-09-20 sur le geste libre de basket : le repere monde
-        # applique 13,57 deg (GeoCalib seul), puis cet etage mesurait 13,28 deg —
-        # la MEME inclinaison, vue une seconde fois — et le tronc passait de 11,0
-        # a 17,2 deg par rapport a la verticale. On garde ici la derive et
-        # l'offset, qui sont autre chose.
-        sf.notes = ((sf.notes + " ; ") if sf.notes else "") + (
-            f"rotation refusee ({fit.tilt_deg:.2f}deg) : le repere monde a deja "
-            "redresse la scene")
+    if not autoriser_rotation:
+        # DEJA REDRESSE PAR LE REPERE MONDE : le plan s'applique en TRANSLATION
+        # par image, jamais en rotation.
+        #
+        # CE QUE LA MESURE DIT (rejeu hors ligne du 2026-09-21, geste libre de
+        # basket, 300 images) : AVANT la rotation monde, le plan des points
+        # plantaires en appui est a 1,04 deg de l'horizontale ; APRES la
+        # rotation GeoCalib de 13,58 deg il est a 14,36 deg. Meme chose sur le
+        # rameur (19,56 deg de monde, 13,51 deg de plan ensuite) et deja
+        # signale sur `REG_run` (8,07 deg de monde, 6,77 de sol stable
+        # par-dessus). La rotation ne trouve donc pas un sol incline : elle le
+        # CREE. La trajectoire issue de `cam_t` est a plat en repere camera —
+        # la pente mesuree de cam_t.y sur cam_t.z vaut 0,094 la ou la
+        # perspective d'une camera piquee de 13,6 deg en demanderait 0,242 —
+        # tandis que l'orientation du corps, elle, est bien vue inclinee par
+        # MHR. La rotation globale est juste pour le corps et fausse pour la
+        # trajectoire, et le corps y prend D.sin(theta) de hauteur : 2,15 m de
+        # deplacement font 30 cm de mediane sous les semelles, c'est le
+        # « decale de 30 cm au-dessus du sol » de Florian.
+        #
+        # Une seconde ROTATION (l'ancien comportement) remet le sol a plat mais
+        # incline le corps a nouveau : tronc 11,0 -> 17,2 deg sur ce meme
+        # essai. Une TRANSLATION verticale par image, egale a la hauteur du plan
+        # ajuste a la position XZ des pieds, remet le sol a plat sans toucher a
+        # un seul angle. Resultat sur le basket : semelles en appui de +12/+14
+        # cm de mediane a +0,4/+1,8 cm, appui detecte 13 % -> 86 %, tronc
+        # inchange a 10,2 deg ; sur le rameur, sauts du bassin 5 -> 0 et pieds
+        # (fixes sur la planche) de +7,6/+9,2 a +2,3/+4,1 cm.
+        #
+        # C'est l'equivalent, en un plan a 2 pentes au lieu de T parametres, de
+        # l'etape [6] de Mesh2Sim (`M2S:mono.py`, « per-frame min-foot -> 0 »),
+        # qui suit ELLE AUSSI leur rotation par la gravite GeoCalib. Le vol est
+        # preserve : la hauteur soustraite ne depend que d'OU est le sujet, pas
+        # de si son pied touche.
+        #
+        # Deux garde-fous. L'etendue : une translation ne change aucun angle,
+        # donc 1 m de progression suffit (le rameur en a 1,03), la ou la
+        # rotation en exige 2. La coherence : la pente du plan ne peut depasser
+        # ce que la rotation monde a pu creer (1,5 fois son angle plus 3 deg) ;
+        # au-dela ce n'est plus ce phenomene, et on ne corrige pas.
+        fit_t = fit
+        if not fit.ok:
+            _kw = dict(fit_kwargs)
+            _kw["min_span_travel_m"] = min(plane_min_span_travel_m,
+                                           float(_kw.get("min_span_travel_m", 0.8)))
+            fit_t = fit_floor_plane(plantar, per_foot_split=per_foot_split, **_kw)
+        _borne = 1.5 * abs(float(inclinaison_monde_deg)) + 3.0
+        if fit_t.ok and fit_t.tilt_deg > 0.1 and fit_t.tilt_deg <= _borne:
+            u = np.asarray(fit_t.travel_axis_xz, dtype=np.float64)
+            wv = np.array([-u[1], u[0]])
+            a = np.tan(np.radians(fit_t.slope_travel_deg))
+            b = np.tan(np.radians(fit_t.slope_cross_deg))
+            with np.errstate(invalid="ignore"):
+                mid = np.nanmean(plantar[:, :, [0, 2]], axis=1)          # (T, 2)
+            ok = np.all(np.isfinite(mid), axis=1)
+            idx = np.arange(T, dtype=np.float64)
+            if ok.any() and not ok.all():
+                mid = np.column_stack([np.interp(idx, idx[ok], mid[ok, j]) for j in range(2)])
+            rel = mid - fit_t.pivot[[0, 2]]
+            h = a * (rel @ u) + b * (rel @ wv) + float(fit_t.pivot[1])
+            h = np.where(np.isfinite(h), h, 0.0)
+            sf.plane_shift_m = h.astype(np.float64)
+            sf.plane_applied = True
+            sf.fit = fit_t
+            work = plantar.copy()
+            work[:, :, 1] -= h[:, None]
+            sf.notes = ((sf.notes + " ; ") if sf.notes else "") + (
+                f"plan en TRANSLATION ({fit_t.tilt_deg:.2f}deg, etendue "
+                f"{np.ptp(h)*100:.1f} cm) : le repere monde a redresse le corps, "
+                "ceci remet la trajectoire a plat")
+        elif fit_t.ok and fit_t.tilt_deg > _borne:
+            sf.notes = ((sf.notes + " ; ") if sf.notes else "") + (
+                f"plan refuse ({fit_t.tilt_deg:.2f}deg > {_borne:.1f}, plus que ce "
+                "que la rotation monde a pu creer)")
+        elif fit_t.ok and fit_t.tilt_deg > 0.1:
+            sf.notes = ((sf.notes + " ; ") if sf.notes else "") + (
+                f"rotation refusee ({fit_t.tilt_deg:.2f}deg) : le repere monde a deja "
+                "redresse la scene")
     elif fit.ok and fit.tilt_deg > 0.1:
         sf.R = rotation_align_a_to_b(fit.normal, np.array([0.0, 1.0, 0.0]))
         sf.pivot = fit.pivot
@@ -786,6 +858,8 @@ def apply_stable_floor(pts: np.ndarray, sf: StableFloor, fps: float) -> np.ndarr
     T = out.shape[0]
     if sf.rotation_applied:
         out = ((out.reshape(-1, 3) - sf.pivot) @ sf.R.T + sf.pivot).reshape(out.shape)
+    if sf.plane_shift_m is not None:
+        out[:, :, 1] -= sf.plane_shift_m[:T, None]
     if sf.drift_m_per_s:
         tt = np.arange(T, dtype=np.float64)
         out[:, :, 1] -= (sf.drift_m_per_s / fps * (tt - sf.t0_frame))[:, None]

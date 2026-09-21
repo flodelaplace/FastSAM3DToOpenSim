@@ -276,6 +276,7 @@ class CoordinateTransformer:
             self._last_world_frame_R = None
             self._last_world_frame_series = None
             self._last_world_frame_dy_m = 0.0
+            self._last_world_frame_tilt_deg = 0.0
             _deja_redresse = False
             # ⚠️ REMIS EN OPT-IN le 2026-09-09 au soir. Mesure sur `Squat.MP4`,
             # tronc en phase debout, 0 degre = vertical :
@@ -570,13 +571,20 @@ class CoordinateTransformer:
             # libre de basket). Sa derive et son offset restent utiles.
             _deja_redresse_monde = (getattr(self, "_last_world_frame_R", None) is not None
                                     or getattr(self, "_last_world_frame_series", None) is not None)
+            # Angle de la rotation monde : borne la pente que la translation
+            # du plan (voir `stable_floor_transform`) a le droit de corriger.
+            _incl_monde = float(getattr(self, "_last_world_frame_tilt_deg", 0.0) or 0.0)
+            if _deja_redresse_monde and not _incl_monde:
+                _incl_monde = float(self._last_floor_angle_deg or 0.0)
             sf = stable_floor_transform(plantar, float(fps), per_foot_split=split,
                                         autoriser_rotation=not _deja_redresse_monde,
+                                        inclinaison_monde_deg=_incl_monde,
                                         drift_model=stable_floor_drift,
                                         min_span_travel_m=2.0)
             print(f"  [stable floor] source : {src} | rotation "
                   f"{'OUI' if sf.rotation_applied else 'non'} "
                   f"(inclinaison {sf.fit.tilt_deg:.2f}deg, {sf.fit.reason or 'ok'}) | "
+                  f"plan en translation {'OUI' if sf.plane_applied else 'non'} | "
                   f"derive {'OUI' if sf.drift_applied else 'non'} "
                   f"({sf.drift_m_per_s*100:+.2f} cm/s, appui "
                   f"{sf.stance_coverage*100:.0f}%) | offset {sf.offset_m*100:+.1f} cm"
@@ -861,6 +869,9 @@ class CoordinateTransformer:
                           * (i - _sf.t0_frame)
                 if _sf.stance_shift_m is not None and i < len(_sf.stance_shift_m):
                     dy += float(_sf.stance_shift_m[i])
+                _psh = getattr(_sf, "plane_shift_m", None)
+                if _psh is not None and i < len(_psh):
+                    dy += float(_psh[i])
                 w = w.copy()
                 w[:, 1] -= dy
                 pre_ground[i] = w
