@@ -2850,8 +2850,14 @@ def main(args, estimator=None, visualizer=None):
         # KHR_mesh_quantization (casse les morph targets dans le viewer) et
         # EXT_meshopt_compression (illisible par Blender sans decodeur).
         # Mesure sur 6 s de course : 82 Mo -> 22 Mo pour 0,047 mm d'ecart max.
-        from sam_3d_body.export.morph_compression import compresser_en_place
+        from sam_3d_body.export.morph_compression import (
+            compresser_en_place, compresser_meshopt)
         compresser_en_place(mesh_glb)
+        # Puis meshopt, a la demande de l'app dont la visionneuse le decode
+        # (2026-09-22) : 28 -> 3,6 Mo sur la course de reference, 0,13 mm
+        # d'ecart au pire. SYNKRO_MESHOPT=0 pour revenir au fichier sans
+        # extension (lisible par tout Blender).
+        compresser_meshopt(mesh_glb)
 
     # NOTE: découplé de --no_mesh_glb (2026-08). Ce bloc ne dépend que du
     # .osim scalé + .mot IK : le désactiver avec le mesh supprimait aussi le

@@ -266,3 +266,63 @@ def compresser_en_place(path, tol_mm=0.05, k_max=160, verbeux=True):
             os.remove(tmp)
         print(f"  [morph] compression ignoree ({type(exc).__name__}: {exc})")
         return None
+
+
+def compresser_meshopt(path, bits_position=16, verbeux=True):
+    """Compression meshopt (EXT_meshopt_compression) du GLB, en place.
+
+    A appliquer APRES `compresser_en_place` : la reduction de base divise le
+    nombre de formes, meshopt compresse ensuite chacune (et les pistes
+    d'animation). Mesure sur la course in situ de Ced (2026-09-22) :
+    28,0 -> 3,6 Mo. Ecart apres decodage, sommets apparies au plus proche
+    voisin (meshopt REORDONNE les sommets, les comparer par indice n'a pas de
+    sens) : corps 0,05 mm en moyenne et 0,13 mm au pire sur les 115 formes,
+    translations 0,5 mm, rotations 0,005 deg. A 14 bits (defaut de l'outil)
+    l'ecart monte a 0,53 mm pour 0,2 Mo de gain : on garde 16.
+
+    Le fichier declare EXT_meshopt_compression et KHR_mesh_quantization comme
+    REQUISES : le lecteur doit savoir decoder meshopt. La visionneuse de l'app
+    le sait (confirme 2026-09-22) ; Blender a besoin d'un importeur recent.
+    Retire en 2026-08 pour ces raisons, remis a la demande de l'app.
+    `SYNKRO_MESHOPT=0` le coupe.
+
+    Renvoie (mo_avant, mo_apres) ou None ; en cas d'echec le fichier d'origine
+    est conserve intact.
+    """
+    import shutil
+    import subprocess
+    if os.environ.get("SYNKRO_MESHOPT", "1") == "0":
+        if verbeux:
+            print("  [meshopt] coupe (SYNKRO_MESHOPT=0)")
+        return None
+    if shutil.which("gltf-transform") is None:
+        if verbeux:
+            print("  [meshopt] gltf-transform absent — fichier laisse tel quel")
+        return None
+    racine, ext = os.path.splitext(path)
+    tmp = racine + ".meshopt" + ext
+    try:
+        avant = os.path.getsize(path)
+        res = subprocess.run(
+            ["gltf-transform", "meshopt", path, tmp, "--level", "high",
+             "--quantize-position", str(int(bits_position))],
+            capture_output=True, text=True, timeout=600)
+        if res.returncode != 0 or not os.path.isfile(tmp):
+            if verbeux:
+                print(f"  [meshopt] echec (code {res.returncode}) : "
+                      f"{(res.stderr or res.stdout)[:300]}")
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+            return None
+        apres = os.path.getsize(tmp)
+        os.replace(tmp, path)
+        if verbeux:
+            print(f"  [meshopt] {avant/1e6:.1f} Mo -> {apres/1e6:.1f} Mo "
+                  f"(positions {bits_position} bits)")
+        return avant / 1e6, apres / 1e6
+    except Exception as e:                                  # pragma: no cover
+        if verbeux:
+            print(f"  [meshopt] exception {type(e).__name__}: {e}")
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+        return None
