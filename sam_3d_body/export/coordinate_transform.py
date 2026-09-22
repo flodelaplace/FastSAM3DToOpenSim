@@ -594,7 +594,20 @@ class CoordinateTransformer:
                                         drift_model=stable_floor_drift,
                                         min_span_travel_m=2.0,
                                         stance_floor_window_s=0.4 if _cam_mobile else 0.0,
-                                        stance_max_shift_m=0.60 if _cam_mobile else 0.30)
+                                        stance_max_shift_m=0.60 if _cam_mobile else 0.30,
+                                        # Lissage de la correction SOUS la cadence
+                                        # (course 2,6-3 Hz). A 4 Hz, elle suivait
+                                        # le rebond et en effacait un tiers :
+                                        # `outputs/FIX_run_hh` (2026-09-22),
+                                        # correction anti-correlee au rebond a
+                                        # -0,76 a 2,64 Hz, oscillation du bassin
+                                        # 7,0 -> 4,1 cm alors que des vols de
+                                        # 0,2 s en imposent deja 4,2 par la seule
+                                        # balistique. La derive de l'operateur,
+                                        # seule cible ici, est lente (secondes).
+                                        stance_lowpass_hz=float(__import__("os").environ.get(
+                                            "SYNKRO_STANCE_LP_MOBILE", "1.2"))
+                                        if _cam_mobile else 4.0)
             print(f"  [stable floor] source : {src} | rotation "
                   f"{'OUI' if sf.rotation_applied else 'non'} "
                   f"(inclinaison {sf.fit.tilt_deg:.2f}deg, {sf.fit.reason or 'ok'}) | "
