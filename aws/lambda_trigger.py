@@ -97,6 +97,13 @@ WORK_QUEUE_URL = os.environ.get("WORK_QUEUE_URL", "")
 WORKER_JOB_DEFINITION = os.environ.get("WORKER_JOB_DEFINITION",
                                        "synkro-shared-video-sam3d-worker-job")
 WORKER_NAME_PREFIX = "fastsam-worker"
+# MISE A L'ECHELLE. Un worker de plus des que la file depasse VIDEOS_PAR_WORKER
+# videos en attente PAR worker actif, jusqu'a MAX_WORKERS GPU. Vu le
+# 2026-09-24 (cours de M2) : 29 videos en 1 h 30, UN SEUL GPU les a enchainees
+# une par une — la lambda n'en lancait un que s'il n'y en avait aucun. Un
+# worker en trop s'eteint seul apres son delai d'inactivite (10 min).
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "3"))
+VIDEOS_PAR_WORKER = int(os.environ.get("VIDEOS_PAR_WORKER", "3"))
 # run_job.sh construit lui-meme <S3_OUTPUT_URI>/output_<TS>_<nom>/. Avec le
 # worker il n'y a plus de run_job.sh, donc le Lambda calcule le meme chemin —
 # meme convention, pour que rien ne bouge cote app.
@@ -536,6 +543,16 @@ def choose_queue(batch, key):
     return JOB_QUEUE, f"{depth} jobs en attente"
 
 
+def _nb_workers(batch):
+    """Nombre de workers en cours ou en demarrage sur la voie interactive."""
+    n = 0
+    for statut in ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"):
+        page = batch.list_jobs(jobQueue=JOB_QUEUE, jobStatus=statut, maxResults=100)
+        n += sum(1 for j in page.get("jobSummaryList", [])
+                 if j.get("jobName", "").startswith(WORKER_NAME_PREFIX))
+    return n
+
+
 def _worker_actif(batch):
     """Un worker tourne-t-il deja sur la voie interactive ?
 
@@ -573,10 +590,24 @@ def deposer_sur_worker(batch, sqs, s3_input, parsed, s3_output):
     # un worker en trop s'eteint tout seul apres son delai d'inactivite,
     # une video sans worker attend indefiniment.
     try:
-        besoin = not _worker_actif(batch)
+        n = _nb_workers(batch)
     except Exception as err:                               # noqa: BLE001
         print(f"WARN: etat worker illisible ({err}) -> on en lance un")
-        besoin = True
+        n = None
+    besoin = n is None or n == 0
+    if not besoin and n < MAX_WORKERS:
+        # File qui s'allonge : un GPU de plus. Profondeur illisible -> on ne
+        # force rien, le worker en place finira la file.
+        try:
+            att = sqs.get_queue_attributes(
+                QueueUrl=WORK_QUEUE_URL,
+                AttributeNames=["ApproximateNumberOfMessages"])["Attributes"]
+            en_attente = int(att.get("ApproximateNumberOfMessages", 0))
+            if en_attente >= VIDEOS_PAR_WORKER * n:
+                print(f"{en_attente} videos en attente pour {n} worker(s) -> un de plus")
+                besoin = True
+        except Exception as err:                           # noqa: BLE001
+            print(f"WARN: profondeur SQS illisible ({err})")
     if besoin:
         batch.submit_job(jobName=WORKER_NAME_PREFIX, jobQueue=JOB_QUEUE,
                          jobDefinition=WORKER_JOB_DEFINITION)
@@ -774,25 +805,29 @@ def _self_test():
 
 
 class _FakeSqs:
-    def __init__(self):
-        self.envois = []
+    def __init__(self, depth=0):
+        self.envois, self.depth = [], depth
 
     def send_message(self, **kw):
         self.envois.append(kw)
         return {"MessageId": "msg-1"}
+
+    def get_queue_attributes(self, **kw):
+        return {"Attributes": {"ApproximateNumberOfMessages": str(self.depth)}}
 
 
 class _FakeBatchWorker:
     """Batch factice : `worker` dit s'il y a deja un worker en cours."""
 
     def __init__(self, worker=False, boom=False):
-        self.worker, self.boom, self.soumis = worker, boom, []
+        # `worker` : False/True, ou un NOMBRE de workers en cours.
+        self.worker, self.boom, self.soumis = int(worker), boom, []
 
     def list_jobs(self, **kw):
         if self.boom:
             raise RuntimeError("AccessDenied simule")
         if self.worker and kw["jobStatus"] == "RUNNING":
-            return {"jobSummaryList": [{"jobName": "fastsam-worker"}]}
+            return {"jobSummaryList": [{"jobName": "fastsam-worker"}] * self.worker}
         # Un job video ne doit PAS etre pris pour un worker.
         if kw["jobStatus"] == "RUNNABLE":
             return {"jobSummaryList": [{"jobName": "fastsam-squat"}]}
@@ -830,6 +865,21 @@ def _worker_test():
     _, lance = deposer_sur_worker(b, q, "s3://b/in.mp4", parsed, "s3://b/out/")
     verifie("worker deja actif -> aucun nouveau", (not lance) and not b.soumis)
     verifie("la video est quand meme deposee", len(q.envois) == 1)
+
+    # File qui s'allonge : 1 worker, 5 videos en attente -> un second GPU.
+    b, q = _FakeBatchWorker(worker=1), _FakeSqs(depth=5)
+    _, lance = deposer_sur_worker(b, q, "s3://b/in.mp4", parsed, "s3://b/out/")
+    verifie("file longue -> worker supplementaire", lance and len(b.soumis) == 1)
+
+    # 1 worker, 1 video en attente -> pas besoin d'un second.
+    b, q = _FakeBatchWorker(worker=1), _FakeSqs(depth=1)
+    _, lance = deposer_sur_worker(b, q, "s3://b/in.mp4", parsed, "s3://b/out/")
+    verifie("file courte -> pas de second worker", not lance)
+
+    # Plafond : MAX_WORKERS deja actifs -> jamais plus, meme file enorme.
+    b, q = _FakeBatchWorker(worker=MAX_WORKERS), _FakeSqs(depth=100)
+    _, lance = deposer_sur_worker(b, q, "s3://b/in.mp4", parsed, "s3://b/out/")
+    verifie("plafond de workers respecte", not lance)
 
     # API muette -> on lance quand meme : un worker de trop s'eteint seul,
     # une video sans worker attend indefiniment.

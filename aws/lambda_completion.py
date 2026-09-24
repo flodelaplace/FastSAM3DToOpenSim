@@ -25,6 +25,49 @@ S3_OUTPUT_URI = os.environ.get(
 SPOT_PRICE_USD_PER_HOUR = 0.16
 # Prefixe des jobs worker persistant, aligne sur aws/lambda_trigger.py.
 WORKER_NAME_PREFIX = os.environ.get("WORKER_NAME_PREFIX", "fastsam-worker")
+WORK_QUEUE_URL = os.environ.get(
+    "WORK_QUEUE_URL",
+    "https://sqs.eu-west-3.amazonaws.com/763695379040/synkro-shared-video-sam3d-work")
+JOB_QUEUE = os.environ.get("JOB_QUEUE", "synkro-shared-video-sam3d-queue")
+WORKER_JOB_DEFINITION = os.environ.get("WORKER_JOB_DEFINITION",
+                                       "synkro-shared-video-sam3d-worker-job")
+
+
+def _relancer_worker_si_file():
+    """Relance un worker si la file SQS n'est pas vide et qu'aucun ne tourne.
+
+    Rien d'autre ne le fait : la lambda de depot ne reveille un worker qu'a
+    l'arrivee d'une NOUVELLE video. Vu le 2026-09-24 (cours de M2, 29 videos) :
+    le worker meurt (memoire), 11 videos restent en file, aucun job ne tourne
+    et rien ne bouge jusqu'au prochain depot. Meme trou quand un worker sort
+    NORMALEMENT (20 videos traitees, ou age maximum) avec une file encore
+    pleine. Renvoie une phrase pour le mail.
+    """
+    try:
+        sqs = boto3.client("sqs")
+        a = sqs.get_queue_attributes(
+            QueueUrl=WORK_QUEUE_URL,
+            AttributeNames=["ApproximateNumberOfMessages",
+                            "ApproximateNumberOfMessagesNotVisible"])["Attributes"]
+        en_file = int(a.get("ApproximateNumberOfMessages", 0))
+        en_cours = int(a.get("ApproximateNumberOfMessagesNotVisible", 0))
+        if en_file + en_cours == 0:
+            return "File vide : aucun worker relance."
+        batch = boto3.client("batch")
+        for statut in ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING"):
+            for j in batch.list_jobs(jobQueue=JOB_QUEUE, jobStatus=statut,
+                                     maxResults=100).get("jobSummaryList", []):
+                if j.get("jobName", "").startswith(WORKER_NAME_PREFIX):
+                    return (f"{en_file + en_cours} video(s) en file ; un autre "
+                            f"worker tourne deja ({statut}).")
+        r = batch.submit_job(jobName=WORKER_NAME_PREFIX, jobQueue=JOB_QUEUE,
+                             jobDefinition=WORKER_JOB_DEFINITION)
+        print(f"WORKER RELANCE {r['jobId']} ({en_file}+{en_cours} en file)")
+        return (f"{en_file + en_cours} video(s) en file : NOUVEAU worker lance "
+                f"automatiquement (job {r['jobId']}).")
+    except Exception as err:                                  # noqa: BLE001
+        print(f"WARN relance worker impossible : {err}")
+        return f"ATTENTION : relance automatique impossible ({err}). A relancer a la main."
 
 
 def _prevenir_worker_eteint(job_id, job_name, created_at, started_at,
@@ -41,7 +84,9 @@ def _prevenir_worker_eteint(job_id, job_name, created_at, started_at,
     session = (stopped_at - started_at) if (stopped_at and started_at) else None
     cout = (session / 3_600_000 * SPOT_PRICE_USD_PER_HOUR) if session else None
 
+    relance = _relancer_worker_si_file()
     l = ["EXTINCTION DU WORKER — ceci n'est PAS une analyse.", "",
+         relance, "",
          "Le worker persistant s'est eteint apres son delai d'inactivite, et la",
          "machine GPU a ete liberee. C'est le fonctionnement normal : il se",
          "rallumera au prochain depot de video.", "",
@@ -87,14 +132,16 @@ def _prevenir_worker_en_echec(detail, job_id, job_name, status, status_reason,
             lignes += ["",
                        "Code 75 = erreur CUDA. Le worker s'est arrete VOLONTAIREMENT :",
                        "l'etat du GPU etait irrecuperable et continuer aurait produit des",
-                       "resultats faux sans le signaler. Batch relance un worker propre.",
+                       "resultats faux sans le signaler. Un worker propre est relance",
+                       "ci-dessous si des videos attendent.",
                        "Les videos en cours reviennent en file automatiquement."]
     if status_reason:
         lignes.append(f"Raison        : {status_reason}")
-    lignes += ["",
-               "Les videos non traitees restent dans la file SQS et seront reprises",
-               "par le prochain worker. Apres trois tentatives elles partent dans",
-               "synkro-shared-video-sam3d-dlq.", ""]
+    relance = _relancer_worker_si_file()
+    lignes += ["", relance, "",
+               "Les videos non traitees restent dans la file SQS et sont reprises",
+               "par le worker suivant. Une video qui fait tomber le worker trois",
+               "fois part dans synkro-shared-video-sam3d-dlq.", ""]
     if log_stream:
         lignes += ["─── Logs ───",
                    f"aws logs tail /aws/batch/synkro-shared-video-sam3d "

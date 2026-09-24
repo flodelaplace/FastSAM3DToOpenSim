@@ -34,6 +34,18 @@ MAX_JOBS = int(os.environ.get("MAX_JOBS_PER_WORKER", "20"))
 MAX_AGE_SECONDS = int(os.environ.get("MAX_WORKER_AGE_SECONDS", "14400"))
 HEARTBEAT_SECONDS = int(os.environ.get("HEARTBEAT_SECONDS", "60"))
 VISIBILITY_SECONDS = int(os.environ.get("VISIBILITY_SECONDS", "1200"))
+# BUDGET D'IMAGES PAR VIDEO. Le post-traitement garde le maillage de chaque
+# image en memoire : le 2026-09-24, un geste libre de 3 min 19 (5 949 images)
+# a tue le worker (OutOfMemoryError, 14 Go) apres 20 min de calcul, et le
+# message, remis en file, aurait tue les workers suivants un par un. Au-dela
+# du budget : on descend d'abord a 30 images/s, puis on ne traite que le debut
+# de la video, et on le DIT (mail + analysis_note.json dans la sortie).
+# Mesure locale sur cette video (2026-09-24) : pic 12,75 Go a 3 000 images,
+# dont ~7,2 Go fixes (modeles + inference) et ~1,8 Mo par image au
+# post-traitement. Le worker a 14 Go et garde un residu d'une video a
+# l'autre : 1 800 images (60 s a 30 images/s) visent ~10,5 Go de pic.
+MAX_FRAMES = int(os.environ.get("MAX_FRAMES_PER_VIDEO", "1800"))
+FPS_REPLI = 30.0
 
 # Code de sortie reserve aux etats CUDA irrecuperables : Batch relancera un
 # worker neuf plutot que de continuer sur un GPU corrompu.
@@ -107,6 +119,58 @@ def _preparer_video(job, dossier):
     return coupe
 
 
+def _compter_images(video):
+    """(fps, nombre d'images) par ffprobe ; (None, None) si illisible."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=avg_frame_rate,nb_frames,duration", "-of", "json", str(video)],
+            capture_output=True, text=True, timeout=60, check=True)
+        st = json.loads(r.stdout)["streams"][0]
+        num, den = (st.get("avg_frame_rate") or "0/1").split("/")
+        fps = float(num) / float(den or 1) if float(den or 1) else 0.0
+        n = int(st["nb_frames"]) if str(st.get("nb_frames", "")).isdigit() else \
+            int(float(st.get("duration") or 0) * fps)
+        return (fps or None), (n or None)
+    except Exception as err:                                # noqa: BLE001
+        log(f"  ffprobe illisible ({err}) — pas de budget d'images applique")
+        return None, None
+
+
+def _budget_images(video, extra_args):
+    """Arguments a ajouter pour tenir dans MAX_FRAMES, et la note a publier.
+
+    Renvoie (args, note) ; note vaut None si la video tient dans le budget.
+    Respecte un --max_frames / --target_fps deja fourni par le message.
+    """
+    if MAX_FRAMES <= 0 or "--max_frames" in extra_args:
+        return [], None
+    fps, n = _compter_images(video)
+    if not fps or not n or n <= MAX_FRAMES:
+        return [], None
+    args, fps_eff = [], fps
+    if fps > FPS_REPLI + 5 and "--target_fps" not in extra_args:
+        args += ["--target_fps", str(FPS_REPLI)]
+        fps_eff = fps / max(1, round(fps / FPS_REPLI))
+    n_eff = int(n * fps_eff / fps)
+    note = {"frames_total": n, "fps_source": round(fps, 2),
+            "fps_processed": round(fps_eff, 2), "max_frames": MAX_FRAMES,
+            "truncated": False}
+    if n_eff > MAX_FRAMES:
+        args += ["--max_frames", str(MAX_FRAMES)]
+        note["truncated"] = True
+        note["seconds_processed"] = round(MAX_FRAMES / fps_eff, 1)
+        note["seconds_total"] = round(n / fps, 1)
+    note["message_fr"] = (
+        f"Video longue ({n} images, {n / fps:.0f} s) : "
+        + (f"seules les {note['seconds_processed']:.0f} premieres secondes "
+           f"ont ete analysees" if note["truncated"] else
+           f"analysee a {fps_eff:.0f} images/s au lieu de {fps:.0f}")
+        + " pour tenir dans la memoire du serveur.")
+    log(f"  budget d'images : {note['message_fr']}")
+    return args, note
+
+
 def _envoyer_resultats(dossier_sortie, s3_output):
     seau, prefixe = _split_s3(s3_output)
     prefixe = prefixe.rstrip("/")
@@ -142,6 +206,8 @@ def _prevenir(job, dossier_sortie, duree, faits=0, erreur=None):
               "Le message reste en file : SQS le représentera. Après trois",
               "tentatives il partira en file d'échec (synkro-shared-video-sam3d-dlq)."]
     else:
+        if job.get("_note"):
+            l += ["", f"⚠ {job['_note']}"]
         l += ["", "─── Temps ───",
               f"Traitement    : {_duree(duree)}",
               "  (le chargement des modèles, ~130 s, n'est PAS repayé :",
@@ -216,10 +282,17 @@ def traiter(session, job, dossier):
         "--fallback_lower_bbox", "0.05", "--fallback_nms", "0.9",
         "--fallback_iou_thresh", "0.5",
     ] + shlex.split(job.get("extra_args", ""))
+    ajout, note = _budget_images(video, job.get("extra_args", ""))
+    argv += ajout
 
     t = time.time()
     session.run(argv)
     duree = time.time() - t
+    if note:
+        job["_note"] = note["message_fr"]
+        sortie.mkdir(parents=True, exist_ok=True)
+        (sortie / "analysis_note.json").write_text(
+            json.dumps(note, ensure_ascii=False, indent=2))
     n = _envoyer_resultats(sortie, job["s3_output"])
     log(f"  {n} fichiers envoyés vers {job['s3_output']}")
     return duree
