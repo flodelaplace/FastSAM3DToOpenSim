@@ -27,6 +27,7 @@ Module tokens (activent l'auto-analytics post-SAM3D) :
     sprint               --module d3.sprint_start
     squat                --module d3.squat
     cmj / jump           --module d3.jump
+    dj / dropjump        --module d3.drop_jump   (depart d'une marche, rebond)
     sts                  --module d3.sit_to_stand
     cycling              --module d3.cycling
     slh                  --module d3.single_leg_hop   (RTS post-LCA, LSI)
@@ -139,6 +140,8 @@ MODULE_TOKENS = {
     "sls": "d3.single_leg_squat",   # RTS : single leg squat (valgus)
     "cmj": "d3.jump",
     "jump": "d3.jump",
+    "dj": "d3.drop_jump",           # drop jump : depart d'une marche + rebond
+    "dropjump": "d3.drop_jump",
     "sts": "d3.sit_to_stand",
     "cycling": "d3.cycling",
 }

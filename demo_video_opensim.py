@@ -1608,7 +1608,7 @@ def main(args, estimator=None, visualizer=None):
     #     médian → effectivement les PIEDS sont locked (pas le pelvis).
     #   • clamp Y≥0 (défaut floor_moge) → empêche traversée sol.
     _auto_feet_anchor = args.module in ("d3.squat", "d3.sit_to_stand",
-                                          "d3.jump")
+                                          "d3.jump", "d3.drop_jump")
     # ⚠️ Le SQUAT sort du mode stationnaire (Florian, 2026-09-09). Ce mode
     # recentre le bassin a chaque image et supprime PAR CONSTRUCTION toute
     # avancee horizontale : un sujet qui fait ses squats puis s'eloigne a pied
@@ -1617,7 +1617,8 @@ def main(args, estimator=None, visualizer=None):
     # laisse avancer -- a la condition, desormais remplie, que les pieds soient
     # reellement au sol pour que la detection de contact par hauteur fonctionne
     # (mode appui du sol stable accepte : pied median +0,4 cm).
-    _auto_stationary = args.module in ("d3.sit_to_stand", "d3.jump", "d3.cycling")
+    _auto_stationary = args.module in ("d3.sit_to_stand", "d3.jump", "d3.drop_jump",
+                                        "d3.cycling")
     # CAMERA QUI SUIT LE SUJET (--handheld, jeton `handheld`) : la translation
     # de camera estimee melange le deplacement du sujet et celui de l'operateur,
     # elle ne vaut rien en XZ. On traite alors comme un tapis : bassin centre
@@ -2005,7 +2006,7 @@ def main(args, estimator=None, visualizer=None):
     # marche a preserver). Mesure sur `outputs/SQUAT_XZ` : excursion des pieds
     # 21,9/19,6 cm en mode locomotion, 3,7/4,3 en mode en place.
     _en_place = args.module in ("d3.squat", "d3.sit_to_stand",
-                                "d3.single_leg_squat", "d3.jump")
+                                "d3.single_leg_squat", "d3.jump", "d3.drop_jump")
     # GESTE LIBRE : la correction suit les sauts de la scene jusqu'a 8 Hz, comme
     # en place, mais avec les ancres de la locomotion (un vol y est reel, et il
     # n'y a pas de borne de 25 cm : sur le basket la trajectoire fausse
@@ -2107,7 +2108,7 @@ def main(args, estimator=None, visualizer=None):
     # exactement cela — il ne touche pas a Y — et l'anti-glissement reste
     # actif par-dessus pour les phases d'appui.
     if _auto_feet_anchor and not args.feet_anchor and _anti_skate_on \
-            and args.module != "d3.jump":
+            and args.module not in ("d3.jump", "d3.drop_jump"):
         print("  [feet_anchor] AUTO DESACTIVE : l'anti-glissement fait le meme "
               "travail par appui, sans bloquer le deplacement")
         _auto_feet_anchor = False
@@ -3359,7 +3360,7 @@ def build_parser():
     # ── Auto-analytics (synkro-analytics) ────────────────────────────────
     parser.add_argument("--module", default=None,
                         choices=[None, "d3.running", "d3.gait", "d3.squat",
-                                 "d3.jump", "d3.sit_to_stand", "d3.cycling",
+                                 "d3.jump", "d3.drop_jump", "d3.sit_to_stand", "d3.cycling",
                                  "d3.sprint_start", "d3.single_leg_hop",
                                  "d3.single_leg_squat"],
                         help="Après SAM3D, appelle synkro-analytics avec ce module. "
