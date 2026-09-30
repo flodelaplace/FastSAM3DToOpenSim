@@ -22,7 +22,7 @@ La translation globale vient de `cam_t`, donc d'une **profondeur estimée image 
 Sur le CMJ `NUIT_jump` (30 i/s, vol de 0,59 s), le centre de masse **recule de 8,4 cm en
 profondeur** pendant la montée, puis repart en avant : il s'écarte de 8,8 cm de la droite
 décollage → réception, alors qu'aucune force horizontale n'agit sur un corps en l'air. Même
-chose sur les deux drop jumps d'AWS (4,9 et 6,5 cm en profondeur, jusqu'à 8,5 cm en latéral)
+chose sur les deux drop jumps de production (4,9 et 6,5 cm en profondeur, jusqu'à 8,5 cm en latéral)
 et sur le hop unipodal (9,2 cm en médiane, 17,3 cm au pire bond).
 
 X est bien l'axe de profondeur : `CAMERA_TO_OPENSIM` envoie Z caméra sur X OpenSim (au
@@ -295,7 +295,7 @@ ne rejoue que XZ :
 même nombre d'images (règle de `_lateral_shifts`). Même ordre que l'application sur les
 marqueurs : lissage → anti-glissement → physique.
 
-### 7.5 Validation avant défaut (Docker local, pas AWS)
+### 7.5 Validation avant défaut (Docker local)
 
 1. Rebuild local, passage de `CMJYT.mp4` (`d3.jump`), d'un drop jump et de `single_leg_hop.mp4`
    (`d3.single_leg_hop`) avec et sans `--physique_trajectoire`, `SYNKRO_DUMP_ETAPES=1`.
