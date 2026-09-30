@@ -115,7 +115,7 @@ rééchantillonnage si les longueurs diffèrent).
   et anti-glissement) : on rejoue les étages existants avec les réglages de
   `demo_video_opensim.py` pour le module (colonne « existant »), puis l'étage physique ; (b) TRC
   pré-IK `markers_<nom>.trc`, déjà passés par les étages existants ; (c) les deux drop jumps
-  d'AWS du 2026-09-24 (`51357ed9`, 60 i/s ; `5d5cdc5b`, 30 i/s), TRC pré-IK téléchargés en
+  de production du 2026-09-24 (`A`, 60 i/s ; `B`, 30 i/s), TRC pré-IK téléchargés en
   lecture seule.
 - **Phases fixées** : détectées une fois sur l'entrée de l'étage, réutilisées avant et après
   (on juge la trajectoire, pas la détection).
@@ -145,13 +145,13 @@ maximale du décalage horizontal / vertical.
 | essai | vol | écart profondeur X | écart latéral Z | RMS parabole | montée CM (Bosco gT²/8) | distance du vol | glissement méd / P90 | dépl. net | corr h / v |
 |---|---|---|---|---|---|---|---|---|---|
 | `NUIT_jump` CMJ | 0,59 s | **8,8 → 0** (recul −8,4 → 0) | 3,3 → 0 | 1,3 → 0 cm | 50,4 → 46,9 (43,2) | 1,5 → 1,5 cm | 2,6/3,4 → 2,6/3,5 | 0,226 → 0,226 m | 8,9 / 3,7 cm |
-| drop jump `51357ed9` | 0,48 s | **4,9 → 0** (avance +5,8 → +0,5) | 3,1 → 0 | 0,7 → 0 | 27,0 → 28,7 (28,7) | 8,1 → 8,1 | 1,5/9,0 → 1,4/8,8 | 0,170 → 0,170 | 5,4 / 2,7 |
-| drop jump `5d5cdc5b` | 0,47 s | **6,5 → 0** (+7,7 → +1,7) | **8,5 → 0** | 0,7 → 0 | 23,2 → 25,1 (26,7) | 3,0 → 3,0 | 1,4/6,7 → 1,4/6,9 | 0,172 → 0,172 | 10,0 / 2,4 |
+| drop jump `A` | 0,48 s | **4,9 → 0** (avance +5,8 → +0,5) | 3,1 → 0 | 0,7 → 0 | 27,0 → 28,7 (28,7) | 8,1 → 8,1 | 1,5/9,0 → 1,4/8,8 | 0,170 → 0,170 | 5,4 / 2,7 |
+| drop jump `B` | 0,47 s | **6,5 → 0** (+7,7 → +1,7) | **8,5 → 0** | 0,7 → 0 | 23,2 → 25,1 (26,7) | 3,0 → 3,0 | 1,4/6,7 → 1,4/6,9 | 0,172 → 0,172 | 10,0 / 2,4 |
 | `NUIT_hop`, 4 bonds | 0,07-0,50 s | **9,2 → 0** (max 17,3) | 2,5 → 0 | 0,8 → 0 | — | 114,6 → 114,1 ; 151,3 → 151,2 | 5,7/14,2 → 5,0/17,1 (explosif **5,0/13,7**) | 4,102 → 4,087 (4,091) | 23,6 / 4,6 |
 
 `MO_cmj` porte les mêmes marqueurs que `NUIT_jump` (résultats identiques). Le drop jump
-`51357ed9` a un second vol court (0,08 s) avant le vol principal, corrigé aussi ; la station
-sur la box est écartée (non balistique : « gravité » de 0,3 m/s²), celle de `5d5cdc5b` comme
+`A` a un second vol court (0,08 s) avant le vol principal, corrigé aussi ; la station
+sur la box est écartée (non balistique : « gravité » de 0,3 m/s²), celle de `B` comme
 « passage en hauteur » (1,0 s).
 
 Lecture :
@@ -215,7 +215,7 @@ flottant). Test unitaire dédié (`test_translation_rigide_aucun_angle_ne_change
    les gardes les écartent mais ne les rattrapent pas. La descente d'une box n'est corrigée que
    si la station sur la box est reconnue comme appui (seuil de 10 cm) : non, en général.
 3. **±1 image de flottement** : la correction verticale peut décaler d'une image le décollage ou
-   la réception redétectés après coup (`NUIT_hop`, drop jump `51357ed9`). Le temps de vol publié
+   la réception redétectés après coup (`NUIT_hop`, drop jump `A`). Le temps de vol publié
    par `d3.jump` doit rester lu **avant** l'étage, ou sur les semelles de la sortie finale en
    acceptant ±17-33 ms.
 4. **Le raccord C1 n'est pas garanti** : la vitesse mesurée juste avant le décollage est parfois
