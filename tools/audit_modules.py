@@ -30,9 +30,18 @@ L_EP    = borne(r"    _en_place = ")
 L_TRAJ  = borne(r"    _traj_lisse = ")
 L_FA    = borne(r"    if _auto_feet_anchor and not args.feet_anchor")
 
+def fin_parenthese(debut):
+    """Derniere ligne de l'expression ouverte a `debut` (parentheses equilibrees)."""
+    n, k = 0, debut
+    while True:
+        n += SRC[k - 1].count("(") - SRC[k - 1].count(")")
+        if n <= 0:
+            return k
+        k += 1
+
 MORCEAUX = [bloc(L_LAT, L_STEFF), bloc(L_CLAMP, L_CLAMP + 4),
             bloc(L_SF, L_SFEND), bloc(L_AS, L_ASEND),
-            bloc(L_EP, L_EP + 1), bloc(L_TRAJ, L_TRAJ + 1),
+            bloc(L_EP, L_EP + 1), bloc(L_TRAJ, fin_parenthese(L_TRAJ)),
             bloc(L_FA, L_FA + 4)]   # suppression effective de feet_anchor
 
 DEFAUTS = dict(module=None, stationary=False, handheld=False, danseuse=False,
@@ -42,7 +51,8 @@ DEFAUTS = dict(module=None, stationary=False, handheld=False, danseuse=False,
                anti_skate_variance=False, floor=False, floor_seated=False,
                floor_moge=False, no_floor_moge=False, no_lean_fix=False,
                no_world_frame=False, lateral_anchor=False, no_lateral_anchor=False,
-               cycling_position="road", hop_type=None, leg=None)
+               cycling_position="road", hop_type=None, leg=None,
+               compute_com=False)
 
 def regler(**kw):
     a = argparse.Namespace(**{**DEFAUTS, **kw})
@@ -68,6 +78,9 @@ CAS = [
     ("cyclisme route",     dict(module="d3.cycling")),
     ("cyclisme danseuse",  dict(module="d3.cycling", danseuse=True)),
     ("cyclisme cam portee",dict(module="d3.cycling", handheld=True)),
+    ("tennis service",     dict(module="d3.tennis_serve")),
+    ("tennis coup droit",  dict(module="d3.tennis_forehand")),
+    ("tennis revers",      dict(module="d3.tennis_backhand")),
 ]
 COLS = [("stationnaire", "_stationary_effective"), ("verrou vertical", "_auto_lock_vertical"),
         ("verrou lateral", "_auto_lock_lateral"), ("anti-glisse", "_anti_skate_on"),

@@ -32,11 +32,26 @@ Module tokens (activent l'auto-analytics post-SAM3D) :
     cycling              --module d3.cycling
     slh                  --module d3.single_leg_hop   (RTS post-LCA, LSI)
     sls                  --module d3.single_leg_squat (RTS valgus unipodal)
+    tsv                  --module d3.tennis_serve     (service ; --compute_com force)
+    tcd                  --module d3.tennis_forehand  (coup droit)
+    trv                  --module d3.tennis_backhand  (revers)
 
 Tokens RTS (tests unipodaux — une vidéo = une jambe, LSI agrégé côté app) :
     single|triple|crossover|timed6m   type de saut (slh) : --hop_type
     legR | legL          jambe testée (slh/sls) : --leg
     Ex: hop_marie__h172_m64_sxF_slh_triple_legR.mp4  → triple hop jambe D
+
+Tokens tennis (tsv/tcd/trv ; vide = detection automatique dans le module) :
+    handR | handL        main qui frappe : --hand (subject_info["hand"])
+    bh1 | bh2            revers a une / deux mains (trv seulement) :
+                         --backhand_type one_handed / two_handed
+    Camera FIXE (de profil pour le service, derriere le joueur pour coup droit
+    et revers). Ne pas mettre `st` ni `ll` : le saut, l'avancee et les
+    deplacements lateraux sont des mesures. `ca` est sans effet : le sol
+    stable, actif par defaut, passe avant l'ancrage conscient du contact, et
+    l'anti-glissement (pieds plantes pendant la frappe) est deja actif.
+    Ex: service_lea__h170_m60_sxF_tsv_handR.mp4     → service droitiere
+        revers_tom__h182_m74_sxM_trv_bh2_handL.mp4  → revers 2 mains gaucher
 
 Flags avancés (auto-dispatch par --module rend ces flags souvent redondants) :
     st                   --stationary   (auto pour cmj/squat/sts/cycling)
@@ -144,7 +159,22 @@ MODULE_TOKENS = {
     "dropjump": "d3.drop_jump",
     "sts": "d3.sit_to_stand",
     "cycling": "d3.cycling",
+    "tsv": "d3.tennis_serve",       # tennis : service (centre de masse force)
+    "tcd": "d3.tennis_forehand",    # tennis : coup droit
+    "trv": "d3.tennis_backhand",    # tennis : revers
+    "jshot": "d3.basketball_jump_shot",   # basket : tir en suspension
+    "ft": "d3.basketball_free_throw",     # basket : lancer franc
+    "freethrow": "d3.basketball_free_throw",
+    "stopj": "d3.basketball_stop_jump",   # basket : arret-saut
+    "jumpstop": "d3.basketball_stop_jump",
+    "cut": "d3.football_cut",             # football : changement de direction
+    "kick": "d3.football_kick",           # football : frappe
+    "vspike": "d3.volleyball_spike",      # volley : attaque avec elan
+    "spike": "d3.volleyball_spike",
+    "vblock": "d3.volleyball_block",      # volley : contre
 }
+HAND_TOKENS = {"handR": "R", "handL": "L"}                      # tennis : main
+BACKHAND_TOKENS = {"bh1": "one_handed", "bh2": "two_handed"}    # tennis : revers
 
 _SANITIZE_RE = re.compile(r"[^a-zA-Z0-9_-]")
 
@@ -206,6 +236,8 @@ def parse_filename(basename):
     camera_side = None       # camR / camL → --camera_side (vue 3/4 cyclisme)
     hop_type = None          # single/triple/crossover/timed6m → single_leg_hop RTS
     leg = None               # legR / legL → jambe testée (tests unipodaux RTS)
+    hand = None              # handR / handL → main qui frappe (tennis)
+    backhand_type = None     # bh1 / bh2 → revers une / deux mains (tennis)
 
     for t in tokens:
         m = HEIGHT_RE.match(t)
@@ -353,6 +385,16 @@ def parse_filename(basename):
                 raise FilenameParseError(f"Duplicate leg token: '{t}'")
             leg = t[-1]  # R / L
             continue
+        if t in HAND_TOKENS:
+            if hand is not None:
+                raise FilenameParseError(f"Duplicate hand token: '{t}'")
+            hand = HAND_TOKENS[t]
+            continue
+        if t in BACKHAND_TOKENS:
+            if backhand_type is not None:
+                raise FilenameParseError(f"Duplicate backhand token: '{t}'")
+            backhand_type = BACKHAND_TOKENS[t]
+            continue
         raise FilenameParseError(f"Unknown token: '{t}'")
 
     if heights is None:
@@ -466,6 +508,18 @@ def parse_filename(basename):
                     f"Token 'leg{leg}' réservé aux tests unipodaux (slh/sls)."
                 )
             extra += ["--leg", leg]
+        if hand is not None:
+            if not module.startswith("d3.tennis_"):
+                raise FilenameParseError(
+                    f"Token 'hand{hand}' réservé aux modules tennis (tsv/tcd/trv)."
+                )
+            extra += ["--hand", hand]
+        if backhand_type is not None:
+            if module != "d3.tennis_backhand":
+                raise FilenameParseError(
+                    "Tokens bh1/bh2 réservés au module 'trv' (tennis_backhand)."
+                )
+            extra += ["--backhand_type", backhand_type]
     elif cycling_position is not None:
         raise FilenameParseError(
             f"Token position '{cycling_position}' nécessite le module 'cycling'."
@@ -477,6 +531,10 @@ def parse_filename(basename):
     elif hop_type is not None or leg is not None:
         raise FilenameParseError(
             "Tokens hop/leg nécessitent un module RTS (slh/sls)."
+        )
+    elif hand is not None or backhand_type is not None:
+        raise FilenameParseError(
+            "Tokens hand/bh nécessitent un module tennis (tsv/tcd/trv)."
         )
 
     # Toujours activer --floor_moge (fix Y-DOWN 2026-07 : marche pour tous les
@@ -756,6 +814,19 @@ def _self_test():
           "extra_args": "--multi_person --person_heights 1.85,1.70 --run_ik_per_person --write_combined_trc --stationary --compute_com --floor_moge",
           "trim_start": "", "trim_end": ""}),
         ("Squat.MP4__h185_e5.MOV", None),  # tests uppercase ext handling
+        # Tennis (modules V1 du 2026-09-29) : main et type de revers relayes.
+        ("service_lea__h170_m60_sxF_tsv_handR.mp4",
+         {"raw_name": "service_lea",
+          "extra_args": "--person_height 1.70 --module d3.tennis_serve --mass_kg 60 --sex F --hand R --floor_moge",
+          "trim_start": "", "trim_end": ""}),
+        ("cd_tom__h182_m74_tcd.mp4",
+         {"raw_name": "cd_tom",
+          "extra_args": "--person_height 1.82 --module d3.tennis_forehand --mass_kg 74 --floor_moge",
+          "trim_start": "", "trim_end": ""}),
+        ("revers_tom__h182_m74_sxM_trv_bh2_handL_ca.mp4",
+         {"raw_name": "revers_tom",
+          "extra_args": "--person_height 1.82 --contact_anchor --module d3.tennis_backhand --mass_kg 74 --sex M --hand L --backhand_type two_handed --floor_moge",
+          "trim_start": "", "trim_end": ""}),
     ]
     # Last one just validates uppercase ext → let's just check it doesn't raise
     cases_reject = [
@@ -768,6 +839,10 @@ def _self_test():
         ("foo__h185.exe", "Unsupported extension"),
         ("__h185.mp4", "Empty base name"),
         ("foo__.mp4", "Empty meta block"),
+        ("foo__h185_m70_tcd_bh1.mp4", "réservés au module 'trv'"),
+        ("foo__h185_m70_squat_handR.mp4", "réservé aux modules tennis"),
+        ("foo__h185_handL.mp4", "nécessitent un module tennis"),
+        ("foo__h185_m70_trv_bh1_bh2.mp4", "Duplicate backhand"),
     ]
 
     ok = 0

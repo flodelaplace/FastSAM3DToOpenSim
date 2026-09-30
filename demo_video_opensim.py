@@ -1600,6 +1600,24 @@ def main(args, estimator=None, visualizer=None):
     #    biomeca du saut). NO_FLOOR_CLAMP=1 propagé.
     # - cycling : assis pédale → --stationary + --lock_vertical
     _auto_lock_lateral = args.module in ("d3.running", "d3.gait", "d3.sprint_start")
+    # TENNIS (modules V1 du 2026-09-29, aucune video de tennis encore traitee).
+    # Les trois gestes gardent la TRANSLATION REELLE : jamais --stationary ni
+    # --feet_anchor (le saut et l'avancee dans le terrain du service sont des
+    # mesures, les vitesses lineaires du coup droit et du revers en dependent),
+    # et ni verrouillage ni recalage lateral (les deplacements lateraux sont
+    # reels) — ils ne figurent donc dans aucune de ces listes. Le service
+    # demande le centre de masse (distance centre de masse - pied a MKF,
+    # gao2026) : --compute_com est force ici, sans quoi la metrique manque.
+    # Le coup droit et le revers suivent le depart sprint (lissage rigide de
+    # trajectoire, voir `_traj_lisse`), le service suit le saut sans le mode
+    # en place (borne de 25 cm incompatible avec l'avancee dans le terrain).
+    # Pieds plantes pendant la frappe : c'est l'anti-glissement, actif par
+    # defaut (camera fixe). --contact_anchor (jeton `ca`), souhaite par le
+    # constructeur des modules, n'apporterait rien : le sol stable, actif par
+    # defaut, passe avant lui dans `transform()` (voir tools/audit_modules.py).
+    if args.module == "d3.tennis_serve" and not args.compute_com:
+        args.compute_com = True
+        print("  [tennis_serve] --compute_com force (distance centre de masse - pied).")
     # Activités "en place" (subject bouge peu en XZ globalement) :
     # combo --stationary + --feet_anchor + clamp Y≥0.
     #   • --stationary → active injection cam_t.Y (nécessaire pour capter la
@@ -1607,8 +1625,10 @@ def main(args, estimator=None, visualizer=None):
     #   • --feet_anchor → shift XZ post pour que le midpoint pieds reste au
     #     médian → effectivement les PIEDS sont locked (pas le pelvis).
     #   • clamp Y≥0 (défaut floor_moge) → empêche traversée sol.
+    # Gestes sportifs SUR PLACE (V1 du 2026-09-29) : traites comme le CMJ.
+    _SPORTS_SUR_PLACE = ("d3.basketball_jump_shot", "d3.basketball_free_throw", "d3.volleyball_block")
     _auto_feet_anchor = args.module in ("d3.squat", "d3.sit_to_stand",
-                                          "d3.jump", "d3.drop_jump")
+                                          "d3.jump", "d3.drop_jump") + _SPORTS_SUR_PLACE
     # ⚠️ Le SQUAT sort du mode stationnaire (Florian, 2026-09-09). Ce mode
     # recentre le bassin a chaque image et supprime PAR CONSTRUCTION toute
     # avancee horizontale : un sujet qui fait ses squats puis s'eloigne a pied
@@ -1618,7 +1638,7 @@ def main(args, estimator=None, visualizer=None):
     # reellement au sol pour que la detection de contact par hauteur fonctionne
     # (mode appui du sol stable accepte : pied median +0,4 cm).
     _auto_stationary = args.module in ("d3.sit_to_stand", "d3.jump", "d3.drop_jump",
-                                        "d3.cycling")
+                                        "d3.cycling") + _SPORTS_SUR_PLACE
     # CAMERA QUI SUIT LE SUJET (--handheld, jeton `handheld`) : la translation
     # de camera estimee melange le deplacement du sujet et celui de l'operateur,
     # elle ne vaut rien en XZ. On traite alors comme un tapis : bassin centre
@@ -2006,7 +2026,7 @@ def main(args, estimator=None, visualizer=None):
     # marche a preserver). Mesure sur `outputs/SQUAT_XZ` : excursion des pieds
     # 21,9/19,6 cm en mode locomotion, 3,7/4,3 en mode en place.
     _en_place = args.module in ("d3.squat", "d3.sit_to_stand",
-                                "d3.single_leg_squat", "d3.jump", "d3.drop_jump")
+                                "d3.single_leg_squat", "d3.jump", "d3.drop_jump") + _SPORTS_SUR_PLACE
     # GESTE LIBRE : la correction suit les sauts de la scene jusqu'a 8 Hz, comme
     # en place, mais avec les ancres de la locomotion (un vol y est reel, et il
     # n'y a pas de borne de 25 cm : sur le basket la trajectoire fausse
@@ -2033,7 +2053,13 @@ def main(args, estimator=None, visualizer=None):
     # le bassin bouge a plus de 3 m/s, dans un geste qui n'en fait pas 2. Le
     # lissage est une TRANSLATION rigide, donc aucun angle ne peut changer.
     _traj_lisse = args.module is None or args.module in (
-        "d3.gait", "d3.running", "d3.sprint_start", "d3.single_leg_hop")
+        "d3.gait", "d3.running", "d3.sprint_start", "d3.single_leg_hop",
+        "d3.tennis_forehand", "d3.tennis_backhand",
+        # Gestes sportifs AVEC DEPLACEMENT (V1 du 2026-09-29) : comme le
+        # depart de sprint, translation reelle lissee ; pas de recalage
+        # lateral (le deplacement lateral fait partie du geste).
+        "d3.basketball_stop_jump", "d3.football_cut", "d3.football_kick",
+        "d3.volleyball_spike")
     if _traj_lisse and marker_names is not None and not args.no_traj_smooth:
         from sam_3d_body.export.coordinate_transform import lisser_trajectoire_rigide
         markers_array, _traj_shifts = lisser_trajectoire_rigide(
@@ -2108,7 +2134,7 @@ def main(args, estimator=None, visualizer=None):
     # exactement cela — il ne touche pas a Y — et l'anti-glissement reste
     # actif par-dessus pour les phases d'appui.
     if _auto_feet_anchor and not args.feet_anchor and _anti_skate_on \
-            and args.module not in ("d3.jump", "d3.drop_jump"):
+            and args.module not in ("d3.jump", "d3.drop_jump") + _SPORTS_SUR_PLACE:
         print("  [feet_anchor] AUTO DESACTIVE : l'anti-glissement fait le meme "
               "travail par appui, sans bloquer le deplacement")
         _auto_feet_anchor = False
@@ -3000,6 +3026,14 @@ OpenSim workflow:
             # Vide = auto-détection dans le module (orientation du torse).
             if args.camera_side:
                 subj_info["camera_side"] = args.camera_side
+        if args.module.startswith("d3.tennis_"):
+            # Main forcee (jetons handR/handL) et type de revers (bh1/bh2) :
+            # les modules tennis les lisent dans subject_info, pas en argument
+            # du CLI synkro-analytics.
+            if getattr(args, "hand", None):
+                subj_info["hand"] = args.hand
+            if args.module == "d3.tennis_backhand" and getattr(args, "backhand_type", None):
+                subj_info["backhand_type"] = args.backhand_type
         subj_json = os.path.join(args.output_dir, "subject_info.json")
         with open(subj_json, "w") as f:
             json.dump(subj_info, f, indent=2)
@@ -3362,7 +3396,13 @@ def build_parser():
                         choices=[None, "d3.running", "d3.gait", "d3.squat",
                                  "d3.jump", "d3.drop_jump", "d3.sit_to_stand", "d3.cycling",
                                  "d3.sprint_start", "d3.single_leg_hop",
-                                 "d3.single_leg_squat"],
+                                 "d3.single_leg_squat",
+                                 "d3.tennis_serve", "d3.tennis_forehand",
+                                 "d3.tennis_backhand",
+                                 "d3.basketball_jump_shot", "d3.basketball_free_throw",
+                                 "d3.basketball_stop_jump", "d3.football_cut",
+                                 "d3.football_kick", "d3.volleyball_spike",
+                                 "d3.volleyball_block"],
                         help="Après SAM3D, appelle synkro-analytics avec ce module. "
                              "d3.running/gait → GaitDynamics GRF. Autres → Newton-CoM GRF. "
                              "Écrit metrics.json + report.html/pdf dans le dossier output.")
@@ -3420,6 +3460,16 @@ def build_parser():
     parser.add_argument("--leg", default=None, choices=[None, "R", "L"],
                         help="Jambe testée pour les tests unipodaux RTS (single_leg_hop/squat). "
                              "Vide = auto-détection. Une vidéo = une jambe ; LSI agrégé côté app.")
+    # Tennis (d3.tennis_serve / forehand / backhand) : relayes via
+    # subject_info.json, les modules lisent subject_info["hand"] et
+    # subject_info["backhand_type"]. Vide = detection automatique.
+    parser.add_argument("--hand", default=None, choices=[None, "R", "L"],
+                        help="Main qui frappe (tennis). Vide = auto-détection "
+                             "(poignet le plus rapide / sens de rotation).")
+    parser.add_argument("--backhand_type", default=None,
+                        choices=[None, "one_handed", "two_handed"],
+                        help="Revers à une ou deux mains (d3.tennis_backhand). "
+                             "Vide = auto-détection (distance entre les poignets).")
     return parser
 
 
