@@ -1970,6 +1970,7 @@ def main(args, estimator=None, visualizer=None):
     _antiskate_shifts = None
     _lateral_shifts = None
     _traj_shifts = None
+    _phys_shifts = None
     # Articulations de main : SAM3D les fournit nommees (4 par doigt), la ou le
     # markerset ne portait que des points de PEAU — et, pour le majeur et
     # l'annulaire, des positions INTERPOLEES (23,5 mm d'ecart mesure). On les
@@ -2175,6 +2176,35 @@ def main(args, estimator=None, visualizer=None):
                 print(f"  [feet_anchor] anchored midpoint {ref_pair[0]}/{ref_pair[1]} "
                       f"to ({target_x:+.3f}, {target_z:+.3f}) m. "
                       f"max shift = {np.max(np.abs(shifts)):.3f} m")
+
+    # ── Vol BALISTIQUE a l'horizontale (defaut CMJ et hop, --physique_vol pour
+    # le drop jump et le geste libre, --no_physique_vol pour couper).
+    # Translation rigide par image (aucun angle ne change) : en l'air, vitesse
+    # horizontale constante du centre de masse (le sujet ne recule plus en
+    # sautant) ; verticale, appuis et distance des bonds conserves. APRES
+    # feet_anchor, dernier etage avant le TRC : place avant, l'epinglage des
+    # pieds (actif en saut) referait la derive en vol.
+    # Detail et chiffres : sam_3d_body/export/physique_trajectoire.py.
+    if marker_names is not None:
+        from sam_3d_body.export.physique_trajectoire import decider_activation, etage_vol
+        _phys_on, _phys_amax, _phys_motif = decider_activation(
+            args.module, demande=getattr(args, "physique_vol", False),
+            refus=getattr(args, "no_physique_vol", False),
+            camera_portee=getattr(args, "handheld", False), tapis=_is_treadmill)
+        if _phys_motif:
+            print(f"  [physique vol] DESACTIVE : {_phys_motif}")
+        if _phys_on:
+            _phys_avant = markers_array
+            markers_array, _phys_shifts, _phys_rap, _phys_log = etage_vol(
+                markers_array, marker_names, out_fps, args.module)
+            print(_phys_log)
+            if os.environ.get("SYNKRO_DUMP_ETAPES", "0") == "1":
+                np.savez_compressed(
+                    os.path.join(args.output_dir, "_etapes_physique.npz"),
+                    avant=_phys_avant, apres=markers_array,
+                    decalages=(_phys_shifts if _phys_shifts is not None
+                               else np.zeros((len(markers_array), 3))),
+                    names=np.asarray(marker_names), fps=float(out_fps))
 
     # ---------------------------------------------------------------------
     # Multi-person per-track post-processing & export (if requested)
@@ -2859,6 +2889,13 @@ def main(args, estimator=None, visualizer=None):
                 if jc_world[i] is not None:
                     jc_world[i][:, 0] += sx
                     jc_world[i][:, 2] += sz
+        # Vol balistique : meme translation (3 axes ; Y nul dans le reglage du
+        # pipeline) pour que le mesh suive le squelette pendant le vol.
+        if _phys_shifts is not None and len(verts_world):
+            from sam_3d_body.export.physique_trajectoire import appliquer_decalages
+            verts_world = appliquer_decalages(verts_world, _phys_shifts)
+            kpts_world = appliquer_decalages(kpts_world, _phys_shifts)
+            jc_world = appliquer_decalages(jc_world, _phys_shifts)
         # Le writer attend des verts en frame caméra (il fait son X/Y flip).
         # Nos verts sont DÉJÀ en world OpenSim → on signale verts_in_world=True
         # pour que le writer skip son flip et ne touche pas notre repère.
@@ -3204,6 +3241,17 @@ def build_parser():
                              "cam_t par TRANSLATION rigide : il ne peut modifier "
                              "aucun angle articulaire, et conserve le deplacement "
                              "net et la vitesse moyenne.")
+    parser.add_argument("--physique_vol", action="store_true",
+                        help="Vol BALISTIQUE a l'horizontale : en l'air, vitesse "
+                             "horizontale constante du centre de masse (le sujet ne "
+                             "recule plus en sautant), verticale intacte. Actif par "
+                             "defaut sur d3.jump et d3.single_leg_hop ; ce drapeau "
+                             "l'active aussi sur d3.drop_jump et le geste libre. "
+                             "Translation rigide : aucun angle ne change. Jamais sous "
+                             "--handheld, sur tapis ni en cyclisme.")
+    parser.add_argument("--no_physique_vol", action="store_true",
+                        help="Coupe --physique_vol, y compris sur les modules ou il "
+                             "serait actif par defaut.")
     parser.add_argument("--handheld", action="store_true",
                         help="La CAMERA SUIT le sujet (portee a la main, embarquee). "
                              "Distinct de --stationary, qui dit que le SUJET est en "

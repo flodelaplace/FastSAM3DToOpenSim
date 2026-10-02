@@ -1,7 +1,11 @@
 """Trajectoire globale PHYSIQUEMENT COHERENTE, par translation rigide. PROTOTYPE.
 
-Ce module n'est branche NULLE PART. Plan d'integration et chiffres :
-``docs/physique_trajectoire_2026-09-30.md``.
+Branche dans demo_video_opensim.py (dernier etage avant le TRC) : actif par
+defaut sur :data:`MODULES_AUTO`, sur demande (``--physique_vol``) pour le drop
+jump et le geste libre, coupe par ``--no_physique_vol``. Dans le pipeline,
+:func:`etage_vol` ne redresse que l'HORIZONTAL des vols (ni parabole ni bornes,
+voir ses commentaires). Voir aussi :func:`decider_activation`. Plan d'integration et
+chiffres : ``docs/physique_trajectoire_2026-09-30.md``.
 
 Demande de Florian (2026-09-30) : « tres important de gerer les contacts au
 sol, l'anti-glissement, et quand il y a un mouvement et un saut, avoir un
@@ -76,6 +80,10 @@ __all__ = [
     "trajectoire_physique",
     "appliquer_decalages",
     "metriques_trajectoire",
+    "REGLAGES_MODULES",
+    "MODULES_AUTO",
+    "decider_activation",
+    "etage_vol",
 ]
 
 G = 9.81
@@ -904,3 +912,124 @@ def metriques_trajectoire(markers: np.ndarray, marker_names, fps: float,
         out["vitesse_h"] = {"p99": float(np.percentile(nv, 99)), "max": float(nv.max())}
         out["acceleration_h"] = {"p99": float(np.percentile(na, 99)), "max": float(na.max())}
     return out
+
+
+# ---------------------------------------------------------------------------
+# Branchement dans le pipeline (demo_video_opensim.py)
+# ---------------------------------------------------------------------------
+
+# Acceleration horizontale maximale du centre de masse par geste (m/s2).
+# En place 15 ; explosif 25 (hop : a 15 les bornes prennent la propulsion pour
+# de la gigue, glissement P90 14,2 -> 17,1 cm ; a 25 il passe a 13,7).
+# ``None`` = geste libre, accepte seulement sur demande explicite.
+REGLAGES_MODULES: dict = {
+    "d3.jump": 15.0,
+    "d3.drop_jump": 15.0,
+    "d3.single_leg_hop": 25.0,
+    None: 25.0,
+}
+
+# Modules ou l'etage s'active SANS drapeau (``--no_physique_vol`` pour couper).
+# Validation Docker locale du 2026-10-02 (passages avant/apres sur la meme
+# video), reglage du pipeline (horizontal seulement, sans bornes) :
+#   * CMJ : derive en vol 8,8 cm (profondeur) / 3,3 cm (lateral) -> 0 ; temps
+#     de vol, hauteur de Bosco, pic de force verticale identiques ; angles du
+#     .mot dans le bruit d'un passage a l'autre (< 1 deg, meme ecart entre deux
+#     passages sans l'etage) ; pics de force horizontale 1,24 -> 0,53 BW
+#     (antero-posterieure) et 0,99 -> 0,52 BW (laterale), la fausse force du
+#     recul en vol disparait ;
+#   * hop unipodal (simple et triple) : derive 9-17 cm -> 0, temps de vol et
+#     flexion du genou au contact inchanges, distances publiees +0,1 a +0,4 %.
+# d3.drop_jump reste sur demande : aucune video de drop jump locale, valide
+# seulement hors ligne sur deux TRC (derive 4,9-8,5 cm -> 0, verticale
+# intacte), pas de bout en bout (IK + module).
+MODULES_AUTO: frozenset = frozenset({"d3.jump", "d3.single_leg_hop"})
+
+
+def decider_activation(module, *, demande: bool = False, refus: bool = False,
+                       camera_portee: bool = False, tapis: bool = False):
+    """(actif, a_max_ms2, motif) pour un passage du pipeline.
+
+    Jamais sous camera portee (le repere accelere : « vitesse constante en
+    vol » n'y a pas de sens), sur tapis ni en cyclisme (pas de sol fixe).
+    Hors de :data:`REGLAGES_MODULES` (course, marche, squat...), refuse meme
+    sur demande : rien a gagner a l'horizontale, et en course la parabole
+    imposee a des vols de 0,1-0,2 s fabrique une oscillation verticale.
+    """
+    if refus:
+        return False, None, "coupe par --no_physique_vol"
+    if not demande and module not in MODULES_AUTO:
+        return False, None, None
+    if camera_portee:
+        return False, None, "camera portee (le repere bouge, pas de vol balistique mesurable)"
+    if tapis:
+        return False, None, "tapis (pas de sol fixe)"
+    if module is not None and "cycling" in str(module):
+        return False, None, "cyclisme (pas de vol)"
+    if module not in REGLAGES_MODULES:
+        return False, None, (f"module {module} non concerne (etage reserve a "
+                             "d3.jump, d3.drop_jump, d3.single_leg_hop et au geste libre)")
+    return True, float(REGLAGES_MODULES[module]), None
+
+
+def etage_vol(markers, marker_names, fps: float, module, **kw):
+    """Etage du pipeline : :func:`trajectoire_physique` avec le reglage du geste,
+    vols HORIZONTAUX seulement (``parabole=False`` par defaut, voir plus bas).
+
+    Renvoie ``(marqueurs, decalages | None, rapport, ligne_de_log)``. Ne leve
+    jamais : en cas d'erreur, marqueurs inchanges et avertissement dans le
+    rapport (l'etage est une amelioration, il ne doit pas casser un passage).
+    """
+    a_max = float(REGLAGES_MODULES.get(module, 15.0))
+    kw.setdefault("a_max_ms2", a_max)
+    # HORIZONTAL SEULEMENT dans le pipeline (parabole coupee). Mesure Docker du
+    # 2026-10-02 sur le hop unipodal : la parabole remonte le corps de 5-9 cm
+    # pres de la reception, les semelles restent au-dessus du seuil de contact
+    # une ou deux images de plus, et le module single_leg_hop publie des temps
+    # de vol +8 a +22 % et une flexion du genou au contact initial +21 a +46 deg
+    # (contact date plus tard, genou deja flechi). Sans parabole, la verticale
+    # est intacte : contacts, temps de vol et hauteur (Bosco) inchanges par
+    # construction ; seule la derive de profondeur et laterale en vol est
+    # retiree, ce qui est le defaut vise.
+    kw.setdefault("parabole", False)
+    # SANS BORNES de vitesse/acceleration dans le pipeline. Elles agissent sur
+    # TOUT le clip, appuis compris : mesure Docker du 2026-10-02 sur un triple
+    # hop (vitesse horizontale 5-7,6 m/s, sauts de suivi), elles demandaient
+    # 31 cm de correction, creaient des sauts de vitesse de 3,9 m/s aux
+    # raccords et redistribuaient la distance entre les bonds publies par
+    # single_leg_hop (-10,5 % / +9,9 %). Sans elles : 6 cm de correction,
+    # distances et raccords conserves. L'etage ne touche qu'au vol.
+    kw.setdefault("borner", False)
+    try:
+        out, s, rap = trajectoire_physique(markers, marker_names, fps, **kw)
+    except Exception as err:  # noqa: BLE001
+        rap = {"applique": False, "avertissements": [f"erreur : {err!r}"]}
+        return markers, None, rap, f"  [physique vol] NON APPLIQUE (erreur : {err!r})"
+    vols = rap.get("vols_corriges") or []
+    # SANS VOL CORRIGE, ON NE TOUCHE A RIEN. Les bornes de vitesse et
+    # d'acceleration agissent seules sur un clip sans vol (box jump du
+    # 2026-10-02 : 5 stations sur la box ecartees comme « passages en
+    # hauteur », 8,8 cm de correction par les bornes seules) : ce n'est plus
+    # l'objet de l'etage, qui vise le vol. Marqueurs rendus intacts.
+    if s is not None and rap.get("applique") and not vols:
+        rej = (rap.get("phases") or {}).get("rejets") or []
+        rap["applique"] = False
+        rap["avertissements"] = list(rap.get("avertissements") or []) + [
+            "aucun vol balistique a corriger : marqueurs inchanges"
+            + (f" ({len(rej)} phase(s) ecartee(s) : {rej[0]}...)" if rej else "")]
+        s = None
+    if s is None or not rap.get("applique"):
+        ligne = ("  [physique vol] NON APPLIQUE : "
+                 + "; ".join(rap.get("avertissements") or ["rien a corriger"]))
+        return markers, None, rap, ligne
+    ligne = (f"  [physique vol] {len(vols)} vol(s) a vitesse horizontale constante "
+             f"{[(round(a / fps, 2), round((b - a) / fps, 2)) for a, b in vols]} | "
+             + (f"a_max {kw['a_max_ms2']:.0f} m/s2" if kw.get("borner")
+                else "sans bornes")
+             + " | correction max "
+             f"{rap.get('correction_max_horizontale_cm', 0):.1f} cm horizontale, "
+             f"{rap.get('correction_max_verticale_cm', 0):.1f} cm verticale "
+             "(translation, aucun angle modifie)")
+    if rap.get("avertissements"):
+        ligne += " | " + "; ".join(rap["avertissements"])
+    return out, s, rap, ligne

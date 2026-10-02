@@ -324,3 +324,114 @@ def test_sequence_longue_rapide():
     out, s, rap = pt.trajectoire_physique(M, noms, FPS)
     assert rap["applique"]
     assert time.time() - t0 < 30.0
+
+
+# ---------------------------------------------------------------------------
+# Branchement pipeline : decider_activation / etage_vol
+# ---------------------------------------------------------------------------
+
+
+def test_activation_par_defaut_cmj_et_hop_seulement():
+    assert pt.MODULES_AUTO == frozenset({"d3.jump", "d3.single_leg_hop"})
+    assert pt.decider_activation("d3.jump")[:2] == (True, 15.0)
+    assert pt.decider_activation("d3.single_leg_hop")[:2] == (True, 25.0)
+    # sans drapeau : ni le drop jump (pas valide de bout en bout), ni le geste
+    # libre, ni les autres modules
+    for mod in ("d3.drop_jump", None, "d3.running", "d3.squat", "d3.sprint_start"):
+        assert pt.decider_activation(mod) == (False, None, None)
+    # sur demande, le reglage du geste (hop explosif a 25 m/s2)
+    assert pt.decider_activation("d3.jump", demande=True)[:2] == (True, 15.0)
+    assert pt.decider_activation("d3.drop_jump", demande=True)[:2] == (True, 15.0)
+    assert pt.decider_activation("d3.single_leg_hop", demande=True)[:2] == (True, 25.0)
+    assert pt.decider_activation(None, demande=True)[:2] == (True, 25.0)
+
+
+@pytest.mark.parametrize("kw, mod", [
+    ({"camera_portee": True}, "d3.jump"),
+    ({"tapis": True}, "d3.single_leg_hop"),
+    ({}, "d3.cycling"),
+    ({}, "d3.running"),
+    ({}, "d3.gait"),
+    ({}, "d3.squat"),
+    ({"refus": True}, "d3.jump"),
+])
+def test_activation_refusee_hors_perimetre(kw, mod):
+    actif, amax, motif = pt.decider_activation(mod, demande=True, **kw)
+    assert not actif and amax is None and motif
+
+
+def test_refus_l_emporte_sur_l_automatique(monkeypatch):
+    monkeypatch.setattr(pt, "MODULES_AUTO", frozenset({"d3.jump"}))
+    assert pt.decider_activation("d3.jump")[0]
+    assert not pt.decider_activation("d3.jump", refus=True)[0]
+    assert not pt.decider_activation("d3.jump", camera_portee=True)[0]
+
+
+def test_etage_vol_corrige_le_saut_et_rend_une_ligne_de_log():
+    M, noms, (a, b), _ = _saut(derive_x=0.08)
+    out, s, rap, ligne = pt.etage_vol(M, noms, FPS, "d3.jump")
+    assert rap["applique"] and s is not None and s.shape == (M.shape[0], 3)
+    assert "[physique vol] 1 vol" in ligne and "sans bornes" in ligne
+    # les bornes sont coupees dans le pipeline : le log ne doit pas afficher
+    # un a_max qui n'agit pas
+    assert "a_max" not in ligne
+    # pipeline : horizontal seulement, la verticale (contacts, temps de vol,
+    # hauteur) ne bouge pas
+    assert np.abs(s[:, 1]).max() == 0.0
+    np.testing.assert_array_equal(out[:, :, 1], M[:, :, 1])
+    c = _com(out, noms)
+    seg = c[a - 1:b + 1, 0]
+    assert np.abs(seg - np.linspace(seg[0], seg[-1], seg.size)).max() < 0.01
+
+
+def test_etage_vol_hop_utilise_a_max_25():
+    M, noms, _, _ = _saut(derive_x=0.05)
+    # a_max ne sert qu'avec les bornes (coupees par defaut dans le pipeline)
+    _, _, _, ligne = pt.etage_vol(M, noms, FPS, "d3.single_leg_hop", borner=True)
+    assert "a_max 25" in ligne
+
+
+def test_etage_vol_ne_leve_jamais(monkeypatch):
+    M, noms, _, _ = _saut()
+
+    def boum(*a, **k):
+        raise RuntimeError("panne")
+    monkeypatch.setattr(pt, "trajectoire_physique", boum)
+    out, s, rap, ligne = pt.etage_vol(M, noms, FPS, "d3.jump")
+    assert out is M and s is None and not rap["applique"] and "NON APPLIQUE" in ligne
+
+
+def test_etage_vol_sans_vol_rend_les_marqueurs_intacts():
+    # marche bruitee : pas de vol, les bornes seules auraient corrige ; l'etage
+    # du pipeline ne doit rien toucher
+    M, noms = _marche(duree=3.0, bruit=0.03)
+    out, s, rap, ligne = pt.etage_vol(M, noms, FPS, "d3.jump")
+    assert s is None and out is M and not rap["applique"]
+    assert "aucun vol" in ligne
+
+
+def test_etage_vol_parabole_reste_disponible_sur_demande():
+    M, noms, _, _ = _saut(derive_x=0.08)
+    _, s, rap, _ = pt.etage_vol(M, noms, FPS, "d3.jump", parabole=True)
+    assert rap["applique"] and s is not None
+
+
+def test_etage_vol_contacts_inchanges():
+    M, noms, _, _ = _saut(derive_x=0.08)
+    out, _, _, _ = pt.etage_vol(M, noms, FPS, "d3.jump")
+    p0 = pt.detecter_phases(M, noms, FPS)
+    p1 = pt.detecter_phases(out, noms, FPS)
+    assert [(v["debut"], v["fin"]) for v in p0["vols"]] == [(v["debut"], v["fin"]) for v in p1["vols"]]
+    for c in p0["contact"]:
+        np.testing.assert_array_equal(p0["contact"][c], p1["contact"][c])
+
+
+def test_etage_vol_sans_bornes_hors_vol_intact():
+    # pipeline : ni bornes ni parabole ; un pic d'acceleration en appui (hors
+    # vol) n'est pas lisse, seul le vol est redresse
+    M, noms, (a, b), _ = _saut(derive_x=0.08)
+    M = M.copy()
+    M[10:13, :, 0] += 0.15                       # saut de suivi en appui
+    out, s, rap, _ = pt.etage_vol(M, noms, FPS, "d3.jump")
+    assert rap["applique"] and "bornes" not in rap
+    assert np.linalg.norm(s[:a - 10], axis=1).max() < 0.02
